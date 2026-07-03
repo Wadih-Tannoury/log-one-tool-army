@@ -237,6 +237,23 @@ SIGNATURE_MARKER_RE = re.compile(
     r")\s*[,.-]*\s*$"
 )
 
+# Carrier/customer-support reply signatures often end with a block of labeled
+# contact fields (e.g. "Work Email: ...", "Phone Number: ...", "CER Team
+# Email: ...", "UPS Customer Support Numbers: ..."). SIGNATURE_MARKER_RE only
+# catches the closing pleasantry line right before that block (and only when
+# it is *exactly* "Thank you," etc. with nothing else on the line), so a
+# message like "Thank you, this invoice has been uploaded." followed by a
+# name/title/contact block was never stripped, and the phone/email values
+# inside that block were misread as the customer requesting our phone/email.
+# This marker finds the first such labeled contact-field line and lets
+# strip_contact_signature_block cut everything from there onward.
+CONTACT_SIGNATURE_BLOCK_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"work\s+email|phone\s+number|direct\s+(?:line|phone)?|mobile|tel(?:ephone)?|fax|"
+    r"cer\s+team\s+email|customer\s+support\s+numbers?|.*\bcustomer\s+support\b.*"
+    r")\s*:\s*\S"
+)
+
 FOLLOW_UP_CONTEXT_RE = re.compile(
     r"\b(?:"
     r"follow(?:ing)?\s+up|follow-?up|reminder|circling\s+back|"
@@ -900,6 +917,24 @@ def append_useful_quoted_context(cleaned_latest_text: object, quoted_history: ob
     )
 
 
+def strip_contact_signature_block(text: object) -> Tuple[str, bool]:
+    """Cut off a trailing sender contact-info block (Phone Number:, etc.).
+
+    Conservative: only trims when the text *before* the block is short
+    (<=200 chars) so we never discard the body of a genuine multi-paragraph
+    request that happens to mention "phone number" further down.
+    """
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return "", False
+
+    marker_match = CONTACT_SIGNATURE_BLOCK_RE.search(normalized)
+    if marker_match and 0 < marker_match.start() <= 200:
+        return normalized[: marker_match.start()].strip(), True
+
+    return normalized, False
+
+
 def clean_latest_request_text(text: object) -> Dict[str, object]:
     """
     Clean an email body for intent detection.
@@ -909,6 +944,10 @@ def clean_latest_request_text(text: object) -> Dict[str, object]:
     raw_text = normalize_whitespace(text)
     without_history, quoted_history, quoted_history_removed = split_quoted_history(raw_text)
     without_signature, signature_removed = strip_signature(without_history)
+    without_contact_block, contact_block_removed = strip_contact_signature_block(without_signature)
+    if contact_block_removed:
+        without_signature = without_contact_block
+        signature_removed = True
     cleaned_text = append_useful_quoted_context(without_signature, quoted_history)
 
     return {
