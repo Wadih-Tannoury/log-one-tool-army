@@ -223,6 +223,8 @@ If a request appears to quote an old email and the current sender only says “t
 
 If a FedEx/UPS/DHL message is purely an operational status update or confirmation, such as releasing a customs hold or informing TLG that the return AWB is already in transit, return `human_intervention_required` rather than extracting phone numbers, AWBs, or tracking references from signatures or informational text.
 
+Never infer `customer_phone`, `customer_email`, or `customer_name` from the *sender's own* corporate signature block (e.g. lines such as "Work Email:", "Phone Number:", "CER Team Email:", "UPS Customer Support Numbers:"). A short acknowledgement like "Thank you, this invoice has been uploaded." followed by the agent's name/title/contact details is not a request for our phone number — it is a closing signature. The regex/cleanup layer strips this contact block before matching (see `strip_contact_signature_block` in `customs_rules.py`); treat any phone/email numbers appearing after such labeled contact lines as boilerplate, not as data being requested.
+
 If a message says an AWB, tracking number, or tracking/reference number only as a reference label, do not return `export_tracking_number`. Return export tracking only when the sender explicitly asks TLG to provide the export AWB/TRK/tracking value.
 
 If a shipment is held because it is missing the invoice, for example `priva della fattura`, `fattura mancante`, or `missing invoice`, return `commercial_invoice`, even when an AWB or tracking number appears at the top as a reference.
