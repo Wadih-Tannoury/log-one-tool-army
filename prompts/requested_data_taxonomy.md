@@ -10,6 +10,7 @@ The system should classify requests into requested data elements, not a single i
 | `return_proforma_invoice` | Return proforma invoice / RPI / PRI / reintroduction-in-franchigia documentation. Also covers customs description, importer details, tax information, country of origin, product-description fields, phone, email, and address when those are part of a Returns Customs Clearance RPI package. |
 | `corrected_invoice` | Corrected or updated invoice |
 | `export_tracking_number` | Export tracking number / TRK export / AWB export |
+| `shipping_label` | Return shipping label PDF. Never detected directly from the request text — the response generator automatically appends this key whenever `export_tracking_number` is included in a response, since providing the tracking number implies the customer needs the printable return label too. Generated from the labels API's ZPL data and attached as a PDF (see response_builder.md). |
 | `ups_account_number` | UPS account / abbonamento UPS |
 | `value_confirmation` | Declared value / value confirmation |
 | `returned_items_confirmation` | Which items are returning / partial or full return |
