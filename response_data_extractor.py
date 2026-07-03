@@ -15,6 +15,8 @@ API-backed response data and generated customs documents:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -70,6 +72,7 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     "customer_name": "full_order_customer_name",
     "shipping_address": "full_order_shipping_address",
     "shipped_at": "full_order_shipped_at",
+    "country_code": "full_order_country_code",
     "api_error": "full_order_api_error",
 }
 
@@ -83,7 +86,7 @@ FULL_ORDER_DATA_KEYS = {
     "shipping_address",
 }
 FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
-DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney"}
+DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney", "shipping_label"}
 INVOICE_DOCUMENT_DATA_KEYS = {"return_proforma_invoice", "commercial_invoice"}
 
 DOCUMENT_RESPONSE_COLUMNS = {
@@ -91,6 +94,7 @@ DOCUMENT_RESPONSE_COLUMNS = {
     "power_of_attorney": "generated_power_of_attorney_path",
     "return_proforma_invoice": "generated_return_proforma_invoice_path",
     "commercial_invoice": "generated_commercial_invoice_path",
+    "shipping_label": "generated_shipping_label_path",
     "document_error": "generated_document_error",
 }
 
@@ -133,6 +137,34 @@ POA_TEMPLATE_PATH = Path(
 GENERATED_DOCUMENTS_DIR = Path(os.getenv("GENERATED_DOCUMENTS_DIR", "generated_documents"))
 DOCUMENT_RESPONSE_STYLE = os.getenv("DOCUMENT_RESPONSE_STYLE", "markdown").strip().lower()
 DOCUMENT_PUBLIC_BASE_URL = os.getenv("DOCUMENT_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+# --- Shipping label (ZPL -> PDF) configuration -----------------------------
+#
+# The labels endpoint is a Logic App request trigger (see
+# Labels_triggering_for_DGEUTST0001.py for a batch-trigger example against the
+# same workflow). Given a shipment_order_number it returns a JSON payload with
+# one "shipment" block per label (outbound + return); each block carries an
+# isReturn flag and a base64-or-raw ZPL string in labelData.
+SHIPPING_LABELS_API_URL = os.getenv("SHIPPING_LABELS_API_URL") or (
+    "https://prod-09.northeurope.logic.azure.com/workflows/"
+    "8fca928224de4819aa279973e08f9008/"
+    "triggers/request/paths/invoke"
+)
+SHIPPING_LABELS_API_PARAMS = {
+    "api-version": os.getenv("SHIPPING_LABELS_API_VERSION", "2016-10-01"),
+    "sp": os.getenv("SHIPPING_LABELS_API_SP", "/triggers/request/run"),
+    "sv": os.getenv("SHIPPING_LABELS_API_SV", "1.0"),
+    "sig": os.getenv("SHIPPING_LABELS_API_SIG")
+    or "5Ay_LV4SS9h3gw9zCfftJ0LabeCnfuig7BgkH9fcAU4",
+}
+SHIPPING_LABELS_API_TIMEOUT_SECONDS = int(
+    os.getenv("SHIPPING_LABELS_API_TIMEOUT_SECONDS", "30")
+)
+# Labelary renders ZPL to a raster image at this printer density / label size.
+ZPL_LABEL_RENDERER_URL = os.getenv(
+    "ZPL_LABEL_RENDERER_URL",
+    "https://api.labelary.com/v1/printers/8dpmm/labels/4x6/0/",
+)
 
 
 def _join_public_base_url(base_url: str, relative_path: str) -> str:
@@ -611,75 +643,80 @@ def enrich_dataframe_with_full_order_data(
             df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = message
         return df
 
-        cache: dict[str, dict[str, Any]] = {}
+    # NOTE: this block previously lived (unreachable) inside the
+    # `if not api_client.is_configured:` branch above, after its `return df`.
+    # That meant GET_FULL_ORDER data was never fetched once the API client
+    # *was* configured -- the root cause of tickets with multiple
+    # shipment_order_number values only ever getting one invoice attached.
+    cache: dict[str, dict[str, Any]] = {}
 
-        for index in lookup_indices:
-  
-            shipment_orders = [
-                x.strip()
-                for x in str(
-                    df.at[index, "shipment_order_number"]
-                    if "shipment_order_number" in df.columns
-                    else ""
-                ).split(";")
-                if x.strip()
-            ]
+    for index in lookup_indices:
 
-            if not shipment_orders:
-                df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = (
-                    "Missing shipment_order_number for GET_FULL_ORDER lookup"
-                )
-                continue
+        shipment_orders = [
+            x.strip()
+            for x in str(
+                df.at[index, "shipment_order_number"]
+                if "shipment_order_number" in df.columns
+                else ""
+            ).split(";")
+            if x.strip()
+        ]
 
-            combined = {}
+        if not shipment_orders:
+            df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = (
+                "Missing shipment_order_number for GET_FULL_ORDER lookup"
+            )
+            continue
 
-            for shipment_order_number in shipment_orders:
-  
-                cache_key = shipment_order_number.upper()
-  
-                if cache_key not in cache:
-                    try:
-                        cache[cache_key] = fetch_shipment_order_data(
-                            shipment_order_number,
-                            client=api_client,
-                        )
-                    except Exception as exc:
-                        print(
-                            "WARNING: GET_FULL_ORDER lookup failed for "
-                            f"shipment_order_number={shipment_order_number}: {exc}"
-                        )
-                        cache[cache_key] = {
-                            FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)
-                        }
+        combined = {}
 
-                result = cache[cache_key]
+        for shipment_order_number in shipment_orders:
 
-                for column, value in result.items():
+            cache_key = shipment_order_number.upper()
 
-                    if column not in df.columns:
-                        df[column] = None
+            if cache_key not in cache:
+                try:
+                    cache[cache_key] = fetch_shipment_order_data(
+                        shipment_order_number,
+                        client=api_client,
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: GET_FULL_ORDER lookup failed for "
+                        f"shipment_order_number={shipment_order_number}: {exc}"
+                    )
+                    cache[cache_key] = {
+                        FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)
+                    }
 
-                    if is_blank(value):
-                        continue
+            result = cache[cache_key]
 
-                    existing = combined.get(column)
+            for column, value in result.items():
 
-                    if is_blank(existing):
-                        combined[column] = value
-                    else:
-                        values = [
-                            x.strip()
-                            for x in str(existing).split(";")
-                            if x.strip()
-                        ]
+                if column not in df.columns:
+                    df[column] = None
 
-                        if str(value) not in values:
-                            values.append(str(value))
+                if is_blank(value):
+                    continue
 
-                        combined[column] = ";".join(values)
+                existing = combined.get(column)
 
-            for column, value in combined.items():
-                df.at[index, column] = value
+                if is_blank(existing):
+                    combined[column] = value
+                else:
+                    values = [
+                        x.strip()
+                        for x in str(existing).split(";")
+                        if x.strip()
+                    ]
+
+                    if str(value) not in values:
+                        values.append(str(value))
+
+                    combined[column] = ";".join(values)
+
+        for column, value in combined.items():
+            df.at[index, column] = value
 
     print(f"GET_FULL_ORDER enrichment attempted for {len(lookup_indices)} row(s).")
     return df
@@ -709,6 +746,7 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
             requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email"))
         )
         needs_poa = "power_of_attorney" in requested_data
+        needs_shipping_label = "export_tracking_number" in requested_data
 
         for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
             column = DOCUMENT_RESPONSE_COLUMNS[invoice_key]
@@ -772,6 +810,19 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                 except Exception as exc:
                     message = f"power_of_attorney: {exc}"
                     print(f"WARNING: Could not generate power_of_attorney for row {index}: {exc}")
+                    _append_document_error(df, index, message)
+
+        if needs_shipping_label:
+            column = DOCUMENT_RESPONSE_COLUMNS["shipping_label"]
+            existing_path = row.get(column)
+            if force or is_blank(existing_path) or not document_path_exists(str(existing_path).split(";")[0]):
+                try:
+                    row_data = df.loc[index].to_dict()
+                    df.at[index, column] = generate_shipping_label_document(row_data)
+                    generated += 1
+                except Exception as exc:
+                    message = f"shipping_label: {exc}"
+                    print(f"WARNING: Could not generate shipping_label PDF for row {index}: {exc}")
                     _append_document_error(df, index, message)
 
     print(f"Generated or downloaded {generated} PDF document(s).")
@@ -1200,6 +1251,19 @@ def _format_customer_name(shipping_address: Mapping[str, Any]) -> str | None:
     return value or None
 
 
+def _format_country_code(shipping_address: Mapping[str, Any]) -> str | None:
+    """Return the ISO 3166-1 alpha-2 shipping country code, upper-cased.
+
+    Needed to populate Zendesk's per-brand "Country <BRAND>" field, which
+    some brands require to be set before a ticket can be solved (see
+    country_ticket_field_id_for_brand in customs_rules.py).
+    """
+    value = _clean_item_field(
+        _get_any(shipping_address, ("country", "countryCode", "country_code"))
+    )
+    return value.strip().upper() if value else None
+
+
 def _format_shipping_address(shipping_address: Mapping[str, Any]) -> str | None:
     parts = [
         _clean_item_field(_get_any(shipping_address, ("addressLine1", "address_line_1", "address1"))),
@@ -1262,6 +1326,7 @@ def extract_shipment_order_data(
         FULL_ORDER_RESPONSE_COLUMNS["customer_name"]: _format_customer_name(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["shipping_address"]: _format_shipping_address(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]: _shipped_at_from_shipment(shipment),
+        FULL_ORDER_RESPONSE_COLUMNS["country_code"]: _format_country_code(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["api_error"]: None,
     }
 
@@ -2062,6 +2127,165 @@ def generate_power_of_attorney(row: Mapping[str, Any]) -> str:
     doc.save(output_path, deflate=True, garbage=4)
     doc.close()
     return output_path.as_posix()
+
+
+# ---------------------------------------------------------------------------
+# Shipping label (ZPL -> PDF)
+# ---------------------------------------------------------------------------
+
+
+def fetch_shipment_labels(
+    shipment_order_number: str,
+    *,
+    weight: float | None = None,
+    packages_number: int = 1,
+    timeout: int | None = None,
+) -> dict:
+    """POST to the labels Logic App and return the parsed JSON response.
+
+    Mirrors the request shape used in Labels_triggering_for_DGEUTST0001.py
+    (same workflow, orderNumber/weight/packagesNumber body).
+    """
+
+    order_number = str(shipment_order_number or "").strip()
+    if not order_number:
+        raise DocumentGenerationError("Missing shipment_order_number for label lookup")
+
+    body = {
+        "orderNumber": order_number,
+        "weight": weight,
+        "packagesNumber": packages_number,
+    }
+
+    response = requests.post(
+        SHIPPING_LABELS_API_URL,
+        params=SHIPPING_LABELS_API_PARAMS,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json=body,
+        timeout=timeout or SHIPPING_LABELS_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _label_shipment_blocks(payload: dict) -> list[dict]:
+    """Return the list of shipment label blocks from a labels API payload."""
+
+    if not isinstance(payload, dict):
+        return []
+
+    shipments = payload.get("shipment")
+    if shipments is None:
+        shipments = payload.get("shipments")
+
+    if isinstance(shipments, dict):
+        return [shipments]
+    if isinstance(shipments, list):
+        return [block for block in shipments if isinstance(block, dict)]
+    return []
+
+
+def extract_return_label_zpl(payload: dict) -> str:
+    """Return the ZPL for the return label block (shipment.isReturn == False).
+
+    The labels API usually returns two blocks: one for the outbound shipment
+    and one for the return. The return label is the block where
+    isReturn == False (the outbound leg carries isReturn == True since it is
+    part of a returns flow); labelData holds the (often base64-encoded) ZPL.
+    """
+
+    for block in _label_shipment_blocks(payload):
+        if block.get("isReturn") is False:
+            label_data = block.get("labelData")
+            if label_data:
+                return str(label_data)
+
+    raise DocumentGenerationError(
+        "No return label block (shipment.isReturn == false) with labelData "
+        "found in the labels API response"
+    )
+
+
+def _decode_zpl(encoded_zpl: str) -> str:
+    encoded_zpl = str(encoded_zpl or "").strip()
+    try:
+        zpl = base64.b64decode(encoded_zpl, validate=True).decode("utf-8", errors="ignore")
+    except (binascii.Error, ValueError):
+        zpl = encoded_zpl
+
+    if "^XA" not in zpl or "^XZ" not in zpl:
+        raise DocumentGenerationError(
+            "Decoded label data does not contain a complete ZPL label (^XA ... ^XZ)"
+        )
+    return zpl
+
+
+def render_zpl_label_pdf(encoded_zpl: str, output_path: Path) -> str:
+    """Decode a (base64) ZPL label and render it to a PDF at output_path."""
+
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    zpl = _decode_zpl(encoded_zpl)
+
+    response = requests.post(
+        ZPL_LABEL_RENDERER_URL,
+        headers={"Accept": "image/png"},
+        data=zpl.encode("utf-8"),
+        timeout=SHIPPING_LABELS_API_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 200:
+        raise DocumentGenerationError(
+            f"ZPL label rendering failed (status {response.status_code}): {response.text[:300]}"
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path = output_path.with_suffix(".png")
+    png_path.write_bytes(response.content)
+
+    try:
+        image = Image.open(png_path)
+        pdf = canvas.Canvas(str(output_path))
+        pdf.setPageSize(image.size)
+        pdf.drawImage(ImageReader(image), 0, 0, width=image.width, height=image.height)
+        pdf.save()
+    finally:
+        if png_path.exists():
+            png_path.unlink()
+
+    return output_path.as_posix()
+
+
+def generate_shipping_label_document(row: Mapping[str, Any]) -> str:
+    """Fetch, decode, and render the return shipping label PDF for a row.
+
+    Saves into generated_documents/shipping_labels and returns the local path
+    (or ";"-joined paths when the ticket covers multiple shipments).
+    """
+
+    shipment_orders = [
+        item.strip()
+        for item in str(row.get("shipment_order_number") or "").split(";")
+        if item.strip()
+    ]
+    if not shipment_orders:
+        raise DocumentGenerationError("Missing shipment_order_number for shipping label generation")
+
+    output_dir = GENERATED_DOCUMENTS_DIR / "shipping_labels"
+    generated_paths: list[str] = []
+
+    for shipment_order_number in shipment_orders:
+        output_path = output_dir / f"{safe_filename(shipment_order_number)}.pdf"
+        if output_path.exists() and output_path.is_file() and output_path.stat().st_size > 0:
+            generated_paths.append(output_path.as_posix())
+            continue
+
+        payload = fetch_shipment_labels(shipment_order_number)
+        zpl = extract_return_label_zpl(payload)
+        generated_paths.append(render_zpl_label_pdf(zpl, output_path))
+
+    return ";".join(generated_paths)
 
 
 def document_value_for_response(document_path: str | None) -> str:
