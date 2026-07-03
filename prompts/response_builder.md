@@ -334,8 +334,11 @@ From that shipment block:
 - `customer_email`: use `customer.email`.
 - `customer_phone`: use `customer.customerNumber`.
 - LOA export date: use shipment `shippedAt`, formatted from API ISO datetime to `dd/mm/yyyy`.
+- Zendesk `Country <BRAND>` field: use the shipping address `country` / `countryCode` value (stored as `full_order_country_code`) together with the brand prefix parsed from `shipment_order_number` to build the `country_{brand}_{iso2}` tag. Every ticket whose brand has a "Country <BRAND>" Zendesk field must carry this custom field before the ticket is solved, or Zendesk rejects the status transition with "Country <BRAND>: is required when solving a ticket".
 
 `export_tracking_number` does not come from GET_FULL_ORDER. It is the existing `shipment_tracking_number` retrieved from `tlg-business-intelligence-prd.bi.shipping_platform_shipments`.
+
+If a ticket has more than one `shipment_order_number` (semicolon-separated), GET_FULL_ORDER must be queried once per shipment order number and the resulting invoice/RPI links combined (semicolon-joined) rather than only using the first one. Every requested invoice/RPI must be downloaded and attached, one PDF per shipment, not just the first shipment on the ticket.
 
 If API data required for an automatic response is missing, create a human-intervention note rather than sending a placeholder for that API-backed item.
 
@@ -361,5 +364,13 @@ For `power_of_attorney` / POA, generate `generated_documents/power_of_attorney/<
 
 - UPS Tracking Number: `extracted_tracking_number`;
 - Date `(β)`: generation date, formatted `mm/dd/yyyy`.
+
+Whenever `export_tracking_number` is part of the response data (either directly requested or auto-added), also generate and attach the return shipping label:
+
+1. Call the labels API (a Logic App request trigger; see `Labels_triggering_for_DGEUTST0001.py` for a batch-trigger example against the same workflow) with the shipment's `orderNumber`.
+2. The response contains one `shipment` block per label. Use the block where `shipment.isReturn = false` — that is the return label. Read its `labelData` field (ZPL, usually base64-encoded).
+3. Decode the ZPL (base64 first, falling back to raw ZPL if decoding fails) and render it to PDF via the Labelary rendering API (see `ZPL_to_PDF_converter.py` for the reference implementation).
+4. Save the PDF to `generated_documents/shipping_labels/<shipment_order_number>.pdf`.
+5. Attach the generated PDF in the final response alongside the export tracking number, for every shipment on the ticket.
 
 Draft responses should include the generated file path as a Markdown-style link when the document is referenced.
