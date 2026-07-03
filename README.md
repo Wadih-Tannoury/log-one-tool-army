@@ -145,9 +145,23 @@ Generated and downloaded copies are written to the top-level `generated_document
 generated_documents/authorization_letter/<extracted_tracking_number>.pdf
 generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
 generated_documents/invoice/<invoice_filename_from_document_link>.pdf
+generated_documents/shipping_labels/<shipment_order_number>.pdf
 ```
 
 When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, and saves the final PDF under `generated_documents/invoice`. The draft response can include the saved local document reference, and human-intervention drafts can include source `documentLink` references for reviewer use. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL. A local PDF is required before an automatic public Zendesk reply can be sent for invoice/RPI documents; source links are internal-only and are not used as public-response fallbacks.
+
+When a ticket references more than one `shipment_order_number` (semicolon-separated), GET_FULL_ORDER is queried once per shipment and the resulting invoice/RPI links are combined so **every** shipment's document is downloaded and attached, not only the first one. (Earlier versions of `enrich_dataframe_with_full_order_data` had this multi-shipment lookup nested unreachably after an early `return`, so only whichever document already had a cached path — normally just the first shipment — ever got attached; this has been fixed.)
+
+### Shipping labels
+
+Whenever `export_tracking_number` is part of a response (directly requested or auto-added), `response_generator.py` also auto-adds a `shipping_label` data key and `response_data_extractor.py` generates the return label PDF:
+
+1. POST the shipment's `orderNumber` to the labels API (a Logic App request trigger — see `Labels_triggering_for_DGEUTST0001.py` for a batch-trigger example against the same workflow, configurable via `SHIPPING_LABELS_API_URL` / `SHIPPING_LABELS_API_SIG`).
+2. The response contains one `shipment` block per label (outbound + return). The block where `isReturn == false` is the return label; its `labelData` field holds the ZPL, usually base64-encoded.
+3. Decode the ZPL and render it to PNG via the Labelary API, then wrap it into a PDF with `reportlab` (see `ZPL_to_PDF_converter.py` for the reference implementation, reused as `render_zpl_label_pdf`).
+4. Save to `generated_documents/shipping_labels/<shipment_order_number>.pdf` and attach it in the final response next to the export tracking number, one PDF per shipment on the ticket.
+
+This requires `reportlab` and `pillow`, which are installed by the GitHub Actions workflow alongside the other pipeline dependencies.
 
 The GitHub Actions workflow always uploads `generated_documents` as the `generated-customs-documents` artifact. Committing those files back into the repository is optional and controlled by the manual `workflow_dispatch` input `persist_generated_documents`, which defaults to `false`.
 
@@ -185,7 +199,7 @@ The submission decision is independent from BigQuery history de-duplication. Thi
 
 ### Per-brand "Country" ticket field
 
-Some brands have a Zendesk custom ticket field named `Country <BRAND>` (e.g. `Country DJ`) that Zendesk requires to be set before a ticket can be moved to `solved`. When the GET_FULL_ORDER `shippingAddress.country` value and the brand prefix from `shipment_order_number` (e.g. `DJ` from `DJ-USC11593083`) are both available, `response_generator.py` builds a `country_{brand}_{iso2}` tag and `submit_ticket_response()` in `ticket_fetcher.py` sends it as that field's value.
+Some brands have a Zendesk custom ticket field named `Country <BRAND>` (e.g. `Country DJ`) that Zendesk requires to be set before a ticket can be moved to `solved`. When the GET_FULL_ORDER `shippingAddress.country` value and the brand prefix from `shipment_order_number` (e.g. `DJ` from `DJ-USC11593083`) are both available, `response_generator.py` builds a `country_{brand}_{iso2}` tag and `submit_ticket_response()` in `ticket_fetcher.py` sends it as that field's value. `response_data_extractor.extract_shipment_order_data()` stores the shipping-address country code in the `full_order_country_code` column for this purpose (a prior version of the extractor never populated this column, so the field was always empty and every solve on a country-gated brand hit the 422 error described below).
 
 The brand → field-id mapping lives in `customs_rules.country_ticket_field_id_for_brand()`. It currently only knows about `DJ` (field id `360012198399`). Add more brands there as their field IDs are confirmed in Zendesk, or set them at runtime without a code change via:
 
@@ -208,6 +222,7 @@ Additional response guardrails:
 - Invoice/value/MRN/import-export discrepancies and requests for corrected return invoices or corrected values are routed to human intervention instead of sending a normal generated RPI/commercial-invoice reply.
 - BigQuery repeated-field JSON strings such as `{"v":[{"v":"customer_email"}]}` are flattened before response generation, so drafts use real requested-data labels rather than the raw JSON object.
 - DHL `DATA / FROM / OGGETTO` current-message headers are preserved during cleaning so actionable Italian requests such as missing return invoice or HAWB/AWB export requests are not discarded as quoted history.
+- The sender's own closing corporate signature block (name/title followed by labeled contact lines such as `Work Email:`, `Phone Number:`, `CER Team Email:`, `UPS Customer Support Numbers:`) is stripped from the cleaned request text via `customs_rules.strip_contact_signature_block()` before regex/LLM matching. Without this, a short acknowledgement like "Thank you, this invoice has been uploaded." followed by that block could be misread as the customer requesting our `customer_phone`/`customer_email`.
 
 ## Response data extractor script
 
