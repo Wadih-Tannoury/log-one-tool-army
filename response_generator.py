@@ -31,6 +31,7 @@ from response_data_extractor import (
     generate_authorization_letter,
     generate_documents_for_dataframe,
     generate_power_of_attorney,
+    generate_shipping_label_document,
     tracking_number_for_documents,
     ups_account_number_for_documents,
 )
@@ -150,6 +151,7 @@ AFTER_FIRST_REQUEST_HUMAN_INTERVENTION_REQUESTED_DATA = (
 DOCUMENT_ATTACHMENT_DATA_KEYS = set(INVOICE_DOCUMENT_DATA_KEYS) | {
     "authorization_letter",
     "power_of_attorney",
+    "shipping_label",
 }
 
 RETURN_PROFORMA_CONTEXT_RE = re.compile(
@@ -216,6 +218,7 @@ DATA_LABELS = {
         "shipment_instructions": "Shipment instructions",
         "address_correction": "Address correction",
         "previously_requested_documentation": "Previously requested documentation",
+        "shipping_label": "Shipping label",
     },
     "it": {
         "commercial_invoice": "Fattura commerciale",
@@ -240,6 +243,7 @@ DATA_LABELS = {
         "shipment_instructions": "Istruzioni di spedizione",
         "address_correction": "Correzione indirizzo",
         "previously_requested_documentation": "Documentazione precedentemente richiesta",
+        "shipping_label": "Etichetta di spedizione",
     },
 }
 
@@ -514,6 +518,8 @@ def generated_document_value(row, data_key):
             return document_value_for_response(generate_authorization_letter(row))
         if data_key == "power_of_attorney":
             return document_value_for_response(generate_power_of_attorney(row))
+        if data_key == "shipping_label":
+            return document_value_for_response(generate_shipping_label_document(row))
     except DocumentGenerationError as exc:
         print(
             "WARNING: Could not generate "
@@ -567,7 +573,7 @@ def data_value(row, data_key):
 
         return full_order_data_value(row, data_key)
 
-    if data_key in {"authorization_letter", "power_of_attorney"}:
+    if data_key in {"authorization_letter", "power_of_attorney", "shipping_label"}:
         return generated_document_value(row, data_key)
 
     return PLACEHOLDER
@@ -1097,6 +1103,15 @@ def requested_data_for_response(row):
     ):
         requested_data.append("ups_account_number")
 
+    # Whenever the return export tracking number is part of the response, the
+    # customer is expecting to be able to print/use the return shipping label,
+    # so the generated label PDF must be attached alongside it.
+    if (
+        "export_tracking_number" in requested_data
+        and "shipping_label" not in requested_data
+    ):
+        requested_data.append("shipping_label")
+
     return requested_data
 
 
@@ -1247,6 +1262,9 @@ def missing_required_full_order_values(row, requested_data):
     for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
         if not invoice_document_is_sendable(row, invoice_key) and invoice_key not in missing:
             missing.append(invoice_key)
+
+    if "shipping_label" in requested_data and not generated_document_is_ready(row, "shipping_label"):
+        missing.append("shipping_label_pdf")
 
     if needs_loa or needs_poa:
         if is_blank(tracking_number_for_documents(row)):
