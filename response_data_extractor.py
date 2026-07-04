@@ -74,6 +74,7 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     "shipped_at": "full_order_shipped_at",
     "country_code": "full_order_country_code",
     "api_error": "full_order_api_error",
+    "missing_shipment_orders_by_key": "full_order_missing_shipment_orders_by_key",
 }
 
 FULL_ORDER_DATA_KEYS = {
@@ -669,6 +670,7 @@ def enrich_dataframe_with_full_order_data(
             continue
 
         combined = {}
+        missing_by_key: dict[str, list[str]] = {}
 
         for shipment_order_number in shipment_orders:
 
@@ -690,6 +692,16 @@ def enrich_dataframe_with_full_order_data(
                     }
 
             result = cache[cache_key]
+
+            # Record, per invoice/RPI data key, exactly which shipment(s) had
+            # no value for that key in this lookup -- whether because the
+            # whole GET_FULL_ORDER call failed or because the payload simply
+            # didn't contain that field. This lets the response builder name
+            # the exact missing shipment(s) instead of guessing.
+            for data_key in INVOICE_DOCUMENT_DATA_KEYS:
+                column = FULL_ORDER_RESPONSE_COLUMNS[data_key]
+                if is_blank(result.get(column)):
+                    missing_by_key.setdefault(data_key, []).append(shipment_order_number)
 
             for column, value in result.items():
 
@@ -717,6 +729,22 @@ def enrich_dataframe_with_full_order_data(
 
         for column, value in combined.items():
             df.at[index, column] = value
+
+        missing_column = FULL_ORDER_RESPONSE_COLUMNS["missing_shipment_orders_by_key"]
+        if missing_column not in df.columns:
+            df[missing_column] = None
+        # Only keep entries where at least one (but not all) shipments are
+        # missing the key -- if every shipment is missing it, the existing
+        # "column is entirely blank" check already blocks the reply and a
+        # partial-missing note would be redundant/misleading.
+        partial_missing_by_key = {
+            data_key: order_numbers
+            for data_key, order_numbers in missing_by_key.items()
+            if order_numbers and len(order_numbers) < len(shipment_orders)
+        }
+        df.at[index, missing_column] = (
+            json.dumps(partial_missing_by_key) if partial_missing_by_key else None
+        )
 
     print(f"GET_FULL_ORDER enrichment attempted for {len(lookup_indices)} row(s).")
     return df
@@ -2151,8 +2179,17 @@ def fetch_shipment_labels(
     if not order_number:
         raise DocumentGenerationError("Missing shipment_order_number for label lookup")
 
+    # The labels API expects the shipmentOrderNumber shape used inside
+    # GET_FULL_ORDER payloads (e.g. DG-EUA01667336), not the GET_FULL_ORDER
+    # *order number* URL shape (e.g. DG-EU-01667336). Passing the order-number
+    # shape here caused the labels API to return a payload with no matching
+    # shipment block, so no labelData could ever be found.
+    shipment_order_number_for_labels_api = shipment_order_number_for_shipment_block_lookup(
+        order_number
+    )
+
     body = {
-        "orderNumber": order_number,
+        "orderNumber": shipment_order_number_for_labels_api,
         "weight": weight,
         "packagesNumber": packages_number,
     }
