@@ -1606,14 +1606,16 @@ def extract_tracking_number(subject, description, carrier_code):
         values: list[str] = []
         for pattern in patterns_by_carrier[carrier_code]:
             values.extend(matches(pattern))
-        return next(iter(dict.fromkeys(values)), "N/A")
+        deduped = list(dict.fromkeys(values))
+        return ";".join(deduped) if deduped else "N/A"
 
     # Conservative fallback for malformed/missing requester emails.
     values = []
     for patterns in patterns_by_carrier.values():
         for pattern in patterns:
             values.extend(matches(pattern))
-    return next(iter(dict.fromkeys(values)), "N/A")
+    deduped = list(dict.fromkeys(values))
+    return ";".join(deduped) if deduped else "N/A"
 
 
 def _dedupe_preserve_order(values: Iterable[str]) -> list[str]:
