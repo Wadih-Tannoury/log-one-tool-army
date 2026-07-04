@@ -2206,11 +2206,32 @@ def fetch_shipment_labels(
 
 
 def _label_shipment_blocks(payload: dict) -> list[dict]:
-    """Return the list of shipment label blocks from a labels API payload."""
+    """Return the list of shipment label blocks from a labels API payload.
+
+    The real response shape is:
+        {"success": true, "data": [{"shipment": {...}, ...}, ...], "error": null}
+
+    i.e. a top-level "data" list where each item wraps its label block under
+    "shipment" (one item per parcel/leg: outbound + return). The previous
+    implementation looked for a top-level "shipment"/"shipments" key, which
+    doesn't exist in this shape, so no block was ever found.
+    """
 
     if not isinstance(payload, dict):
         return []
 
+    items = payload.get("data")
+    if isinstance(items, list):
+        blocks = [
+            item.get("shipment")
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("shipment"), dict)
+        ]
+        if blocks:
+            return blocks
+
+    # Fall back to the older/alternate shapes this function originally
+    # supported, in case some environments still return them.
     shipments = payload.get("shipment")
     if shipments is None:
         shipments = payload.get("shipments")
