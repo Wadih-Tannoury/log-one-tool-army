@@ -645,7 +645,12 @@ def build_llm_output_row(source_row, result):
             f"LLM notes: {notes}"
         )
 
-    elif regex_candidates and llm_candidates and regex_candidates != llm_candidates:
+    elif (
+        regex_candidates
+        and llm_candidates
+        and regex_candidates != llm_candidates
+        and not (regex_candidates & llm_candidates)
+    ):
         engine = "regex_llm_disagreement_guard"
         request_types = ["regex_llm_disagreement_guard"]
         requested_data = [HUMAN_INTERVENTION_REQUIRED]
@@ -654,6 +659,27 @@ def build_llm_output_row(source_row, result):
             "Regex candidates and LLM requested_data disagree. "
             f"regex={sorted(regex_candidates)}; llm={sorted(llm_candidates)}. "
             "Human intervention is required. "
+            f"LLM notes: {notes}"
+        )
+
+    elif (
+        regex_candidates
+        and llm_candidates
+        and regex_candidates != llm_candidates
+        and (regex_candidates & llm_candidates)
+    ):
+        # Regex and LLM disagree on the full set, but they agree on at least
+        # one requested_data item. Rather than blocking the whole reply,
+        # respond with the union of both extractions.
+        union_candidates = sorted(regex_candidates | llm_candidates)
+        engine = "regex_llm_union_guard"
+        request_types = ["regex_llm_union_guard"]
+        requested_data = union_candidates
+        notes = (
+            "Regex candidates and LLM requested_data partially disagree but "
+            f"share at least one requested_data. regex={sorted(regex_candidates)}; "
+            f"llm={sorted(llm_candidates)}. Responding with the union: "
+            f"{union_candidates}. "
             f"LLM notes: {notes}"
         )
 
