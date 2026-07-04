@@ -58,7 +58,9 @@ jobs:
             google-cloud-bigquery \
             google-cloud-bigquery-storage \
             google-genai \
-            pymupdf
+            pymupdf \
+            Pillow \
+            reportlab
 
       - name: Initialize Workflow Run
         run: python -c "import uuid; print(f'WORKFLOW_RUN_ID={uuid.uuid4()}')" >> "$GITHUB_ENV"
