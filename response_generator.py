@@ -12,6 +12,7 @@ The templates and safety branches are intentionally aligned with
 prompts/response_builder.md.
 """
 
+import json
 import os
 import re
 
@@ -1224,6 +1225,14 @@ def enrich_with_full_order_data(df):
     return df
 
 
+def _split_document_paths(value):
+    """Split a (possibly ";"-joined, multi-shipment) document column value."""
+
+    if is_blank(value):
+        return []
+    return [item.strip() for item in str(value).split(";") if item.strip()]
+
+
 def generated_document_is_ready(row, data_key):
     column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
     if not column:
@@ -1236,13 +1245,82 @@ def generated_document_is_ready(row, data_key):
     # A generated/downloaded document is ready for Zendesk upload only when a
     # local PDF exists. Source invoice/RPI URLs from GET_FULL_ORDER must remain
     # internal-only and must not be used as public-response fallbacks.
-    return document_path_exists(str(value).strip())
+    #
+    # The column can hold multiple ";"-joined paths when the ticket covers
+    # several shipments (e.g. one invoice per shipment_order_number). At
+    # least one existing local PDF is enough to consider the document ready
+    # to send; any shipment(s) whose invoice could not be found are reported
+    # separately (see missing_invoice_shipment_orders) instead of blocking
+    # the whole reply.
+    return any(document_path_exists(path) for path in _split_document_paths(value))
 
 
 def invoice_document_is_sendable(row, data_key):
-    """Return True only when an invoice/RPI can be attached to Zendesk."""
+    """Return True when at least one invoice/RPI can be attached to Zendesk."""
 
     return generated_document_is_ready(row, data_key)
+
+
+def requested_shipment_order_numbers(row):
+    return [
+        item.strip()
+        for item in str(row.get("shipment_order_number") or "").split(";")
+        if item.strip()
+    ]
+
+
+def missing_invoice_shipment_orders(row, data_key):
+    """Return shipment_order_number values for which `data_key` has no sendable PDF.
+
+    Only meaningful for invoice/RPI-style documents that can be generated
+    per-shipment. Returns [] when every requested shipment has a ready
+    document, or when there is only a single shipment (in which case the
+    existing missing_required_full_order_values check already blocks the
+    reply, so no partial note is needed).
+    """
+
+    shipment_orders = requested_shipment_order_numbers(row)
+    if len(shipment_orders) <= 1:
+        return []
+
+    column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+    ready_paths = _split_document_paths(row.get(column)) if column else []
+    ready_count = sum(1 for path in ready_paths if document_path_exists(path))
+
+    if ready_count >= len(shipment_orders):
+        return []
+
+    # Exact per-shipment mapping threaded through from the GET_FULL_ORDER
+    # enrichment step (see enrich_dataframe_with_full_order_data): names
+    # precisely which shipment_order_number(s) were missing this data_key.
+    missing_map_raw = row.get(FULL_ORDER_RESPONSE_COLUMNS.get("missing_shipment_orders_by_key"))
+    if not is_blank(missing_map_raw):
+        try:
+            missing_map = json.loads(missing_map_raw)
+        except (TypeError, ValueError):
+            missing_map = {}
+        named_missing = missing_map.get(data_key) or []
+        if named_missing:
+            return list(named_missing)
+
+    missing_count = len(shipment_orders) - ready_count
+
+    # Fallback for handoff rows written before the exact mapping existed, or
+    # for cases the mapping doesn't cover: try to name shipment(s) detected
+    # in the GET_FULL_ORDER API error text (e.g.
+    # ".../orders/DG-US-11582769_NEW"), otherwise just report how many.
+    api_error = row.get(FULL_ORDER_API_ERROR_COLUMN)
+    named_missing = []
+    if not is_blank(api_error):
+        for match in re.finditer(r"/orders/([^\s/?]+)", str(api_error)):
+            order_id = match.group(1).strip()
+            if order_id and order_id not in named_missing:
+                named_missing.append(order_id)
+
+    if named_missing:
+        return named_missing[:missing_count] or named_missing
+
+    return [f"{missing_count} of {len(shipment_orders)} shipment(s)"]
 
 
 def missing_required_full_order_values(row, requested_data):
@@ -1701,15 +1779,25 @@ def should_force_human_intervention(row, requested_data):
             "Human intervention is required instead of sending a partial RPI/UPS-account reply.",
         )
 
-    if contains_correction_or_discrepancy(request_text) and (
-        {
-            "corrected_invoice",
-            "invoice_correction",
-            "value_confirmation",
-            "commercial_invoice",
-            "return_proforma_invoice",
-        }
-        & set(all_requested_data_sources(row))
+    # On the first request for a ticket, boilerplate correction/discrepancy
+    # language (e.g. "CON VALORE CORRETTO...") is treated as noise rather than
+    # a genuine reason to withhold the invoice: simply respond with the
+    # invoice attached. Only block automation on repeat requests, where a
+    # correction/discrepancy claim is more likely to reflect a real issue
+    # with previously-sent documents.
+    if (
+        contains_correction_or_discrepancy(request_text)
+        and normalize_request_number(row.get("request_number", 1)) != 1
+        and (
+            {
+                "corrected_invoice",
+                "invoice_correction",
+                "value_confirmation",
+                "commercial_invoice",
+                "return_proforma_invoice",
+            }
+            & set(all_requested_data_sources(row))
+        )
     ):
         return (
             True,
@@ -1894,9 +1982,43 @@ def build_response(row):
             return f"Hi,\n\nThank you for your message.\nPlease find attached the requested documents:\n{rpi_display}\n\nKind regards,"
 
     if requested_data == ["power_of_attorney"]:
-        return build_power_of_attorney_only_response(row, language)
+        message = build_power_of_attorney_only_response(row, language)
+        return _append_missing_invoice_note(row, requested_data, language, message)
 
-    return build_generic_response(row, requested_data, language)
+    message = build_generic_response(row, requested_data, language)
+    return _append_missing_invoice_note(row, requested_data, language, message)
+
+
+def _append_missing_invoice_note(row, requested_data, language, message):
+    """Append a note when only some of the requested shipments' invoices were found.
+
+    When a ticket covers multiple shipments and the invoice/RPI could not be
+    retrieved for one or more of them, we still send the invoices that were
+    found and simply note which shipment(s) are missing, instead of
+    withholding the whole reply (that full-block behavior is handled earlier
+    by should_force_human_intervention/missing_required_full_order_values,
+    which still fires when *no* invoice at all could be found).
+    """
+
+    if not message:
+        return message
+
+    notes = []
+    for data_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
+        missing = missing_invoice_shipment_orders(row, data_key)
+        if missing:
+            notes.append(", ".join(missing))
+
+    if not notes:
+        return message
+
+    missing_text = "; ".join(notes)
+    if normalize_language(language) == "it":
+        note = f"Nota: non è stato possibile reperire la fattura per: {missing_text}."
+    else:
+        note = f"Note: the invoice could not be found for: {missing_text}."
+
+    return f"{message}\n\n{note}"
 
 
 def requires_human_intervention(row):
@@ -1940,9 +2062,11 @@ def document_attachment_paths_for_response(row, requested_data=None):
         value = row.get(column)
         if is_blank(value):
             continue
-        text_value = str(value).strip()
-        if document_path_exists(text_value) and text_value not in paths:
-            paths.append(text_value)
+        # A column can contain multiple ";"-joined paths when the ticket
+        # covers several shipments; attach every one that exists locally.
+        for text_value in _split_document_paths(value):
+            if document_path_exists(text_value) and text_value not in paths:
+                paths.append(text_value)
     return paths
 
 
