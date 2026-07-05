@@ -45,6 +45,7 @@ from customs_rules import (
     email_matches_any_carrier_domain,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
+    is_noreply_fedex_requester_email,
     normalize_email,
 )
 
@@ -1168,6 +1169,66 @@ def submit_ticket_response(
     return True
 
 
+def submit_ticket_solved_without_response(
+    ticket_id: int,
+    *,
+    auth: HTTPBasicAuth | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Move a ticket straight to ``solved`` with no Zendesk comment at all.
+
+    Used exclusively for automated ``noreply@fedex.com`` requests: FedEx's
+    notification mailbox never reads replies, so posting a public comment
+    would be pointless. The ticket is still solved so it doesn't linger in
+    the active queue, but `body`/`comment` is intentionally omitted from the
+    Zendesk ticket update.
+    """
+
+    auth = auth or zendesk_auth()
+    base_url = (base_url or zendesk_base_url()).rstrip("/")
+
+    ticket_update: dict[str, Any] = {"status": "solved"}
+
+    response = requests.put(
+        f"{base_url}/tickets/{int(ticket_id)}.json",
+        auth=auth,
+        json={"ticket": ticket_update},
+        timeout=60,
+    )
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        error_detail = _zendesk_error_detail(response)
+
+        if response.status_code == 422 and _is_zendesk_closed_ticket_error(error_detail):
+            raise ZendeskTicketClosedError(
+                f"Zendesk ticket {ticket_id} is closed and cannot be updated "
+                f"via the API. Skipping this ticket. Zendesk said: {error_detail}"
+            ) from exc
+
+        # Same "Country <BRAND>" required-field-on-solve situation as
+        # submit_ticket_response(): if we can't resolve it here (no
+        # GET_FULL_ORDER lookup is run for noreply rows), leave the ticket in
+        # its current status rather than failing the whole batch. There is
+        # no comment to post either way, so simply surface success without
+        # the status change.
+        if response.status_code == 422 and _is_zendesk_required_field_for_solve_error(error_detail):
+            print(
+                f"Zendesk ticket {ticket_id}: cannot set status to 'solved' "
+                f"because a required field is missing ({error_detail}). "
+                "Leaving the ticket in its current status; needs manual solving."
+            )
+            return True
+
+        raise requests.HTTPError(
+            f"{exc} | Zendesk ticket {ticket_id} solve-without-response update failed. "
+            f"Zendesk error detail: {error_detail}",
+            response=response,
+        ) from exc
+    return True
+
+
 class ZendeskTicketClosedError(RuntimeError):
     """Raised when Zendesk refuses an update because the ticket is closed."""
 
@@ -1220,8 +1281,23 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
         raw_rows = list(rows)
 
     response_rows = []
+    solve_without_response_rows = []
     for row in raw_rows:
-        if is_noreply_requester_email(row.get("requester_email")):
+        requester_email = row.get("requester_email")
+
+        # noreply@fedex.com is a special case: FedEx's automated mailbox
+        # never reads replies, so instead of leaving the ticket untouched
+        # (the general noreply* behavior below) the agent solves it with no
+        # public comment at all. This must be checked before the general
+        # is_noreply_requester_email() skip, which would otherwise silently
+        # swallow it with no ticket update at all.
+        if is_noreply_fedex_requester_email(requester_email):
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
+            continue
+
+        if is_noreply_requester_email(requester_email):
             continue
         if bool(_to_bool(row.get("human_intervention_required"))):
             continue
@@ -1242,14 +1318,15 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
             )
         response_rows.append((ticket_id, str(final_response).strip(), row))
 
-    if not response_rows:
+    if not response_rows and not solve_without_response_rows:
         print("No Zendesk final responses to submit.")
         return 0
 
     if not zendesk_response_submission_enabled():
         print(
             f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
-            f"{len(response_rows)} Zendesk response(s)."
+            f"{len(response_rows)} Zendesk response(s) and "
+            f"{len(solve_without_response_rows)} FedEx noreply solve-without-response ticket(s)."
         )
         return 0
 
@@ -1257,6 +1334,23 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
     base_url = zendesk_base_url()
     submitted = 0
     failed: list[tuple[int, str]] = []
+
+    # FedEx noreply tickets: move straight to solved, no public comment.
+    for ticket_id, row in solve_without_response_rows:
+        try:
+            if submit_ticket_solved_without_response(
+                ticket_id,
+                auth=auth,
+                base_url=base_url,
+            ):
+                submitted += 1
+        except ZendeskTicketClosedError as exc:
+            print(f"Skipped Zendesk ticket {ticket_id}: {exc}")
+            failed.append((ticket_id, str(exc)))
+        except Exception as exc:  # noqa: BLE001 - one bad ticket must not
+            # abort the rest of the batch.
+            print(f"Failed to solve-without-response Zendesk ticket {ticket_id}: {exc}")
+            failed.append((ticket_id, str(exc)))
 
     for ticket_id, final_response, row in response_rows:
         attachment_paths = _attachment_paths(row.get("zendesk_attachment_paths"))
@@ -1292,8 +1386,9 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
             f"WARNING: {len(failed)} Zendesk response(s) failed to submit "
             f"(ticket id(s): {failed_ids}). See messages above for details."
         )
+        total_attempted = len(response_rows) + len(solve_without_response_rows)
         raise RuntimeError(
-            f"{len(failed)} of {len(response_rows)} Zendesk response(s) failed "
+            f"{len(failed)} of {total_attempted} Zendesk response(s)/solve(s) failed "
             f"to submit after submitting {submitted} successfully. "
             f"Failed ticket id(s): {failed_ids}."
         )
