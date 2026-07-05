@@ -1172,6 +1172,9 @@ def submit_ticket_response(
 def submit_ticket_solved_without_response(
     ticket_id: int,
     *,
+    reason_of_contact: str = 'Altro',
+    order_note: str = '-',
+    country_tag: str | None = None,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1182,12 +1185,35 @@ def submit_ticket_solved_without_response(
     would be pointless. The ticket is still solved so it doesn't linger in
     the active queue, but `body`/`comment` is intentionally omitted from the
     Zendesk ticket update.
+
+    Even without a comment, Zendesk still requires the same mandatory
+    ticket fields as any other solve: Channel, Reason of contact, and Order
+    Number. These are filled in exactly like submit_ticket_response() does,
+    otherwise Zendesk rejects the solve with a 422 "is required" error.
     """
 
     auth = auth or zendesk_auth()
     base_url = (base_url or zendesk_base_url()).rstrip("/")
 
     ticket_update: dict[str, Any] = {"status": "solved"}
+
+    channel_value = _zendesk_field_value(360000381300, "online", auth, base_url)
+    reason_value = _zendesk_field_value(23910471, reason_of_contact, auth, base_url)
+    custom_fields: list[dict[str, Any]] = [
+        {"id": 360000381300, "value": channel_value},
+        {"id": 23910471, "value": reason_value},
+        {"id": 36951465, "value": order_note or "-"},
+    ]
+
+    # Same per-brand "Country <BRAND>" field handling as submit_ticket_response().
+    if country_tag:
+        brand_code = _brand_from_country_tag(country_tag)
+        from customs_rules import country_ticket_field_id_for_brand
+        field_id = country_ticket_field_id_for_brand(brand_code)
+        if field_id:
+            custom_fields.append({"id": field_id, "value": country_tag})
+
+    ticket_update["custom_fields"] = custom_fields
 
     response = requests.put(
         f"{base_url}/tickets/{int(ticket_id)}.json",
@@ -1208,17 +1234,37 @@ def submit_ticket_solved_without_response(
             ) from exc
 
         # Same "Country <BRAND>" required-field-on-solve situation as
-        # submit_ticket_response(): if we can't resolve it here (no
-        # GET_FULL_ORDER lookup is run for noreply rows), leave the ticket in
-        # its current status rather than failing the whole batch. There is
-        # no comment to post either way, so simply surface success without
-        # the status change.
+        # submit_ticket_response(): if we still can't resolve it (e.g.
+        # unmapped brand or missing shipping country -- no GET_FULL_ORDER
+        # lookup is run for noreply rows, so country_tag is usually absent),
+        # retry once without the status change so the mandatory-field values
+        # above are still saved instead of failing the whole batch. There is
+        # no comment either way, so the ticket is simply left unsolved for
+        # manual solving.
         if response.status_code == 422 and _is_zendesk_required_field_for_solve_error(error_detail):
             print(
                 f"Zendesk ticket {ticket_id}: cannot set status to 'solved' "
                 f"because a required field is missing ({error_detail}). "
-                "Leaving the ticket in its current status; needs manual solving."
+                "Retrying without the status change so the mandatory fields "
+                "are still saved; ticket needs manual solving."
             )
+            retry_update = {k: v for k, v in ticket_update.items() if k != "status"}
+            retry_response = requests.put(
+                f"{base_url}/tickets/{int(ticket_id)}.json",
+                auth=auth,
+                json={"ticket": retry_update},
+                timeout=60,
+            )
+            try:
+                retry_response.raise_for_status()
+            except requests.HTTPError as retry_exc:
+                retry_error_detail = _zendesk_error_detail(retry_response)
+                raise requests.HTTPError(
+                    f"{retry_exc} | Zendesk ticket {ticket_id} solve-without-response "
+                    f"update failed (even after retrying without status change). "
+                    f"Zendesk error detail: {retry_error_detail}",
+                    response=retry_response,
+                ) from retry_exc
             return True
 
         raise requests.HTTPError(
@@ -1336,10 +1382,21 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
     failed: list[tuple[int, str]] = []
 
     # FedEx noreply tickets: move straight to solved, no public comment.
+    # Zendesk still requires Channel/Reason of contact/Order Number to solve
+    # a ticket even with no comment, so these are filled in the same way as
+    # for a normal automatic reply.
     for ticket_id, row in solve_without_response_rows:
         try:
             if submit_ticket_solved_without_response(
                 ticket_id,
+                reason_of_contact=str(
+                    row.get('reason_of_contact')
+                    or row.get('contact_reason')
+                    or row.get('zendesk_reason_of_contact')
+                    or 'Altro'
+                ),
+                order_note=str(row.get('shipment_order_number') or row.get('order_number') or '-'),
+                country_tag=row.get('zendesk_country_tag') or None,
                 auth=auth,
                 base_url=base_url,
             ):
