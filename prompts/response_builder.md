@@ -29,6 +29,8 @@ Carrier notification/status emails that were classified as `exclude_from_process
 
 If `requester_email` starts with `noreply`, do not create a public Zendesk reply regardless of the detected requested data. Create a `HUMAN INTERVENTION REQUIRED` draft that summarizes what the request appears to be about, keep `final_response` empty, and mark the row as human intervention required. Do not run GET_FULL_ORDER or document generation only for a `noreply*` sender because no automatic response will be sent.
 
+**Exception:** if `requester_email` is exactly `noreply@fedex.com` (not any other `noreply*` address), do not build the `HUMAN INTERVENTION REQUIRED` note above. Instead, set both `draft_response` and `final_response` to a note stating that the ticket was submitted as solved, without a response, because the request comes from `noreply@fedex.com`. No public Zendesk comment is ever posted for this address either — the ticket-submission step moves it straight to `solved` with a status-only update instead of posting `final_response` as a comment. Still skip GET_FULL_ORDER and document generation for this sender, exactly like any other `noreply*` address.
+
 ## Tracking Not Found in Shipments Table Rule
 
 When no `extracted_tracking_number` is found in the ticket, the request must not be analyzed by regex or LLM. `draft_response` must be a human-intervention note saying that the tracking number was not found, and `final_response` must stay empty.
@@ -282,7 +284,7 @@ Cordiali saluti,
 
 Do not create a public customer-facing reply for informational carrier/status notifications. This includes delivery or pickup notices, customs-cleared/MRN confirmations, import declaration document receipts, carrier billing/copy-invoice emails, case-created/case-closed acknowledgements, and messages that explicitly say no action is required. These rows should be excluded from processing and the draft should explain the no-action reason.
 
-Requester emails starting with `noreply` must never receive a public Zendesk reply. Keep a human-intervention draft explaining what the message appears to be about. For status-only `noreply` notifications, say that no actionable data request was detected instead of listing false requested-data fields.
+Requester emails starting with `noreply` must never receive a public Zendesk reply. Keep a human-intervention draft explaining what the message appears to be about. For status-only `noreply` notifications, say that no actionable data request was detected instead of listing false requested-data fields. Exception: `noreply@fedex.com` exactly is instead submitted as `solved` with no comment; both `draft_response` and `final_response` state that it was solved without a response because the request comes from `noreply@fedex.com`.
 
 Route these cases to human intervention rather than sending a partial automatic answer:
 
@@ -372,5 +374,7 @@ Whenever `export_tracking_number` is part of the response data (either directly 
 3. Decode the ZPL (base64 first, falling back to raw ZPL if decoding fails) and render it to PDF via the Labelary rendering API (see `ZPL_to_PDF_converter.py` for the reference implementation).
 4. Save the PDF to `generated_documents/shipping_labels/<shipment_order_number>.pdf`.
 5. Attach the generated PDF in the final response alongside the export tracking number, for every shipment on the ticket.
+
+If any of these steps fail and the label PDF cannot be produced, still send `export_tracking_number` in the response with its real value. A missing/failed shipping label must never block the reply or trigger a human-intervention note by itself — just drop the `shipping_label` line (and skip its attachment) from that response.
 
 Draft responses should include the generated file path as a Markdown-style link when the document is referenced.
