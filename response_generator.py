@@ -63,6 +63,7 @@ from customs_rules import (
     is_missing_extracted_tracking_number,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
+    is_noreply_fedex_requester_email,
     is_returns_customs_clearance,
     is_unpaid_extra_charges_request as rules_is_unpaid_extra_charges_request,
     is_ups_uk_import_clearance_instructions_request,
@@ -782,6 +783,31 @@ def build_noreply_human_intervention_note(row, requested_data=None):
     )
 
 
+def build_noreply_fedex_solved_note(row):
+    """Note used for BOTH draft_response and final_response on noreply@fedex.com rows.
+
+    These tickets are never given a public Zendesk reply (FedEx's automated
+    mailbox never reads them), but the ticket itself is still submitted as
+    ``solved``. Unlike every other human-intervention/no-reply row, the
+    BigQuery ``final_response`` column is intentionally NOT left blank here:
+    it must record why the ticket was solved with no response. This text is
+    never posted to Zendesk as a comment; ticket_fetcher.submit_final_responses
+    routes noreply@fedex.com rows to a status-only update instead of using
+    this text as a comment body.
+    """
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+    requester = normalize_email(row.get("requester_email"))
+
+    return (
+        "Ticket submitted as solved, without a response, because the "
+        "request comes from noreply@fedex.com.\n\n"
+        f"Requester: {requester}\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
+    )
+
+
 def llm_human_intervention_draft(row):
     return normalize_text(row.get("llm_human_intervention_draft_response", ""))
 
@@ -1341,8 +1367,11 @@ def missing_required_full_order_values(row, requested_data):
         if not invoice_document_is_sendable(row, invoice_key) and invoice_key not in missing:
             missing.append(invoice_key)
 
-    if "shipping_label" in requested_data and not generated_document_is_ready(row, "shipping_label"):
-        missing.append("shipping_label_pdf")
+    # Deliberately NOT added to `missing`: a shipping label that failed to
+    # generate/retrieve must never withhold the rest of the reply. When
+    # export_tracking_number is otherwise ready, the customer still gets the
+    # tracking number; build_generic_response() drops the "Shipping label"
+    # line on its own when the PDF isn't ready, instead of blocking here.
 
     if needs_loa or needs_poa:
         if is_blank(tracking_number_for_documents(row)):
@@ -1480,6 +1509,18 @@ def build_power_of_attorney_only_response(row, language):
 
 
 def build_generic_response(row, requested_data, language):
+    # A shipping label that could not be generated/retrieved must never
+    # withhold the rest of the reply (e.g. the export tracking number).
+    # Robustness fix: only show/attach the "Shipping label" line when the
+    # PDF actually exists locally; otherwise silently drop just that key
+    # from the displayed response (missing_required_full_order_values()
+    # deliberately does not block the whole reply for this either).
+    requested_data = [
+        data_key
+        for data_key in requested_data
+        if data_key != "shipping_label" or generated_document_is_ready(row, "shipping_label")
+    ]
+
     lines = []
 
     for data_key in requested_data:
@@ -1913,6 +1954,9 @@ def build_response(row):
             "The tracking number was not found in the ticket. The request was not analyzed.",
         )
 
+    if is_noreply_fedex_requester_email(requester_email):
+        return build_noreply_fedex_solved_note(row)
+
     if is_noreply_requester_email(requester_email):
         return build_noreply_human_intervention_note(row, requested_data)
 
@@ -2192,6 +2236,14 @@ def _remove_document_values_from_response(response_text, document_values):
 
 
 def build_final_response(row):
+    if is_noreply_fedex_requester_email(row.get("requester_email")):
+        # Deliberately non-blank: this is the one case where final_response
+        # is populated even though no public Zendesk comment is ever sent.
+        # ticket_fetcher.submit_final_responses() special-cases
+        # noreply@fedex.com rows to a status-only "solved" update and never
+        # uses this text as a comment body.
+        return build_noreply_fedex_solved_note(row)
+
     if is_noreply_requester_email(row.get("requester_email")):
         return ""
 
