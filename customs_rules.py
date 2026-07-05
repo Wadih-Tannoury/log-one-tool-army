@@ -1559,6 +1559,31 @@ def is_noreply_requester_email(email: object) -> bool:
     return False
 
 
+def is_noreply_fedex_requester_email(email: object) -> bool:
+    """Return True only for the exact FedEx notification address.
+
+    This is a narrower, more specific check than
+    ``is_noreply_requester_email``: it only matches
+    ``noreply@fedex.com`` (tolerating the same ``Name <noreply@fedex.com>``
+    display-name wrapping and surrounding whitespace/case), not every
+    ``noreply*`` sender. Every request from this address gets solved
+    without a public Zendesk reply, regardless of what data it appears to
+    request.
+    """
+    normalized = normalize_email(email)
+    if not normalized:
+        return False
+
+    if normalized == "noreply@fedex.com":
+        return True
+
+    for match in re.finditer(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", normalized):
+        if match.group(0) == "noreply@fedex.com":
+            return True
+
+    return False
+
+
 def normalize_request_number(value: object) -> int:
     try:
         if value is None or (isinstance(value, float) and math.isnan(value)):
