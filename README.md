@@ -54,6 +54,12 @@ Carrier-domain notification emails that historically did not need a customer-fac
 
 Requester emails whose address starts with `noreply` are never answered automatically. They still get a `draft_response` that summarizes the detected request, `human_intervention_required=true`, an empty `final_response`, and no GET_FULL_ORDER/document-generation work. This keeps the request visible to a human without creating a Zendesk public reply to an automated mailbox.
 
+**Exception — `noreply@fedex.com`:** every request from this exact address is submitted as `solved` with no Zendesk comment at all, instead of being left for human review. `customs_rules.is_noreply_fedex_requester_email()` matches only the exact address `noreply@fedex.com` (tolerating `Name <noreply@fedex.com>` wrapping and case), not every `noreply*` sender. For these rows:
+
+- `draft_response` and `final_response` are both set to a note stating that the ticket was submitted as solved, without a response, because the request comes from `noreply@fedex.com`. This is the one case where `final_response` is intentionally non-blank even though no public comment is ever sent — the text exists purely to explain the outcome in the BigQuery history table.
+- `ticket_fetcher.submit_final_responses()` checks `is_noreply_fedex_requester_email()` before the general noreply skip and routes these tickets to `submit_ticket_solved_without_response()`, which issues a Zendesk ticket update containing only `{"status": "solved"}` — no `comment` field, so nothing is posted publicly. This is a different code path from `submit_ticket_response()`, which always requires a non-empty comment body.
+- No GET_FULL_ORDER lookup or document generation is run for these rows, same as any other `noreply*` sender.
+
 ## Gemini LLM fallback
 
 `intent_detection.py` uses `GEMINI_MODEL` as the primary model, defaulting to `gemini-2.5-flash`. If that exact primary model fails with a Gemini limit/quota error such as HTTP 429 or `RESOURCE_EXHAUSTED`, the detector immediately switches to the fallback model. The fallback defaults to `gemini-3.1-flash-lite` and can be overridden with either `GEMINI_RATE_LIMIT_FALLBACK_MODEL` or `GEMINI_FALLBACK_MODEL`.
@@ -163,6 +169,8 @@ Whenever `export_tracking_number` is part of a response (directly requested or a
 
 This requires `reportlab` and `pillow`, which are installed by the GitHub Actions workflow alongside the other pipeline dependencies.
 
+**Robustness:** a shipping label that fails to generate/retrieve never withholds the rest of the reply. `missing_required_full_order_values()` deliberately does not treat a missing `shipping_label` PDF as a blocking condition, so a row is only routed to human intervention for reasons unrelated to the label. `response_generator.build_generic_response()` independently drops the `shipping_label` key from the displayed response (and from the "attached documents" intro wording) whenever `generated_document_is_ready(row, "shipping_label")` is false, while still rendering the `export_tracking_number` line with its real value. In short: if the tracking number was retrieved but the label PDF was not, the customer still gets the tracking number and simply doesn't see a "Shipping label" line; the ticket is not silently escalated to human intervention over the label alone.
+
 The GitHub Actions workflow always uploads `generated_documents` as the `generated-customs-documents` artifact. Committing those files back into the repository is optional and controlled by the manual `workflow_dispatch` input `persist_generated_documents`, which defaults to `false`.
 
 
@@ -174,7 +182,7 @@ The GitHub Actions workflow always uploads `generated_documents` as the `generat
 - `draft_response`: the internal/audit draft, which may still include generated-document references;
 - `final_response`: the exact public Zendesk comment body.
 
-For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. This includes `noreply*` requester emails, where the draft is an internal human-review summary rather than a customer-facing response. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the public body only lists the data/document labels being provided, for example `- RPI`, `- Commercial invoice`, or `LOA`, never a GitHub URL, GET_FULL_ORDER source URL, RPI/invoice link, or local document path. If an invoice/RPI source link exists but no local PDF attachment can be produced, the row is routed to human intervention and the source link remains available only in `draft_response` for internal review.
+For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. This includes `noreply*` requester emails, where the draft is an internal human-review summary rather than a customer-facing response. The one exception is `noreply@fedex.com` (see above): its `final_response` is intentionally non-blank — it documents that the ticket was solved without a response — but that text is still never posted as a Zendesk comment; the ticket is solved via a status-only update instead. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the public body only lists the data/document labels being provided, for example `- RPI`, `- Commercial invoice`, or `LOA`, never a GitHub URL, GET_FULL_ORDER source URL, RPI/invoice link, or local document path. If an invoice/RPI source link exists but no local PDF attachment can be produced, the row is routed to human intervention and the source link remains available only in `draft_response` for internal review.
 
 The BigQuery history table is migrated additively at runtime with:
 
@@ -216,7 +224,8 @@ Additional response guardrails:
 - If the ticket request body contains `sdoganamento`, `export_tracking_number` is included in the response data so the draft and final public response mention the export tracking number.
 - If `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, the row is routed to human intervention by default.
 - Informational carrier notices, delivery/pickup notifications, import/export document receipts, automatic billing/case updates, acknowledgement-only replies, and customs-cleared/status-only messages are excluded from processing. They receive an internal `draft_response` reason and never produce a public Zendesk `final_response`.
-- `noreply*` requester emails remain human-intervention rows with no public Zendesk reply. If the message is also a status/no-action notification, the draft summary says that no actionable data request was detected instead of listing misleading requested-data labels.
+- `noreply*` requester emails remain human-intervention rows with no public Zendesk reply. If the message is also a status/no-action notification, the draft summary says that no actionable data request was detected instead of listing misleading requested-data labels. The sole exception is `noreply@fedex.com`, which is instead submitted as `solved` with no comment (see above).
+- A missing shipping-label PDF is never a reason by itself to block a reply or force human intervention; the export tracking number (and everything else requested) is still sent, with the shipping-label line/attachment simply omitted.
 - UPS UK import-clearance instruction emails asking for customs procedure, commodity code, EORI, DAN/deferment approval, UPS credit-account usage, or possible extra charges are routed to human intervention and skipped for GET_FULL_ORDER/document generation.
 - Cost/penalty/abandonment requests, including Spanish requests to accept generated expenses or sanctions and authorization-of-expenses letters, are routed to human intervention.
 - Invoice/value/MRN/import-export discrepancies and requests for corrected return invoices or corrected values are routed to human intervention instead of sending a normal generated RPI/commercial-invoice reply.
