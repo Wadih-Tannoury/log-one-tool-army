@@ -147,7 +147,7 @@ For the UPS UK import-clearance instruction template from UPS Brokerage at East 
 
 ## UPS Extra Charges Rule
 
-If the request says the customer, consignee, receiver, destinatario, or cliente did not pay extra charges, outstanding charges, oneri, costi, spese, addebiti, dazi, or diritti, return only:
+If the request says the customer, consignee, receiver, destinatario, or cliente did not pay, or refused to pay, extra charges, outstanding charges, import charges, oneri, costi, spese, addebiti, dazi, or diritti, return only:
 
 ```json
 {
@@ -162,9 +162,11 @@ Do not return `ups_account_number` for unpaid-extra-charge cases unless the mess
 
 ## Customer Refused Package Rule
 
-If the carrier says the customer, consignee, receiver, destinatario, or cliente refused the package and asks how TLG wants to proceed, return `ups_account_number`. This is the standard return-cost/LOA response case.
+If the carrier says the customer, consignee, receiver, destinatario, or cliente refused the package itself (refused delivery/refused the parcel) and asks how TLG wants to proceed, return `ups_account_number`. This is the standard return-cost/LOA response case.
 
 Do not classify a refused-package request as generic `shipment_instructions`.
+
+**Important — this rule does not apply when the refusal is about paying charges.** "The consignee refused to pay the import charges" is a refusal to pay, not a refusal of the package, even though it also mentions returning the shipment. Always check the Unpaid Extra Charges Rule above first: any refusal to pay charges/duties/fees must be classified as `human_intervention_required`, never as `ups_account_number`, regardless of whether the message also talks about returning the shipment.
 
 ## UPS Receiver Contact / Clearance Templates
 
