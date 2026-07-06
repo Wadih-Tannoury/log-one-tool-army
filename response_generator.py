@@ -181,15 +181,19 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"(?:customer|consignee|receiver|destinatario|cliente)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"refus(?:ed|es|al)(?:\s+to)?\s+pay|"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante|"
+    r"rifiutat[oa][\s\S]{0,40}pagare|rifiuta(?:to)?\s+di\s+pagare)"
     r"[\s\S]{0,120}"
-    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)|"
-    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"refus(?:ed|es|al)(?:\s+to)?\s+pay|"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante|"
+    r"rifiutat[oa][\s\S]{0,40}pagare|rifiuta(?:to)?\s+di\s+pagare)"
     r")",
     re.IGNORECASE,
 )
@@ -1079,13 +1083,16 @@ def requested_data_for_response(row):
     if only_libera_esportazione_regex_type(row.get("regex_request_types")):
         return []
 
-    if is_customer_refused_return_request(request_text):
-        return ["ups_account_number"]
-
-    # Unpaid extra/outstanding charges require a human decision about who must
-    # pay.  Do not auto-authorize charges to the UPS account.
+    # Unpaid extra/outstanding charges (including a refusal to pay them) require
+    # a human decision about who must pay. Do not auto-authorize charges to the
+    # UPS account, and check this before the refused-package rule below so a
+    # "refused to pay the charges" case is never mistaken for a "refused the
+    # package" case.
     if is_unpaid_extra_charges_request(request_text):
         return [HUMAN_INTERVENTION_REQUIRED]
+
+    if is_customer_refused_return_request(request_text):
+        return ["ups_account_number"]
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
     if only_libera_esportazione_requested_data(requested_data):
@@ -2034,35 +2041,19 @@ def build_response(row):
 
 
 def _append_missing_invoice_note(row, requested_data, language, message):
-    """Append a note when only some of the requested shipments' invoices were found.
-
-    When a ticket covers multiple shipments and the invoice/RPI could not be
+    """When a ticket covers multiple shipments and the invoice/RPI could not be
     retrieved for one or more of them, we still send the invoices that were
-    found and simply note which shipment(s) are missing, instead of
-    withholding the whole reply (that full-block behavior is handled earlier
-    by should_force_human_intervention/missing_required_full_order_values,
-    which still fires when *no* invoice at all could be found).
+    found for the other shipment(s), instead of withholding the whole reply
+    (that full-block behavior is handled earlier by
+    should_force_human_intervention/missing_required_full_order_values, which
+    still fires when *no* invoice at all could be found).
+
+    We intentionally do NOT flag which shipment(s) are missing in the reply
+    itself (e.g. no "Nota: non è stato possibile reperire la fattura per: ...").
+    That kind of note should not be sent to the customer; it stays internal.
     """
 
-    if not message:
-        return message
-
-    notes = []
-    for data_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
-        missing = missing_invoice_shipment_orders(row, data_key)
-        if missing:
-            notes.append(", ".join(missing))
-
-    if not notes:
-        return message
-
-    missing_text = "; ".join(notes)
-    if normalize_language(language) == "it":
-        note = f"Nota: non è stato possibile reperire la fattura per: {missing_text}."
-    else:
-        note = f"Note: the invoice could not be found for: {missing_text}."
-
-    return f"{message}\n\n{note}"
+    return message
 
 
 def requires_human_intervention(row):
