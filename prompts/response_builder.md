@@ -93,11 +93,11 @@ Cordiali saluti,
 
 ## UPS Extra Charges Rule
 
-When the request says the customer/receiver/destinatario did not pay extra or outstanding charges, do not authorize payment automatically and do not draft a UPS-account response. Create a human-intervention note because a human must verify whether the customer or TLG should pay the extra charges.
+When the request says the customer/receiver/destinatario did not pay, or refused to pay, extra or outstanding charges, do not authorize payment automatically and do not draft a UPS-account response. Create a human-intervention note because a human must verify whether the customer or TLG should pay the extra charges. This rule takes precedence over the Customer Refused Package Rule below: a message saying the consignee "refused to pay the charges" — even if it also mentions returning the shipment — must never receive the automatic UPS-account/LOA response; it must always be escalated for human review.
 
 ## Customer Refused Package Rule
 
-When the carrier says the customer/receiver refused the package and asks how to proceed, classify as `ups_account_number` and draft the standard UPS account/LOA return-cost response:
+When the carrier says the customer/receiver refused the package itself (not a refusal to pay charges) and asks how to proceed, classify as `ups_account_number` and draft the standard UPS account/LOA return-cost response:
 
 ```text
 Hello,
@@ -376,5 +376,9 @@ Whenever `export_tracking_number` is part of the response data (either directly 
 5. Attach the generated PDF in the final response alongside the export tracking number, for every shipment on the ticket.
 
 If any of these steps fail and the label PDF cannot be produced, still send `export_tracking_number` in the response with its real value. A missing/failed shipping label must never block the reply or trigger a human-intervention note by itself — just drop the `shipping_label` line (and skip its attachment) from that response.
+
+## Multi-Shipment Documents: Partial Retrieval
+
+When a request asks for documents (invoice, RPI, label, etc.) for more than one shipment and at least one shipment's document is found, reply with the document(s) found and attach them. Do **not** add a note telling the customer that a document could not be found for the other shipment(s) (e.g. do not write "Nota: non è stato possibile reperire la fattura per: ..." or "Note: the invoice could not be found for: ..."). That kind of gap is tracked internally, not surfaced in the customer-facing reply. Only escalate for human intervention when *no* document at all could be found for any shipment on the ticket.
 
 Draft responses should include the generated file path as a Markdown-style link when the document is referenced.
