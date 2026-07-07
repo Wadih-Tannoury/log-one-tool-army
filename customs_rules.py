@@ -435,7 +435,10 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"(?:accept|approve|authorize)\s+(?:all\s+)?(?:charges?|fees?|costs?|penalt(?:y|ies))|"
     r"(?:extra\s+charges?|processing\s+fee|storage\s+fees?|deferment\s+fee|ups\s+dan|fee\s+of\s+\d)|"
     r"(?:accettare|autorizzare|approvare)\s+(?:tutti\s+)?(?:i\s+)?(?:costi|oneri|spese|addebiti|dazi)|"
-    r"(?:costi|oneri|spese|addebiti|dazi)[\s\S]{0,120}(?:accettare|autorizzare|approvare)"
+    r"(?:costi|oneri|spese|addebiti|dazi)[\s\S]{0,120}(?:accettare|autorizzare|approvare)|"
+    r"(?:import\s+)?charges?\s+due\s*:?\s*[£$€]?\s*\d|"
+    r"acceptance\s+of\s+all\s+outstanding\s+charges|"
+    r"outstanding\s+charges\s+due"
     r")",
     re.IGNORECASE,
 )
