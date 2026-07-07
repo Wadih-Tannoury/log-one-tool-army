@@ -1893,12 +1893,18 @@ def download_invoice_pdf(
     *,
     row: Mapping[str, Any] | None = None,
     session: requests.Session | None = None,
+    output_path_override: Path | None = None,
 ) -> str:
-    """Download an invoice PDF link into generated_documents/invoice.
+    """Download a PDF link (invoice, RPI, or hosted shipping label) into
+    generated_documents/invoice by default.
 
     Some DocOpen.aspx links return an HTML wrapper that Chrome executes before
     downloading the real PDF. This function follows regular redirects, emulates
     ASP.NET __doPostBack links, and follows PDF/redirect URLs found in that wrapper.
+
+    Pass output_path_override to save the downloaded PDF at a specific path
+    (e.g. generated_documents/shipping_labels/<order>.pdf) instead of the
+    default invoice output folder/filename derivation.
     """
 
     source = str(source_link or "").strip()
@@ -1910,7 +1916,11 @@ def download_invoice_pdf(
             return str(source)
         raise DocumentGenerationError(f"Invoice source is not a downloadable URL: {source}")
 
-    output_path = _invoice_output_path(source, data_key, row)
+    if output_path_override is not None:
+        output_path = output_path_override
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = _invoice_output_path(source, data_key, row)
     if output_path.exists() and output_path.is_file() and output_path.stat().st_size > 0:
         return output_path.as_posix()
 
@@ -2243,13 +2253,18 @@ def _label_shipment_blocks(payload: dict) -> list[dict]:
     return []
 
 
-def extract_return_label_zpl(payload: dict) -> str:
-    """Return the ZPL for the return label block (shipment.isReturn == False).
+def extract_return_label_data(payload: dict) -> str:
+    """Return the raw labelData for the return label block (shipment.isReturn == False).
 
     The labels API usually returns two blocks: one for the outbound shipment
     and one for the return. The return label is the block where
     isReturn == False (the outbound leg carries isReturn == True since it is
-    part of a returns flow); labelData holds the (often base64-encoded) ZPL.
+    part of a returns flow); labelData holds either a (often base64-encoded)
+    ZPL string, or a URL pointing to a hosted PDF label (e.g. an Azure blob
+    storage link such as
+    "https://tlgspstorage.blob.core.windows.net/pdflabels/.../LABEL.pdf").
+    Callers should inspect the returned value (see _label_data_is_pdf_link)
+    to decide whether to decode it as ZPL or download it as a PDF.
     """
 
     for block in _label_shipment_blocks(payload):
@@ -2262,6 +2277,33 @@ def extract_return_label_zpl(payload: dict) -> str:
         "No return label block (shipment.isReturn == false) with labelData "
         "found in the labels API response"
     )
+
+
+# Backwards-compatible alias: existing callers/tests may still import the
+# original name. The returned value can now be either ZPL or a PDF URL.
+extract_return_label_zpl = extract_return_label_data
+
+
+def _label_data_is_pdf_link(label_data: str) -> bool:
+    """Return True if labelData looks like a URL to a hosted PDF label.
+
+    Some carriers/label providers return a direct link to a pre-rendered PDF
+    (e.g. Azure blob storage URLs like
+    ".../pdflabels/2026/06/12/LN-EUA01675973_....pdf") instead of a ZPL
+    string. In that case the label should simply be downloaded, the same way
+    invoices/RPIs are downloaded from GETFULLORDER links, instead of being
+    decoded/rendered as ZPL.
+    """
+
+    text = str(label_data or "").strip()
+    if not text:
+        return False
+    if not is_url(text):
+        return False
+
+    parsed = urlparse(text)
+    path = unquote(parsed.path or "")
+    return path.lower().endswith(".pdf")
 
 
 def _decode_zpl(encoded_zpl: str) -> str:
@@ -2340,8 +2382,23 @@ def generate_shipping_label_document(row: Mapping[str, Any]) -> str:
             continue
 
         payload = fetch_shipment_labels(shipment_order_number)
-        zpl = extract_return_label_zpl(payload)
-        generated_paths.append(render_zpl_label_pdf(zpl, output_path))
+        label_data = extract_return_label_data(payload)
+
+        if _label_data_is_pdf_link(label_data):
+            # labelData is already a hosted PDF link (e.g. an Azure blob
+            # storage URL) rather than ZPL. Download it directly, the same
+            # way invoices/RPIs are downloaded from GETFULLORDER links,
+            # instead of trying to decode/render it as ZPL.
+            generated_paths.append(
+                download_invoice_pdf(
+                    label_data,
+                    "shipping_label",
+                    row=row,
+                    output_path_override=output_path,
+                )
+            )
+        else:
+            generated_paths.append(render_zpl_label_pdf(label_data, output_path))
 
     return ";".join(generated_paths)
 
