@@ -46,6 +46,8 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_noreply_fedex_requester_email,
+    is_missing_extracted_tracking_number,
+    is_purely_informative_request,
     normalize_email,
 )
 
@@ -1343,6 +1345,26 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 solve_without_response_rows.append((ticket_id, row))
             continue
 
+        # The tracking number could not be extracted from the ticket, but the
+        # message is purely informative with no data or action requested.
+        # Treat this the same way as noreply@fedex.com above: solve the
+        # ticket with no public comment, instead of leaving it for human
+        # review. Must be checked before the general noreply*/human
+        # intervention skips below, which would otherwise silently swallow
+        # it with no ticket update at all.
+        if is_missing_extracted_tracking_number(
+            row.get("extracted_tracking_number")
+        ) and is_purely_informative_request(
+            "\n".join(
+                str(row.get(column) or "")
+                for column in ("subject", "cleaned_request_body", "request_body")
+            )
+        ):
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
+            continue
+
         if is_noreply_requester_email(requester_email):
             continue
         if bool(_to_bool(row.get("human_intervention_required"))):
@@ -1372,7 +1394,8 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
         print(
             f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
             f"{len(response_rows)} Zendesk response(s) and "
-            f"{len(solve_without_response_rows)} FedEx noreply solve-without-response ticket(s)."
+            f"{len(solve_without_response_rows)} solve-without-response ticket(s) "
+            "(FedEx noreply / missing-tracking informative)."
         )
         return 0
 
@@ -1381,10 +1404,12 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
     submitted = 0
     failed: list[tuple[int, str]] = []
 
-    # FedEx noreply tickets: move straight to solved, no public comment.
-    # Zendesk still requires Channel/Reason of contact/Order Number to solve
-    # a ticket even with no comment, so these are filled in the same way as
-    # for a normal automatic reply.
+    # Solve-without-response tickets: FedEx noreply rows, and rows where the
+    # tracking number could not be extracted but the message is purely
+    # informative. Move straight to solved, no public comment. Zendesk still
+    # requires Channel/Reason of contact/Order Number to solve a ticket even
+    # with no comment, so these are filled in the same way as for a normal
+    # automatic reply.
     for ticket_id, row in solve_without_response_rows:
         try:
             if submit_ticket_solved_without_response(
