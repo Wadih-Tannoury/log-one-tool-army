@@ -74,7 +74,7 @@ Do not guess between similar document types. For example, if the message could m
 
 ## Missing Tracking Number Guard
 
-Rows with no `extracted_tracking_number` must not be sent to the LLM. The pipeline should create a human-intervention draft saying that the tracking number was not found and leave `final_response` empty.
+Rows with no `extracted_tracking_number` must not be sent to the LLM. The pipeline first checks whether the message is purely informative (no data or action requested): if so, it is submitted as solved without a response, the same way as `noreply@fedex.com`. Otherwise, the pipeline creates a human-intervention draft saying that the tracking number was not found and leaves `final_response` empty.
 
 ## Tracking Not Found Handoff
 
