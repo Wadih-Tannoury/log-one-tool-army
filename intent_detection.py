@@ -41,6 +41,7 @@ from customs_rules import (
     detect_language_with_dictionary,
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
+    is_purely_informative_request,
     is_request_number_3_or_higher,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
@@ -762,13 +763,24 @@ def main():
 
     for _, row in unmatched_df.iterrows():
         if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
-            llm_results.append(
-                build_human_output_row(
-                    row,
-                    "The tracking number was not found in the ticket. The request was not analyzed.",
-                    engine="missing_tracking_number_guard",
+            if is_purely_informative_request(source_text_for_llm(row)):
+                llm_results.append(
+                    build_exclude_output_row(
+                        row,
+                        "The tracking number was not found in the ticket, but the "
+                        "message is purely informative with no data or action "
+                        "requested. Submitted as solved without a response.",
+                        engine="missing_tracking_informative_solved",
+                    )
                 )
-            )
+            else:
+                llm_results.append(
+                    build_human_output_row(
+                        row,
+                        "The tracking number was not found in the ticket. The request was not analyzed.",
+                        engine="missing_tracking_number_guard",
+                    )
+                )
         elif is_tracking_lookup_not_found(row):
             # User requirement: when the extracted tracking number is missing from
             # shipping_platform_shipments, bypass regex/hard guards and let the
