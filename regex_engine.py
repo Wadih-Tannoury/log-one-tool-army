@@ -56,6 +56,7 @@ from customs_rules import (
     is_missing_extracted_tracking_number,
     is_acknowledgement_only,
     is_platform_handoff_request,
+    is_purely_informative_request,
     is_request_number_3_or_higher,
     normalize_request_number,
     is_special_followup_ticket,
@@ -364,6 +365,35 @@ class RegexEngine:
         ).strip().lower() in {"true", "1", "yes", "y"}
 
         if is_missing_extracted_tracking_number(extracted_tracking_number):
+            if is_purely_informative_request(cleaned_text):
+                # No tracking number could be extracted, but the message is
+                # purely informative with no data or action requested. Treat
+                # this the same way as noreply@fedex.com: submit the ticket
+                # as solved without ever sending a public reply, instead of
+                # routing it to human intervention.
+                return self._as_output(
+                    matched=True,
+                    excluded=False,
+                    request_types=["missing_tracking_informative_solved"],
+                    requested_data=[],
+                    cleaned_request_text=cleaned_text,
+                    matched_spans=[],
+                    confidence=HIGH_CONFIDENCE,
+                    notes=(
+                        "The tracking number was not found in the ticket, but "
+                        "the message is purely informative with no data or "
+                        "action requested. Submitted as solved without a "
+                        "response."
+                    ),
+                    needs_llm_confirmation=False,
+                    force_human_intervention=False,
+                    human_intervention_required=False,
+                    regex_request_types=[],
+                    regex_requested_data=[],
+                    quoted_history_removed=quoted_history_removed,
+                    signature_removed=signature_removed,
+                )
+
             return self._as_output(
                 matched=True,
                 excluded=False,
@@ -932,9 +962,19 @@ class RegexEngine:
             )
             force_human = True
 
-        if contains_correction_or_discrepancy(cleaned_text) and (
-            {"invoice", "invoice_correction", "value_confirmation", "return_proforma_invoice"}
-            & set(real_request_types)
+        # On the first request for a ticket, correction/discrepancy language
+        # (e.g. "CON VALORE CORRETTO...") is treated as noise rather than a
+        # genuine reason to withhold the invoice: answer with the data found.
+        # Only block automation on repeat requests (request_number != 1),
+        # where a correction/discrepancy claim is more likely to reflect a
+        # real issue with previously-sent documents.
+        if (
+            contains_correction_or_discrepancy(cleaned_text)
+            and normalize_request_number(request_number) != 1
+            and (
+                {"invoice", "invoice_correction", "value_confirmation", "return_proforma_invoice"}
+                & set(real_request_types)
+            )
         ):
             review_reasons.append(
                 "Correction/discrepancy language detected for invoice/value data. "
