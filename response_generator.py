@@ -64,6 +64,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_noreply_fedex_requester_email,
+    is_purely_informative_request,
     is_returns_customs_clearance,
     is_unpaid_extra_charges_request as rules_is_unpaid_extra_charges_request,
     is_ups_uk_import_clearance_instructions_request,
@@ -807,6 +808,30 @@ def build_noreply_fedex_solved_note(row):
         "Ticket submitted as solved, without a response, because the "
         "request comes from noreply@fedex.com.\n\n"
         f"Requester: {requester}\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
+    )
+
+
+def build_missing_tracking_solved_note(row):
+    """Note used for BOTH draft_response and final_response when the tracking
+    number could not be extracted from the ticket, but the message is purely
+    informative with no data or action requested.
+
+    Like noreply@fedex.com rows, these tickets never receive a public Zendesk
+    reply, but the ticket itself is still submitted as ``solved``. The
+    BigQuery ``final_response`` column intentionally is NOT left blank here;
+    this text is never posted to Zendesk as a comment -
+    ticket_fetcher.submit_final_responses routes these rows to a status-only
+    update instead of using this text as a comment body.
+    """
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+
+    return (
+        "Ticket submitted as solved, without a response, because the "
+        "tracking number was not found in the ticket and the message is "
+        "purely informative, with no data or action requested.\n\n"
         f"Ticket: {ticket_id}\n"
         f"Request number: {request_number}"
     )
@@ -1956,6 +1981,8 @@ def build_response(row):
         ]
 
     if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+        if is_purely_informative_request(request_text):
+            return build_missing_tracking_solved_note(row)
         return build_human_intervention_note(
             row,
             "The tracking number was not found in the ticket. The request was not analyzed.",
@@ -2234,6 +2261,15 @@ def build_final_response(row):
         # noreply@fedex.com rows to a status-only "solved" update and never
         # uses this text as a comment body.
         return build_noreply_fedex_solved_note(row)
+
+    if is_missing_extracted_tracking_number(
+        row.get("extracted_tracking_number")
+    ) and is_purely_informative_request(row_request_text(row)):
+        # Deliberately non-blank, same treatment as noreply@fedex.com above:
+        # ticket_fetcher.submit_final_responses() routes these rows to a
+        # status-only "solved" update instead of posting this text as a
+        # public comment.
+        return build_missing_tracking_solved_note(row)
 
     if is_noreply_requester_email(row.get("requester_email")):
         return ""
