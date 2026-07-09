@@ -1007,6 +1007,21 @@ def is_unpaid_extra_charges_request(text: object) -> bool:
     return bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_whitespace(text)))
 
 
+def is_purely_informative_request(text: object) -> bool:
+    """True when the message contains no actionable data/action request language.
+
+    Used for tickets where no ``extracted_tracking_number`` could be found, to
+    distinguish a purely informational message (no data or action requested)
+    from a genuine request that a human still needs to review. Blank text is
+    treated conservatively as NOT purely informative, so malformed/empty rows
+    still fall through to human review instead of being auto-solved.
+    """
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+    return not has_actionable_request_language(cleaned)
+
+
 def is_informative_status_update_only(text: object) -> bool:
     """True when the latest message is an operational update, not a data request."""
     cleaned = normalize_whitespace(text)
