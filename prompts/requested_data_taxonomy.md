@@ -29,6 +29,7 @@ The system should classify requests into requested data elements, not a single i
 | `previously_requested_documentation` | Reminder for previously requested documentation |
 | `human_intervention_required` | Human must handle the request; used for external-portal handoffs such as FedEx Support Hub and safety guardrails. |
 | `unknown_request` | No known actionable requested data found |
+| `purely_informative_solved` | The message has no data or action request at all (pure acknowledgement, FYI-only update, etc.). Submitted as solved without a public response, regardless of request number or tracking-number status. |
 
 ## Deprecated Standalone Values
 
