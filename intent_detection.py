@@ -35,6 +35,7 @@ from pipeline_io import (
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
+    PURELY_INFORMATIVE_SOLVED,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
@@ -42,6 +43,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
+    is_request_number_2_or_higher,
     is_request_number_3_or_higher,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
@@ -80,6 +82,7 @@ ALLOWED_REQUESTED_DATA = [
     "previously_requested_documentation",
     "human_intervention_required",
     "unknown_request",
+    "purely_informative_solved",
 ]
 
 LEGACY_REQUESTED_DATA_ALIASES = {
@@ -590,7 +593,37 @@ def build_llm_output_row(source_row, result):
     llm_model_used = str(result.get("llm_model_used", "") or "").strip()
     llm_model_attempts = str(result.get("llm_model_attempts", "") or "").strip()
 
-    if is_tracking_lookup_not_found(source_row):
+    if requested_data == [PURELY_INFORMATIVE_SOLVED]:
+        # Regardless of request number, tracking-number-in-ticket status, or
+        # tracking-number-in-shipment status: the LLM decided the message is
+        # purely informative, with no data or action requested. Submit the
+        # ticket as solved without a public response.
+        engine = "llm_purely_informative_guard"
+        request_types = [PURELY_INFORMATIVE_SOLVED]
+        human_intervention_required = False
+        notes = (
+            "LLM classified this request as purely informative, with no "
+            "data or action requested. Submitted as solved without a "
+            f"response. LLM notes: {notes}"
+        )
+
+    elif is_request_number_3_or_higher(source_row.get("request_number", 1)):
+        # Request number 3 or higher never receives an automatic answer to
+        # an actual data/action request, no matter how confident the LLM is
+        # or whether regex and LLM agree. The only automatic outcome allowed
+        # for request number 3+ is the purely-informative branch above.
+        engine = "llm_request_number_3_or_higher_guard"
+        request_types = ["request_number_3_or_higher_guard"]
+        requested_data = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            "Request number is 3 or higher. The message was evaluated by "
+            "the LLM but is not purely informative, so an automatic answer "
+            "is never sent regardless of LLM confidence; human intervention "
+            f"is required. LLM notes: {notes}"
+        )
+
+    elif is_tracking_lookup_not_found(source_row):
         engine = "llm_tracking_lookup_not_found_guard"
         request_types = ["tracking_lookup_not_found_guard"]
         understood_requested_data = [
@@ -762,7 +795,13 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+        if is_missing_extracted_tracking_number(
+            row.get("extracted_tracking_number")
+        ) and not is_request_number_2_or_higher(row.get("request_number")):
+            # This guard only applies to request number 1. From request
+            # number 2 onward, policy requires always sending the ticket to
+            # the LLM regardless of tracking-number status (see
+            # is_request_number_2_or_higher branch in regex_engine.py).
             if is_purely_informative_request(source_text_for_llm(row)):
                 llm_results.append(
                     build_exclude_output_row(
@@ -793,19 +832,16 @@ def main():
                     "Carrier notification/status message only; no actionable customer-data request was detected.",
                 )
             )
-        elif is_request_number_3_or_higher(row.get("request_number")):
-            llm_results.append(
-                build_human_output_row(
-                    row,
-                    "Request number is 3 or higher. Human intervention is required by automation policy.",
-                )
-            )
         elif as_bool(row.get("force_human_intervention")) or as_bool(
             row.get("human_intervention_required")
         ):
             reason = row.get("notes") or "Regex safety guard required human review."
             llm_results.append(build_human_output_row(row, reason))
         else:
+            # Includes request number 2 and higher unconditionally (policy:
+            # always send to the LLM regardless of tracking-number status).
+            # build_llm_output_row() applies the purely-informative and
+            # request-number-3+ guards after the LLM call.
             rows_for_llm.append(row)
 
     total_batches = ceil(len(rows_for_llm) / BATCH_SIZE) if rows_for_llm else 0
