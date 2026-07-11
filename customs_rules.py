@@ -23,6 +23,7 @@ CARRIER_EMAIL_DOMAINS = ("ups.com", "dhl.com", "fedex.com")
 PLACEHOLDER = "[TO BE RETRIEVED]"
 HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
+PURELY_INFORMATIVE_SOLVED = "purely_informative_solved"
 DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE = "dichiarazione_di_libera_esportazione"
 LIBERA_ESPORTAZIONE_REQUEST_TYPES = {
     DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE,
@@ -1306,6 +1307,10 @@ def is_request_number_3_or_higher(request_number: object) -> bool:
 
 def is_request_number_2(request_number: object) -> bool:
     return normalize_request_number(request_number) == 2
+
+
+def is_request_number_2_or_higher(request_number: object) -> bool:
+    return normalize_request_number(request_number) >= 2
 
 
 def is_first_returns_customs_request(ticket_category: object, request_number: object) -> bool:
