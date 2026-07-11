@@ -48,6 +48,7 @@ from customs_rules import (
     FEDEX_BROKERAGE_EMAIL,
     HUMAN_INTERVENTION_REQUIRED,
     PLACEHOLDER,
+    PURELY_INFORMATIVE_SOLVED,
     UNKNOWN_REQUEST,
     UPS_BROKERAGE_EMAIL,
     align_invoice_requested_data_with_tracking_context,
@@ -863,6 +864,32 @@ def build_missing_tracking_solved_note(row):
     )
 
 
+def build_purely_informative_solved_note(row):
+    """Note used for BOTH draft_response and final_response when the message
+    is purely informative, with no data or action requested.
+
+    This applies regardless of the request number, and regardless of
+    whether the tracking number was found in the ticket or in
+    shipping_platform_shipments. Like noreply@fedex.com rows, these tickets
+    never receive a public Zendesk reply, but the ticket itself is still
+    submitted as ``solved``. The BigQuery ``final_response`` column
+    intentionally is NOT left blank here; this text is never posted to
+    Zendesk as a comment - ticket_fetcher.submit_final_responses routes
+    these rows to a status-only update instead of using this text as a
+    comment body.
+    """
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+
+    return (
+        "Ticket submitted as solved, without a response, because the "
+        "message is purely informative, with no data or action "
+        "requested.\n\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
+    )
+
+
 def llm_human_intervention_draft(row):
     return normalize_text(row.get("llm_human_intervention_draft_response", ""))
 
@@ -1125,6 +1152,10 @@ def collapse_embedded_document_fields(row, requested_data):
         ]
 
     return result
+
+
+def is_purely_informative_solved_row(row):
+    return normalize_requested_data(row.get("requested_data")) == [PURELY_INFORMATIVE_SOLVED]
 
 
 def requested_data_for_response(row):
@@ -2046,6 +2077,14 @@ def build_response(row):
             if item != "ups_account_number"
         ]
 
+    if is_purely_informative_solved_row(row):
+        # Regardless of request number, and regardless of whether the
+        # tracking number was found in the ticket or in
+        # shipping_platform_shipments: the message was classified as purely
+        # informative, with no data or action requested. Submit as solved
+        # without a response.
+        return build_purely_informative_solved_note(row)
+
     if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
         if is_purely_informative_request(request_text):
             return build_missing_tracking_solved_note(row)
@@ -2338,6 +2377,15 @@ def build_final_response(row):
         # noreply@fedex.com rows to a status-only "solved" update and never
         # uses this text as a comment body.
         return build_noreply_fedex_solved_note(row)
+
+    if is_purely_informative_solved_row(row):
+        # Deliberately non-blank, same treatment as noreply@fedex.com above:
+        # ticket_fetcher.submit_final_responses() routes these rows to a
+        # status-only "solved" update instead of posting this text as a
+        # public comment. Applies regardless of request number, and
+        # regardless of whether the tracking number was found in the ticket
+        # or in shipping_platform_shipments.
+        return build_purely_informative_solved_note(row)
 
     if is_missing_extracted_tracking_number(
         row.get("extracted_tracking_number")
