@@ -1035,6 +1035,94 @@ def is_informative_status_update_only(text: object) -> bool:
     return not bool(REQUEST_LANGUAGE_RE.search(cleaned))
 
 
+# ---------------------------------------------------------------------------
+# DDP (Delivered Duty Paid) configuration
+# ---------------------------------------------------------------------------
+# The authoritative table lives in config/ddp_configuration.json (plain JSON:
+# {"rows": [[country_code, brand, ddp], ...]}), so it can be reviewed/updated
+# as a small data file without touching code. This module only knows how to
+# load and query it.
+DDP_CONFIGURATION_PATH = os.environ.get(
+    "DDP_CONFIGURATION_PATH", "config/ddp_configuration.json"
+)
+
+_ddp_configuration_cache: Dict[str, object] = {"mtime": None, "table": {}}
+
+
+def _load_ddp_configuration_rows(path: str = DDP_CONFIGURATION_PATH) -> List[List[object]]:
+    with open(path, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+    rows = payload.get("rows") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise ValueError("DDP configuration JSON must contain a 'rows' list")
+    return rows
+
+
+def load_ddp_configuration(path: str = DDP_CONFIGURATION_PATH) -> Dict[Tuple[str, str], bool]:
+    """Load and cache the (country_code, brand) -> ddp lookup table.
+
+    The cache is invalidated automatically when the underlying file's mtime
+    changes, so editing config/ddp_configuration.json takes effect without a
+    process restart. Returns an empty dict (with a printed warning) if the
+    file is missing or malformed, so callers can treat "no match" the same
+    way as "brand/country not found" -- i.e. route to human review.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        print(f"WARNING: DDP configuration file not found at {path!r}.")
+        _ddp_configuration_cache["mtime"] = None
+        _ddp_configuration_cache["table"] = {}
+        return {}
+
+    if _ddp_configuration_cache["mtime"] == mtime and _ddp_configuration_cache["table"]:
+        return _ddp_configuration_cache["table"]
+
+    try:
+        rows = _load_ddp_configuration_rows(path)
+    except Exception as exc:
+        print(f"WARNING: Could not load DDP configuration from {path!r}: {exc}")
+        _ddp_configuration_cache["mtime"] = mtime
+        _ddp_configuration_cache["table"] = {}
+        return {}
+
+    table: Dict[Tuple[str, str], bool] = {}
+    for row in rows:
+        try:
+            country_code, brand, ddp = row
+        except (TypeError, ValueError):
+            continue
+        country_key = str(country_code or "").strip().upper()
+        brand_key = str(brand or "").strip().upper()
+        if not country_key or not brand_key:
+            continue
+        table[(country_key, brand_key)] = bool(ddp)
+
+    _ddp_configuration_cache["mtime"] = mtime
+    _ddp_configuration_cache["table"] = table
+    return table
+
+
+def ddp_status_for_country_and_brand(
+    country_code: object,
+    brand: object,
+    path: str = DDP_CONFIGURATION_PATH,
+):
+    """Return True/False for a configured (country_code, brand) pair, else None.
+
+    None means the pair is not present in config/ddp_configuration.json, so
+    the caller cannot safely decide automatically and must route to human
+    review.
+    """
+    country_key = str(country_code or "").strip().upper()
+    brand_key = str(brand or "").strip().upper()
+    if not country_key or not brand_key:
+        return None
+
+    table = load_ddp_configuration(path)
+    return table.get((country_key, brand_key))
+
+
 def is_customer_refused_return_request(text: object) -> bool:
     """True when the carrier reports a refused package and asks how to proceed."""
     cleaned = normalize_whitespace(text)
