@@ -36,6 +36,7 @@ from pipeline_io import (
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
+    PURELY_INFORMATIVE_SOLVED,
     align_invoice_requested_data_with_tracking_context,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
@@ -57,8 +58,7 @@ from customs_rules import (
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_purely_informative_request,
-    is_request_number_2,
-    is_request_number_3_or_higher,
+    is_request_number_2_or_higher,
     normalize_request_number,
     is_special_followup_ticket,
     is_tracking_reference_only,
@@ -365,57 +365,6 @@ class RegexEngine:
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
 
-        if is_missing_extracted_tracking_number(extracted_tracking_number):
-            if is_purely_informative_request(cleaned_text):
-                # No tracking number could be extracted, but the message is
-                # purely informative with no data or action requested. Treat
-                # this the same way as noreply@fedex.com: submit the ticket
-                # as solved without ever sending a public reply, instead of
-                # routing it to human intervention.
-                return self._as_output(
-                    matched=True,
-                    excluded=False,
-                    request_types=["missing_tracking_informative_solved"],
-                    requested_data=[],
-                    cleaned_request_text=cleaned_text,
-                    matched_spans=[],
-                    confidence=HIGH_CONFIDENCE,
-                    notes=(
-                        "The tracking number was not found in the ticket, but "
-                        "the message is purely informative with no data or "
-                        "action requested. Submitted as solved without a "
-                        "response."
-                    ),
-                    needs_llm_confirmation=False,
-                    force_human_intervention=False,
-                    human_intervention_required=False,
-                    regex_request_types=[],
-                    regex_requested_data=[],
-                    quoted_history_removed=quoted_history_removed,
-                    signature_removed=signature_removed,
-                )
-
-            return self._as_output(
-                matched=True,
-                excluded=False,
-                request_types=[HUMAN_INTERVENTION_REQUIRED],
-                requested_data=[HUMAN_INTERVENTION_REQUIRED],
-                cleaned_request_text=cleaned_text,
-                matched_spans=[],
-                confidence=0.0,
-                notes=(
-                    "The tracking number was not found in the ticket. "
-                    "Regex and LLM analysis were skipped; human review is required."
-                ),
-                needs_llm_confirmation=False,
-                force_human_intervention=True,
-                human_intervention_required=True,
-                regex_request_types=[],
-                regex_requested_data=[],
-                quoted_history_removed=quoted_history_removed,
-                signature_removed=signature_removed,
-            )
-
         if is_no_action_carrier_notification(cleaned_text):
             return self._as_output(
                 matched=True,
@@ -434,9 +383,95 @@ class RegexEngine:
                 confidence=HIGH_CONFIDENCE,
                 notes=(
                     "Carrier-domain notification/status message historically required "
-                    "no customer-facing reply. Excluded before tracking-number guardrails."
+                    "no customer-facing reply. Excluded before all other guardrails."
                 ),
                 regex_request_types=["exclude_from_processing"],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_request_number_2_or_higher(request_number):
+            # Policy: request number 2 or higher must always be evaluated by
+            # the LLM, regardless of whether a tracking number was found in
+            # the ticket or in shipping_platform_shipments, and regex never
+            # auto-answers these on its own. Downstream in
+            # intent_detection.py:
+            # - if the LLM classifies the message as purely informative (no
+            #   data or action requested), the ticket is submitted as solved
+            #   without a response, no matter the request number;
+            # - otherwise, request number 2 is answered only if the LLM is
+            #   confident about what is being requested (LLM_CONFIDENCE_MIN);
+            # - otherwise, request number 3+ never receives an automatic
+            #   answer and always requires human intervention, same as
+            #   before.
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "Request number is 2 or higher. Regex auto-answering is "
+                    "skipped by policy; this ticket is always sent to the "
+                    "LLM regardless of tracking-number status."
+                ),
+                needs_llm_confirmation=True,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        # From here on, request_number == 1.
+
+        if is_purely_informative_request(cleaned_text):
+            # Regardless of whether a tracking number was found in the
+            # ticket or in shipping_platform_shipments, a purely informative
+            # message (no data or action requested) is submitted as solved
+            # without ever sending a public reply, the same way as
+            # noreply@fedex.com.
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[PURELY_INFORMATIVE_SOLVED],
+                requested_data=[PURELY_INFORMATIVE_SOLVED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "The message is purely informative with no data or "
+                    "action requested. Submitted as solved without a "
+                    "response, regardless of tracking-number status."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=False,
+                human_intervention_required=False,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_missing_extracted_tracking_number(extracted_tracking_number):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "The tracking number was not found in the ticket. "
+                    "Regex and LLM analysis were skipped; human review is required."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[],
                 regex_requested_data=[],
                 quoted_history_removed=quoted_history_removed,
                 signature_removed=signature_removed,
@@ -459,55 +494,6 @@ class RegexEngine:
                 needs_llm_confirmation=True,
                 regex_request_types=[],
                 regex_requested_data=[],
-                quoted_history_removed=quoted_history_removed,
-                signature_removed=signature_removed,
-            )
-
-        if is_request_number_2(request_number):
-            # Policy: request number 2 must always be evaluated by the LLM,
-            # never auto-answered from regex alone. If the LLM is confident
-            # in what is being requested, the normal LLM confidence gate in
-            # intent_detection.py (LLM_CONFIDENCE_MIN) will let the answer
-            # through; if the LLM is not confident, that same gate routes
-            # the ticket to human intervention instead of answering.
-            return self._as_output(
-                matched=False,
-                excluded=False,
-                request_types=[],
-                requested_data=[],
-                cleaned_request_text=cleaned_text,
-                matched_spans=[],
-                confidence=0.0,
-                notes=(
-                    "Request number is 2. Regex auto-answering is skipped by "
-                    "policy; this ticket is always sent to the LLM. It will "
-                    "only be answered if the LLM is confident about what is "
-                    "requested."
-                ),
-                needs_llm_confirmation=True,
-                regex_request_types=[],
-                regex_requested_data=[],
-                quoted_history_removed=quoted_history_removed,
-                signature_removed=signature_removed,
-            )
-
-        if is_request_number_3_or_higher(request_number):
-            return self._as_output(
-                matched=True,
-                excluded=False,
-                request_types=[HUMAN_INTERVENTION_REQUIRED],
-                requested_data=[HUMAN_INTERVENTION_REQUIRED],
-                cleaned_request_text=cleaned_text,
-                matched_spans=[],
-                confidence=0.0,
-                notes=(
-                    "Request number is 3 or higher. Human intervention is required "
-                    "by automation policy."
-                ),
-                force_human_intervention=True,
-                human_intervention_required=True,
-                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
-                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
                 quoted_history_removed=quoted_history_removed,
                 signature_removed=signature_removed,
             )
