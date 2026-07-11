@@ -39,6 +39,7 @@ from pipeline_io import (
 )
 from customs_rules import (
     CARRIER_EMAIL_DOMAINS,
+    PURELY_INFORMATIVE_SOLVED,
     VALID_TICKET_CATEGORIES,
     carrier_code_from_email,
     classify_ticket_category_from_content,
@@ -49,6 +50,7 @@ from customs_rules import (
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
     normalize_email,
+    normalize_requested_data,
 )
 
 # ============================================================================
@@ -1340,6 +1342,21 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
         # is_noreply_requester_email() skip, which would otherwise silently
         # swallow it with no ticket update at all.
         if is_noreply_fedex_requester_email(requester_email):
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
+            continue
+
+        # The message was classified (by regex or LLM) as purely informative,
+        # with no data or action requested. This applies regardless of
+        # request number, and regardless of whether the tracking number was
+        # found in the ticket or in shipping_platform_shipments. Treat this
+        # the same way as noreply@fedex.com above: solve the ticket with no
+        # public comment, instead of leaving it for human review. Must be
+        # checked before the general noreply*/human intervention skips
+        # below, which would otherwise silently swallow it with no ticket
+        # update at all.
+        if normalize_requested_data(row.get("requested_data")) == [PURELY_INFORMATIVE_SOLVED]:
             ticket_id = _to_int(row.get("zendesk_ticket_id"))
             if ticket_id is not None:
                 solve_without_response_rows.append((ticket_id, row))
