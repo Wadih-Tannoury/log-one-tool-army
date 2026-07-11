@@ -1304,6 +1304,10 @@ def is_request_number_3_or_higher(request_number: object) -> bool:
     return normalize_request_number(request_number) >= 3
 
 
+def is_request_number_2(request_number: object) -> bool:
+    return normalize_request_number(request_number) == 2
+
+
 def is_first_returns_customs_request(ticket_category: object, request_number: object) -> bool:
     return is_returns_customs_clearance(ticket_category) and normalize_request_number(request_number) == 1
 
