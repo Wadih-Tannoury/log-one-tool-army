@@ -12,7 +12,9 @@ If `llm_was_used` is true, the internal `draft_response` must report the model f
 
 ## Safety Rules
 
-If `request_number` is `3` or higher, do not draft a customer-facing answer. Create a human-intervention note.
+If `requested_data` is `purely_informative_solved`, do not draft a customer-facing answer and do not create a human-intervention note. Set both `draft_response` and `final_response` to a note stating that the ticket was submitted as solved, without a response, because the message is purely informative with no data or action requested. This applies regardless of `request_number`, and regardless of whether the tracking number was found in the ticket or in `shipping_platform_shipments`. No public Zendesk comment is ever posted for these rows either — the ticket-submission step moves it straight to `solved` with a status-only update instead of posting `final_response` as a comment.
+
+If `request_number` is `3` or higher and `requested_data` is not `purely_informative_solved`, do not draft a customer-facing answer. Create a human-intervention note.
 
 If `requested_data` is `unknown_request` or `human_intervention_required`, do not draft a customer-facing email. Create a human-intervention note.
 
@@ -33,7 +35,9 @@ If `requester_email` starts with `noreply`, do not create a public Zendesk reply
 
 ## Tracking Not Found in Shipments Table Rule
 
-When no `extracted_tracking_number` is found in the ticket, the request must not be analyzed by regex or LLM. Instead, check whether the message is purely informative (no data or action requested, i.e. `customs_rules.is_purely_informative_request()` returns true): if so, treat it the same as `noreply@fedex.com` above — set both `draft_response` and `final_response` to a note stating the ticket was submitted as solved, without a response, because the tracking number was not found and the message is purely informative, and route it to a status-only solved update with no public comment. Otherwise (some data or action is requested), `draft_response` must be a human-intervention note saying that the tracking number was not found, and `final_response` must stay empty.
+When `request_number` is `1` and no `extracted_tracking_number` is found in the ticket, the request must not be analyzed by regex or LLM. Instead, check whether the message is purely informative (no data or action requested, i.e. `customs_rules.is_purely_informative_request()` returns true): if so, treat it the same as `noreply@fedex.com` above — set both `draft_response` and `final_response` to a note stating the ticket was submitted as solved, without a response, because the message is purely informative, and route it to a status-only solved update with no public comment. Otherwise (some data or action is requested), `draft_response` must be a human-intervention note saying that the tracking number was not found, and `final_response` must stay empty.
+
+When `request_number` is `2` or higher, this guard does not apply: the row is always sent to the LLM regardless of whether `extracted_tracking_number` is present, and the `purely_informative_solved` safety rule above still takes priority over every other outcome.
 
 When the tracking number extracted from the ticket is not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, the regex layer must not process the request. The row must be sent only to the LLM.
 
