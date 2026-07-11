@@ -53,6 +53,7 @@ from customs_rules import (
     align_invoice_requested_data_with_tracking_context,
     detect_language_with_dictionary,
     contains_correction_or_discrepancy,
+    ddp_status_for_country_and_brand,
     extract_ups_code,
     expand_first_returns_customs_clearance_bundle,
     filter_libera_esportazione_response_data,
@@ -384,6 +385,31 @@ def zendesk_country_tag_for_row(row) -> str | None:
         return None
 
     return f"country_{brand.lower()}_{str(country_code).strip().lower()}"
+
+
+def ddp_lookup_country_and_brand(row):
+    """Return (country_code, brand) used to look up the DDP configuration.
+
+    country_code comes from the GET_FULL_ORDER shippingAddress.country field
+    (stored as full_order_country_code); brand is the first 2 characters of
+    shipment_order_number. Either value can be blank when unavailable.
+    """
+    from response_data_extractor import brand_from_shipment_order_number, FULL_ORDER_RESPONSE_COLUMNS
+
+    country_col = FULL_ORDER_RESPONSE_COLUMNS.get("country_code", "full_order_country_code")
+    country_code = row.get(country_col)
+    country_code = "" if is_blank(country_code) else str(country_code).strip()
+
+    brand = brand_from_shipment_order_number(row.get("shipment_order_number"))
+    return country_code, brand
+
+
+def ddp_status_for_row(row):
+    """Return True/False from config/ddp_configuration.json for this row's
+    (country_code, brand) pair, or None when the pair is missing/unconfigured.
+    """
+    country_code, brand = ddp_lookup_country_and_brand(row)
+    return ddp_status_for_country_and_brand(country_code, brand)
 
 
 def is_blank(value):
@@ -1108,15 +1134,14 @@ def requested_data_for_response(row):
     if only_libera_esportazione_regex_type(row.get("regex_request_types")):
         return []
 
-    # Unpaid extra/outstanding charges (including a refusal to pay them) require
-    # a human decision about who must pay. Do not auto-authorize charges to the
-    # UPS account, and check this before the refused-package rule below so a
-    # "refused to pay the charges" case is never mistaken for a "refused the
-    # package" case.
-    if is_unpaid_extra_charges_request(request_text):
-        return [HUMAN_INTERVENTION_REQUIRED]
-
-    if is_customer_refused_return_request(request_text):
+    # Unpaid extra/outstanding charges (whether or not the customer also
+    # refused the package), and a plain package refusal with no mention of
+    # unpaid charges, both resolve to the standard UPS-account/LOA reply.
+    # build_response() distinguishes between the two cases (and, for unpaid
+    # charges, consults the DDP configuration in config/ddp_configuration.json)
+    # to pick the exact wording; should_force_human_intervention() still
+    # routes to human review when the DDP status cannot be determined.
+    if is_unpaid_extra_charges_request(request_text) or is_customer_refused_return_request(request_text):
         return ["ups_account_number"]
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
@@ -1601,38 +1626,38 @@ def build_generic_response(row, requested_data, language):
     )
 
 
-def build_ups_extra_charges_response(row):
+def build_ddp_deliver_response(row):
+    """Reply used when the DDP configuration for this country/brand is TRUE.
+
+    Sent when the customer refused the package and/or did not pay the extra
+    charges, and config/ddp_configuration.json says the shipment is Delivered
+    Duty Paid: TLG asks the carrier to proceed with delivery and debit the
+    remaining costs to TLG's UPS account.
+    """
     ups_account = data_value(row, "ups_account_number")
-    loa = data_value(row, "authorization_letter")
 
     return (
-        "Response 1:\n"
         "Hello,\n\n"
-        f"Please, debit the outstanding charges to our UPS account {ups_account}, "
-        "authorized by Piero Trevisan and proceed with the delivery.\n\n"
-        "Best regards,\n\n"
-        "Piero T.\n\n"
-        "Response 2:\n"
-        "Hello,\n\n"
-        "I confirm you the return of shipment on topic.\n"
-        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
-        f"LOA: {loa}\n\n"
-        "Best regards\n\n"
-        "Piero T."
+        f"Please proceed with the delivery, and debit the remaining costs to our UPS account {ups_account}\n"
+        "You can find attached the letter of authorization.\n\n"
+        "Best regards"
     )
 
 
-def build_ups_account_standard_response(row):
+def build_return_confirmation_response(row):
+    """Standard return-confirmation reply for the UPS-account/LOA flow.
+
+    Used both when the DDP configuration says ddp=False, and when the
+    customer refused the package with no mention of unpaid charges at all.
+    """
     ups_account = data_value(row, "ups_account_number")
-    loa = data_value(row, "authorization_letter")
 
     return (
         "Hello,\n\n"
         "I confirm you the return of shipment on topic.\n"
-        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
-        f"LOA: {loa}\n\n"
-        "Best regards\n\n"
-        "Piero T."
+        f"Debit all the relative costs to our UPS account {ups_account}.\n"
+        "You can find attached the letter of authorization.\n\n"
+        "Best regards"
     )
 
 
@@ -1886,11 +1911,17 @@ def should_force_human_intervention(row, requested_data):
         )
 
     if is_unpaid_extra_charges_request(request_text):
-        return (
-            True,
-            "Customer did not pay extra/outstanding charges. Human intervention "
-            "is required to verify whether the customer or TLG should pay.",
-        )
+        ddp_status = ddp_status_for_row(row)
+        if ddp_status is None:
+            country_code, brand = ddp_lookup_country_and_brand(row)
+            return (
+                True,
+                "Customer did not pay extra/outstanding charges and the DDP "
+                f"configuration has no entry for country_code={country_code!r}, "
+                f"brand={brand!r} (see config/ddp_configuration.json). Human "
+                "intervention is required to determine whether to proceed "
+                "with delivery or with the return.",
+            )
 
     data_policy_reason = human_intervention_data_policy_reason(row, requested_data)
     if data_policy_reason:
@@ -2035,8 +2066,19 @@ def build_response(row):
 
     if requested_data == ["ups_account_number"]:
         if is_unpaid_extra_charges_request(request_text):
-            return build_ups_extra_charges_response(row)
-        return build_ups_account_standard_response(row)
+            ddp_status = ddp_status_for_row(row)
+            if ddp_status is True:
+                return build_ddp_deliver_response(row)
+            if ddp_status is False:
+                return build_return_confirmation_response(row)
+            # Defensive fallback: should_force_human_intervention already
+            # routes this case to human review when ddp_status is None.
+            return build_human_intervention_note(
+                row,
+                "DDP configuration could not be determined for this "
+                "shipment's country/brand.",
+            )
+        return build_return_confirmation_response(row)
 
     language = row_language(row)
 
