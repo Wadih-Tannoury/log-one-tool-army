@@ -31,6 +31,22 @@ If the sender is not asking for any actionable information, return:
 }
 ```
 
+## Purely Informative Requests
+
+Some messages contain no data or action request at all: pure acknowledgements, FYI-only updates, thank-you notes, or messages that only share information without asking TLG to do or provide anything. When the message is purely informative in this sense, return:
+
+```json
+{
+  "requested_data": ["purely_informative_solved"],
+  "confidence": 0.95,
+  "notes": "Message is purely informative, no data or action requested",
+  "human_intervention_draft_response": ""
+}
+```
+
+This is different from `unknown_request`: use `unknown_request` when the sender IS asking for something but you cannot tell precisely what; use `purely_informative_solved` only when you are confident the sender is not asking for anything at all. Rows classified this way are submitted as solved without a public response, so only use `purely_informative_solved` when you are confident there is truly no data or action being requested.
+
+
 ## Important Logic
 
 A request can require more than one data element.
@@ -74,7 +90,11 @@ Do not guess between similar document types. For example, if the message could m
 
 ## Missing Tracking Number Guard
 
-Rows with no `extracted_tracking_number` must not be sent to the LLM. The pipeline first checks whether the message is purely informative (no data or action requested): if so, it is submitted as solved without a response, the same way as `noreply@fedex.com`. Otherwise, the pipeline creates a human-intervention draft saying that the tracking number was not found and leaves `final_response` empty.
+For request number 1: rows with no `extracted_tracking_number` are first checked for purely-informative content by regex (`customs_rules.is_purely_informative_request()`); if purely informative, the ticket is submitted as solved without a response, the same way as `noreply@fedex.com`, and the LLM is never called. Otherwise the pipeline creates a human-intervention draft saying that the tracking number was not found and leaves `final_response` empty; the LLM is not called either.
+
+For request number 2 or higher, this guard does not apply: the ticket is always sent to the LLM regardless of whether `extracted_tracking_number` is present. You may still classify such a row as `purely_informative_solved` when appropriate.
+
+For request number 3 or higher: even when you identify `requested_data` with high confidence, the application never sends an automatic answer for actual data/action requests at that request number — it always routes to human intervention. The only automatic outcome available at request number 3+ is `purely_informative_solved`. Classify normally; the application enforces this policy downstream.
 
 ## Tracking Not Found Handoff
 
