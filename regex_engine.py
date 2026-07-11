@@ -57,6 +57,7 @@ from customs_rules import (
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_purely_informative_request,
+    is_request_number_2,
     is_request_number_3_or_higher,
     normalize_request_number,
     is_special_followup_ticket,
@@ -454,6 +455,34 @@ class RegexEngine:
                     "Tracking number extracted from the ticket was not found in "
                     "tlg-business-intelligence-prd.bi.shipping_platform_shipments. "
                     "Regex processing skipped; send to LLM for a human-intervention draft."
+                ),
+                needs_llm_confirmation=True,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_request_number_2(request_number):
+            # Policy: request number 2 must always be evaluated by the LLM,
+            # never auto-answered from regex alone. If the LLM is confident
+            # in what is being requested, the normal LLM confidence gate in
+            # intent_detection.py (LLM_CONFIDENCE_MIN) will let the answer
+            # through; if the LLM is not confident, that same gate routes
+            # the ticket to human intervention instead of answering.
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "Request number is 2. Regex auto-answering is skipped by "
+                    "policy; this ticket is always sent to the LLM. It will "
+                    "only be answered if the LLM is confident about what is "
+                    "requested."
                 ),
                 needs_llm_confirmation=True,
                 regex_request_types=[],
