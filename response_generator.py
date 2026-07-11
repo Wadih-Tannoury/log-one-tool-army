@@ -1279,30 +1279,65 @@ def enrich_with_full_order_data(df):
     cache = {}
 
     for index in lookup_indices:
-        shipment_order_number = df.at[index, "shipment_order_number"] if "shipment_order_number" in df.columns else None
+        raw_shipment_order_number = df.at[index, "shipment_order_number"] if "shipment_order_number" in df.columns else None
 
-        if is_blank(shipment_order_number):
+        if is_blank(raw_shipment_order_number):
             df.at[index, FULL_ORDER_API_ERROR_COLUMN] = "Missing shipment_order_number for GET_FULL_ORDER lookup"
             continue
 
-        cache_key = str(shipment_order_number).strip().upper()
+        # shipment_order_number can be a ";"-joined list when a ticket covers
+        # multiple shipments (e.g. "DJ-USA00033283;DJ-USA00033628"). The API
+        # only accepts one order number per call, so each one must be looked
+        # up individually and the results merged, exactly like
+        # response_data_extractor.enrich_dataframe_with_full_order_data does.
+        shipment_orders = [
+            item.strip()
+            for item in str(raw_shipment_order_number).split(";")
+            if item.strip()
+        ]
 
-        if cache_key not in cache:
-            try:
-                cache[cache_key] = fetch_shipment_order_data(
-                    shipment_order_number,
-                    client=client,
-                )
-            except Exception as exc:
-                print(
-                    "WARNING: GET_FULL_ORDER lookup failed for "
-                    f"shipment_order_number={shipment_order_number}: {exc}"
-                )
-                cache[cache_key] = {FULL_ORDER_API_ERROR_COLUMN: str(exc)}
+        if not shipment_orders:
+            df.at[index, FULL_ORDER_API_ERROR_COLUMN] = "Missing shipment_order_number for GET_FULL_ORDER lookup"
+            continue
 
-        for column, value in cache[cache_key].items():
-            if column not in df.columns:
-                df[column] = None
+        combined = {}
+
+        for shipment_order_number in shipment_orders:
+            cache_key = shipment_order_number.upper()
+
+            if cache_key not in cache:
+                try:
+                    cache[cache_key] = fetch_shipment_order_data(
+                        shipment_order_number,
+                        client=client,
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: GET_FULL_ORDER lookup failed for "
+                        f"shipment_order_number={shipment_order_number}: {exc}"
+                    )
+                    cache[cache_key] = {FULL_ORDER_API_ERROR_COLUMN: str(exc)}
+
+            for column, value in cache[cache_key].items():
+                if column not in df.columns:
+                    df[column] = None
+                if is_blank(value):
+                    continue
+
+                existing = combined.get(column)
+                if is_blank(existing):
+                    combined[column] = value
+                else:
+                    values = [
+                        item.strip()
+                        for item in str(existing).split(";")
+                        if item.strip()
+                    ]
+                    if str(value) not in values:
+                        values.append(str(value))
+                    combined[column] = ";".join(values)
+
+        for column, value in combined.items():
             df.at[index, column] = value
 
     return df
