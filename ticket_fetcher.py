@@ -1128,17 +1128,55 @@ def submit_ticket_response(
                 f"via the API. Skipping this ticket. Zendesk said: {error_detail}"
             ) from exc
 
-        # Some brands require a "Country <BRAND>" custom field to be set
-        # before a ticket can be moved to "solved". If we don't have (or
-        # couldn't resolve) that value, retry once WITHOUT the status change
-        # so the customer-facing comment is still delivered instead of the
-        # whole batch aborting. The ticket is left in its current status for
-        # manual solving.
+        # Some brands require extra custom fields to be set before a ticket
+        # can be moved to "solved" (e.g. "Country <BRAND>", "Amazon Order
+        # Number"). When Zendesk returns a list of missing field IDs, try to
+        # populate them automatically from known shipment data and retry the
+        # full update (comment + status) in one call. Fields that cannot be
+        # resolved are skipped; if the retry still fails, fall back to posting
+        # the comment without the status change so the reply is still delivered
+        # and the ticket is left for manual solving.
         if (
             response.status_code == 422
             and "status" in ticket_update
             and _is_zendesk_required_field_for_solve_error(error_detail)
         ):
+            missing_field_ids = _extract_missing_field_ids(error_detail)
+            order_note_value = str(order_note or "-")
+            extra_fields = _resolve_missing_fields(missing_field_ids, order_note_value)
+            if extra_fields:
+                # Merge the newly resolved fields into custom_fields and retry
+                # the original update (with status) so the ticket is solved in
+                # one call without any separate follow-up request.
+                existing_ids = {f["id"] for f in ticket_update.get("custom_fields", [])}
+                merged_fields = list(ticket_update.get("custom_fields", []))
+                for field in extra_fields:
+                    if field["id"] not in existing_ids:
+                        merged_fields.append(field)
+                retry_update = {**ticket_update, "custom_fields": merged_fields}
+                print(
+                    f"Zendesk ticket {ticket_id}: retrying with resolved fields "
+                    f"{[f['id'] for f in extra_fields]} populated from shipment data."
+                )
+                retry_response = requests.put(
+                    f"{base_url}/tickets/{int(ticket_id)}.json",
+                    auth=auth,
+                    json={"ticket": retry_update},
+                    timeout=60,
+                )
+                try:
+                    retry_response.raise_for_status()
+                    return True
+                except requests.HTTPError:
+                    # Field injection did not resolve the issue; fall through
+                    # to the comment-only retry below.
+                    retry_error_detail = _zendesk_error_detail(retry_response)
+                    print(
+                        f"Zendesk ticket {ticket_id}: field-injection retry failed "
+                        f"({retry_error_detail}). Falling back to comment-only update; "
+                        "ticket needs manual solving."
+                    )
+
             print(
                 f"Zendesk ticket {ticket_id}: cannot set status to "
                 f"'{ticket_update['status']}' because a required field is "
@@ -1237,15 +1275,44 @@ def submit_ticket_solved_without_response(
                 f"via the API. Skipping this ticket. Zendesk said: {error_detail}"
             ) from exc
 
-        # Same "Country <BRAND>" required-field-on-solve situation as
-        # submit_ticket_response(): if we still can't resolve it (e.g.
-        # unmapped brand or missing shipping country -- no GET_FULL_ORDER
-        # lookup is run for noreply rows, so country_tag is usually absent),
-        # retry once without the status change so the mandatory-field values
-        # above are still saved instead of failing the whole batch. There is
-        # no comment either way, so the ticket is simply left unsolved for
-        # manual solving.
+        # Same "Country <BRAND>" / required-field-on-solve situation as
+        # submit_ticket_response(): try to resolve unknown required fields
+        # from shipment data and retry with the status included. If the
+        # field cannot be resolved, fall back to retrying without the status
+        # change so mandatory-field values are still saved; ticket is left
+        # for manual solving.
         if response.status_code == 422 and _is_zendesk_required_field_for_solve_error(error_detail):
+            missing_field_ids = _extract_missing_field_ids(error_detail)
+            order_note_value = str(order_note or "-")
+            extra_fields = _resolve_missing_fields(missing_field_ids, order_note_value)
+            if extra_fields:
+                existing_ids = {f["id"] for f in ticket_update.get("custom_fields", [])}
+                merged_fields = list(ticket_update.get("custom_fields", []))
+                for field in extra_fields:
+                    if field["id"] not in existing_ids:
+                        merged_fields.append(field)
+                retry_update = {**ticket_update, "custom_fields": merged_fields}
+                print(
+                    f"Zendesk ticket {ticket_id}: retrying solve-without-response with "
+                    f"resolved fields {[f['id'] for f in extra_fields]} populated from shipment data."
+                )
+                retry_response = requests.put(
+                    f"{base_url}/tickets/{int(ticket_id)}.json",
+                    auth=auth,
+                    json={"ticket": retry_update},
+                    timeout=60,
+                )
+                try:
+                    retry_response.raise_for_status()
+                    return True
+                except requests.HTTPError:
+                    retry_error_detail = _zendesk_error_detail(retry_response)
+                    print(
+                        f"Zendesk ticket {ticket_id}: field-injection retry failed "
+                        f"({retry_error_detail}). Falling back to status-less update; "
+                        "ticket needs manual solving."
+                    )
+
             print(
                 f"Zendesk ticket {ticket_id}: cannot set status to 'solved' "
                 f"because a required field is missing ({error_detail}). "
@@ -1302,6 +1369,53 @@ def _is_zendesk_closed_ticket_error(error_detail: str) -> bool:
         or "prevents ticket update" in lowered
         or "not valid for ticket update" in lowered
     )
+
+
+def _extract_missing_field_ids(error_detail: str) -> list[int]:
+    """Parse Zendesk's 422 error body and return ticket_field_id values listed
+    under details.base[].ticket_field_id for fields that are required on solve.
+
+    Example payload fragment:
+        {"details": {"base": [{"ticket_field_id": 28946463797660, ...}]}}
+    """
+    try:
+        payload = json.loads(error_detail)
+        base_errors = payload.get("details", {}).get("base", [])
+        return [
+            int(e["ticket_field_id"])
+            for e in base_errors
+            if e.get("ticket_field_id") is not None
+        ]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+
+# Map of Zendesk ticket_field_id values that can be auto-populated from
+# shipment data available at response-submission time.  Add new entries here
+# whenever a brand-specific required-on-solve field is identified.
+#
+# 28946463797660  – "Amazon Order Number" field: populated with the shipment
+#                   order number (already used as the order_note value).
+_FIELD_ID_TO_SHIPMENT_DATA: dict[int, str] = {
+    28946463797660: "order_note",
+}
+
+
+def _resolve_missing_fields(
+    field_ids: list[int], order_note: str
+) -> list[dict[str, Any]]:
+    """Return custom-field dicts for every field_id we know how to populate.
+
+    Fields whose IDs are not in ``_FIELD_ID_TO_SHIPMENT_DATA`` are silently
+    skipped; the caller falls back to a comment-only retry for those.
+    """
+    resolved = []
+    context = {"order_note": order_note}
+    for fid in field_ids:
+        data_key = _FIELD_ID_TO_SHIPMENT_DATA.get(fid)
+        if data_key and context.get(data_key):
+            resolved.append({"id": fid, "value": context[data_key]})
+    return resolved
 
 
 def _is_zendesk_required_field_for_solve_error(error_detail: str) -> bool:
