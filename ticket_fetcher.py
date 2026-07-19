@@ -1505,6 +1505,11 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
             for column in ("subject", "cleaned_request_body", "request_body")
         )
         if is_no_action_carrier_notification(request_text):
+            # No actionable customer-data request detected: solve the ticket
+            # with no public comment, same as noreply@fedex.com above.
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
             continue
         final_response = strip_links_from_public_response(row.get("final_response"))
         if _response_is_blank(final_response):
