@@ -890,6 +890,29 @@ def build_purely_informative_solved_note(row):
     )
 
 
+def build_no_action_solved_note(row):
+    """Note used for BOTH draft_response and final_response when the message
+    is a carrier notification with no actionable customer-data request.
+
+    Like noreply@fedex.com rows, these tickets never receive a public Zendesk
+    reply, but the ticket itself is still submitted as ``solved``. The
+    BigQuery ``final_response`` column intentionally is NOT left blank here;
+    this text is never posted to Zendesk as a comment -
+    ticket_fetcher.submit_final_responses routes these rows to a status-only
+    update instead of using this text as a comment body.
+    """
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+
+    return (
+        "Ticket submitted as solved, without a response, because the "
+        "message is a carrier notification with no actionable customer-data "
+        "request detected.\n\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
+    )
+
+
 def llm_human_intervention_draft(row):
     return normalize_text(row.get("llm_human_intervention_draft_response", ""))
 
@@ -2097,6 +2120,9 @@ def build_response(row):
     if is_noreply_requester_email(requester_email):
         return build_noreply_human_intervention_note(row, requested_data)
 
+    if is_no_action_carrier_notification(request_text):
+        return build_no_action_solved_note(row)
+
     if is_excluded_from_processing(row):
         return build_exclude_from_processing_draft(row)
 
@@ -2393,6 +2419,13 @@ def build_final_response(row):
 
     if is_noreply_requester_email(row.get("requester_email")):
         return ""
+
+    if is_no_action_carrier_notification(row_request_text(row)):
+        # Deliberately non-blank, same treatment as noreply@fedex.com above:
+        # ticket_fetcher.submit_final_responses() routes these rows to a
+        # status-only "solved" update instead of posting this text as a
+        # public comment.
+        return build_no_action_solved_note(row)
 
     if is_excluded_from_processing(row):
         return ""
