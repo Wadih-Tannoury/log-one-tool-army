@@ -67,6 +67,8 @@ When the ticket request body contains `sdoganamento`, include `export_tracking_n
 
 `draft_response` may contain internal document references. `final_response` is the exact public Zendesk answer. If human intervention is required, `final_response` must be empty and no Zendesk reply is submitted. Public `final_response` text must never contain invoice, RPI, LOA, POA, or other document links/paths. If a generated local document is provided, remove the document URL/path from `final_response`, keep only the data/document label, and upload the actual PDF as a Zendesk attachment. If an invoice/RPI has a GET_FULL_ORDER `documentLink` but no local PDF attachment, do not put that source link in `final_response`; route the row to human intervention and keep the source link only in `draft_response` for internal review.
 
+Whenever the agent submits a `final_response` to Zendesk, the ticket must always be submitted as **solved** at the same time. If the combined comment+solve call fails due to a missing required Zendesk field, the comment must still be posted (retry without status), and a separate follow-up API call must then set the ticket status to `solved`. A response must never be posted without the ticket being solved.
+
 ## Generic English Structure
 
 ```text
@@ -97,7 +99,39 @@ Cordiali saluti,
 
 ## UPS Extra Charges Rule
 
-When the request says the customer/receiver/destinatario did not pay, or refused to pay, extra or outstanding charges, do not authorize payment automatically and do not draft a UPS-account response. Create a human-intervention note because a human must verify whether the customer or TLG should pay the extra charges. This rule also applies when the request states there are unpaid/outstanding charges tied to a refused delivery, even without the words "refused to pay" — for example a UPS exception line stating "Import charges due: <amount>" and asking for "return authorization ... with acceptance of all outstanding charges". Any mention of an amount still owed or outstanding charges requiring acceptance means a human must confirm who bears the cost before any reply is sent. This rule takes precedence over the Customer Refused Package Rule below: a message saying the consignee refused delivery/the package *and* references unpaid or outstanding charges — even if it also mentions returning the shipment — must never receive the automatic UPS-account/LOA response; it must always be escalated for human review. Only when the message reports a plain refusal of the package/delivery with no mention of unpaid or outstanding charges should the automatic Customer Refused Package Rule response be used.
+When the request says the customer/receiver/destinatario did not pay, or refused to pay, extra or outstanding charges, do not authorize payment automatically based on the message alone. Instead, consult `config/ddp_configuration.json` to determine the DDP (Delivered Duty Paid) status for the combination of the shipment's destination country code and brand:
+
+- If the country/brand pair is found in `ddp_configuration.json` and `ddp=true`: the shipment is Delivered Duty Paid. Draft the delivery-proceed response and debit costs to the TLG UPS account:
+
+```text
+Hello,
+
+Please proceed with the delivery of the shipment on topic.
+Debit all the relative costs to our UPS account <UPS account>, authorized by Piero Trevisan.
+You can find attached the letter of authorization.
+
+Best regards,
+
+Piero T.
+```
+
+- If the country/brand pair is found in `ddp_configuration.json` and `ddp=false`, or if the country/brand pair is **not** present in `ddp_configuration.json`: draft the return-confirmation response:
+
+```text
+Hello,
+
+I confirm you the return of shipment on topic.
+Debit all the relative costs to our UPS account <UPS account>, authorized by Piero Trevisan.
+You can find attached the letter of authorization.
+
+Best regards,
+
+Piero T.
+```
+
+In both cases the letter of authorization must be attached to the response.
+
+This rule also applies when the request states there are unpaid/outstanding charges tied to a refused delivery, even without the words "refused to pay" — for example a UPS exception line stating "Import charges due: <amount>" and asking for "return authorization ... with acceptance of all outstanding charges". Any mention of an amount still owed or outstanding charges requiring acceptance is covered by this rule. This rule takes precedence over the Customer Refused Package Rule below: a message saying the consignee refused delivery/the package *and* references unpaid or outstanding charges — even if it also mentions returning the shipment — must always use the DDP-based logic above. Only when the message reports a plain refusal of the package/delivery with no mention of unpaid or outstanding charges should the automatic Customer Refused Package Rule response be used.
 
 ## Customer Refused Package Rule
 
@@ -107,10 +141,10 @@ When the carrier says the customer/receiver refused the package itself (not a re
 Hello,
 
 I confirm you the return of shipment on topic.
-Debit all the relative costs to our UPS account <UPS account>, authorized by Piero T.
-You can find attached the LOA
+Debit all the relative costs to our UPS account <UPS account>, authorized by Piero Trevisan.
+You can find attached the letter of authorization.
 
-Best regards
+Best regards,
 
 Piero T.
 ```
