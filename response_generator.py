@@ -1704,9 +1704,11 @@ def build_ddp_deliver_response(row):
 
     return (
         "Hello,\n\n"
-        f"Please proceed with the delivery, and debit the remaining costs to our UPS account {ups_account}\n"
+        f"Please proceed with the delivery of the shipment on topic.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero Trevisan.\n"
         "You can find attached the letter of authorization.\n\n"
-        "Best regards"
+        "Best regards,\n\n"
+        "Piero T."
     )
 
 
@@ -1721,9 +1723,10 @@ def build_return_confirmation_response(row):
     return (
         "Hello,\n\n"
         "I confirm you the return of shipment on topic.\n"
-        f"Debit all the relative costs to our UPS account {ups_account}.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero Trevisan.\n"
         "You can find attached the letter of authorization.\n\n"
-        "Best regards"
+        "Best regards,\n\n"
+        "Piero T."
     )
 
 
@@ -1979,15 +1982,10 @@ def should_force_human_intervention(row, requested_data):
     if is_unpaid_extra_charges_request(request_text):
         ddp_status = ddp_status_for_row(row)
         if ddp_status is None:
-            country_code, brand = ddp_lookup_country_and_brand(row)
-            return (
-                True,
-                "Customer did not pay extra/outstanding charges and the DDP "
-                f"configuration has no entry for country_code={country_code!r}, "
-                f"brand={brand!r} (see config/ddp_configuration.json). Human "
-                "intervention is required to determine whether to proceed "
-                "with delivery or with the return.",
-            )
+            # Country/brand pair not found in ddp_configuration.json.
+            # Default to the return-confirmation response so the ticket can
+            # be answered automatically without human intervention.
+            pass
 
     data_policy_reason = human_intervention_data_policy_reason(row, requested_data)
     if data_policy_reason:
@@ -2145,13 +2143,10 @@ def build_response(row):
                 return build_ddp_deliver_response(row)
             if ddp_status is False:
                 return build_return_confirmation_response(row)
-            # Defensive fallback: should_force_human_intervention already
-            # routes this case to human review when ddp_status is None.
-            return build_human_intervention_note(
-                row,
-                "DDP configuration could not be determined for this "
-                "shipment's country/brand.",
-            )
+            # Country/brand pair not in ddp_configuration.json: default to
+            # the return-confirmation response so the ticket is answered
+            # automatically without human intervention.
+            return build_return_confirmation_response(row)
         return build_return_confirmation_response(row)
 
     language = row_language(row)
