@@ -1292,6 +1292,84 @@ def _format_country_code(shipping_address: Mapping[str, Any]) -> str | None:
     return value.strip().upper() if value else None
 
 
+def _needs_translation(text: str) -> bool:
+    """Return True if *text* contains Chinese, Japanese, Korean, Greek, or Arabic characters."""
+    for char in text:
+        cp = ord(char)
+        if (
+            # CJK Unified Ideographs (Chinese, Japanese Kanji, Korean Hanja)
+            0x4E00 <= cp <= 0x9FFF
+            # CJK Extension A
+            or 0x3400 <= cp <= 0x4DBF
+            # CJK Compatibility Ideographs
+            or 0xF900 <= cp <= 0xFAFF
+            # Hiragana
+            or 0x3040 <= cp <= 0x309F
+            # Katakana
+            or 0x30A0 <= cp <= 0x30FF
+            # Hangul Syllables (Korean)
+            or 0xAC00 <= cp <= 0xD7A3
+            # Greek and Coptic
+            or 0x0370 <= cp <= 0x03FF
+            # Arabic
+            or 0x0600 <= cp <= 0x06FF
+            # Arabic Supplement / Presentation Forms
+            or 0xFB50 <= cp <= 0xFDFF
+            or 0xFE70 <= cp <= 0xFEFF
+        ):
+            return True
+    return False
+
+
+def _translate_address_to_english(address: str) -> str:
+    """Translate *address* to English using the Anthropic API.
+
+    Falls back to the original text if the API call fails, so that a
+    translation outage never blocks the rest of the pipeline.
+    """
+    raw_secret = os.environ.get("CLAUDE_API_KEY", "")
+    if not raw_secret:
+        print("WARNING: CLAUDE_API_KEY not set; skipping address translation.")
+        return address
+    try:
+        api_key = json.loads(raw_secret).get("claude_api_key", "")
+    except (json.JSONDecodeError, AttributeError):
+        api_key = raw_secret.strip()
+    if not api_key:
+        print("WARNING: CLAUDE_API_KEY secret is set but claude_api_key value is empty; skipping address translation.")
+        return address
+
+    prompt = (
+        "Translate the following shipping address to English. "
+        "Return only the translated address, preserving line structure where possible, "
+        "with no additional commentary or explanation.\n\n"
+        f"{address}"
+    )
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        translated = data["content"][0]["text"].strip()
+        if translated:
+            return translated
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: Address translation failed: {exc}")
+    return address
+
+
 def _format_shipping_address(shipping_address: Mapping[str, Any]) -> str | None:
     parts = [
         _clean_item_field(_get_any(shipping_address, ("addressLine1", "address_line_1", "address1"))),
@@ -1301,7 +1379,11 @@ def _format_shipping_address(shipping_address: Mapping[str, Any]) -> str | None:
         _clean_item_field(_get_any(shipping_address, ("cityOrTown", "city_or_town", "city", "town"))),
     ]
     value = ", ".join(part for part in parts if part).strip()
-    return value or None
+    if not value:
+        return None
+    if _needs_translation(value):
+        value = _translate_address_to_english(value)
+    return value
 
 
 def _shipped_at_from_shipment(shipment: Mapping[str, Any] | None) -> str | None:
