@@ -818,7 +818,7 @@ RETURN_PROFORMA_CONTEXT_RE = re.compile(
 
 COMMERCIAL_INVOICE_CONTEXT_RE = re.compile(
     r"\b(?:commercial\s+invoice|commercial/proforma\s+invoice|proforma\s+invoice|"
-    r"fattura\s+commerciale|fattura\s+export|invoice|fattura)\b",
+    r"fattura\s+commerciale|fattura\s+export|invoice|fattur[ae])\b",
     re.IGNORECASE,
 )
 
@@ -1162,6 +1162,31 @@ def is_delivery_address_phone_unreachable_request(text: object) -> bool:
 def is_missing_invoice_request(text: object) -> bool:
     """True when the shipment is held because the invoice is missing."""
     return bool(MISSING_INVOICE_REQUEST_RE.search(normalize_whitespace(text)))
+
+
+# Matches explicit requests for a commercial invoice that the BigQuery regex
+# config may not cover — in particular the bare Italian plural "fatture" and
+# short combined requests such as "awb e fatture".  Patterns are anchored to
+# request wording rather than boilerplate context to avoid false positives.
+EXPLICIT_INVOICE_REQUEST_RE = re.compile(
+    r"(?:"
+    r"\bfatture\b|"                                              # Italian plural (fattura = invoice)
+    r"\bfattura\s+commerciale\b|"                               # explicit Italian qualified form
+    r"(?:provide|send|invia[rt]e?|fornire|fornite)"
+    r"[^.!?\n]{0,60}\bfattura\b"                               # explicit send/provide + fattura
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_explicit_invoice_request(text: object) -> bool:
+    """True when the request explicitly asks for a commercial invoice.
+
+    Catches Italian plural 'fatture' and other patterns not covered by the
+    BigQuery regex config — e.g. bare 'awb e fatture' messages that the
+    per-request regex resolves only to export_tracking_number.
+    """
+    return bool(EXPLICIT_INVOICE_REQUEST_RE.search(normalize_whitespace(text)))
 
 
 def is_ups_uk_import_clearance_instructions_request(text: object) -> bool:
