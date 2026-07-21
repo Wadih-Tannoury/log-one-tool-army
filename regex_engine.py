@@ -52,6 +52,7 @@ from customs_rules import (
     is_explicit_export_tracking_request,
     is_explicit_ups_account_request,
     is_informative_status_update_only,
+    is_explicit_invoice_request,
     is_missing_invoice_request,
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
@@ -619,6 +620,17 @@ class RegexEngine:
                 {
                     "request_type": "invoice",
                     "span": "shipment held because invoice is missing",
+                    "start": 0,
+                    "end_pos": 0,
+                }
+            )
+
+        if is_explicit_invoice_request(cleaned_text) and "invoice" not in request_types:
+            request_types.append("invoice")
+            matched_spans.append(
+                {
+                    "request_type": "invoice",
+                    "span": "explicit invoice request (fatture/fattura)",
                     "start": 0,
                     "end_pos": 0,
                 }
