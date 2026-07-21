@@ -64,6 +64,20 @@ Classification:
 Example:
 
 ```text
+awb e fatture
+```
+
+Classification:
+
+```json
+["export_tracking_number", "commercial_invoice"]
+```
+
+(Italian: `awb` = export AWB/tracking number; `fatture` or `fattura` without a `di reso` or `corretta` qualifier = commercial invoice.)
+
+Example:
+
+```text
 Please send invoice with country of origin and VAT number.
 ```
 
