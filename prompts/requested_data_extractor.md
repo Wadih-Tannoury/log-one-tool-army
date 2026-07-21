@@ -251,6 +251,38 @@ If a message says an AWB, tracking number, or tracking/reference number only as 
 
 If a shipment is held because it is missing the invoice, for example `priva della fattura`, `fattura mancante`, or `missing invoice`, return `commercial_invoice`, even when an AWB or tracking number appears at the top as a reference.
 
+When a request asks for both an AWB/tracking number and an invoice (fattura/fatture) together — even in very short or abbreviated form — return both `export_tracking_number` and `commercial_invoice`. The word `fatture` (plural of fattura) without a `di reso` or `corretta` qualifier always maps to `commercial_invoice`.
+
+Example:
+
+> awb e fatture
+
+Return:
+
+```json
+{
+  "requested_data": ["export_tracking_number", "commercial_invoice"],
+  "confidence": 0.95,
+  "notes": "AWB = export tracking number; fatture = commercial invoice",
+  "human_intervention_draft_response": ""
+}
+```
+
+Example:
+
+> AWB e Fatture
+
+Return:
+
+```json
+{
+  "requested_data": ["export_tracking_number", "commercial_invoice"],
+  "confidence": 0.95,
+  "notes": "AWB = export tracking number; Fatture = commercial invoice",
+  "human_intervention_draft_response": ""
+}
+```
+
 ## Exclusion Logic
 
 Do not treat pure acknowledgements as requests.
@@ -281,6 +313,7 @@ Requests may be written in English or Italian.
 Examples:
 
 - fattura commerciale = commercial_invoice
+- fattura / fatture (alone, without di reso or corretta qualifier) = commercial_invoice
 - fattura mancante = commercial_invoice
 - fattura di reso = return_proforma_invoice
 - RPI / PRI = return_proforma_invoice
