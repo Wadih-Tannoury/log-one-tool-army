@@ -24,6 +24,11 @@ from typing import Dict, List
 import pandas as pd
 from google import genai
 
+try:  # google-genai >= 0.3 ships the types module; guard older/partial installs
+    from google.genai import types as genai_types
+except ImportError:  # pragma: no cover - defensive, keeps the old call shape
+    genai_types = None
+
 from pipeline_io import (
     REGEX_MATCHES_PATH,
     REQUEST_INTENT_RESULTS_PATH,
@@ -149,11 +154,45 @@ class GeminiJsonHelper:
         return text
 
     @staticmethod
+    def afc_disabled_config():
+        """Config that turns automatic function calling (AFC) off.
+
+        No tools/functions are ever declared here: every call is a single
+        stateless prompt -> JSON response. google-genai nevertheless enables
+        AFC by default in Models.generate_content and logs the warning
+        recommending Chat.send_message. Switching AFC off explicitly removes
+        that warning; the request payload and the response are unchanged,
+        because the SDK simply skips the (unused) function-calling loop.
+        """
+        if genai_types is None:
+            return None
+
+        try:
+            return genai_types.GenerateContentConfig(
+                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                    disable=True,
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Older/newer SDK without this config shape: fall back to the
+            # previous call without a config.
+            return None
+
+    @staticmethod
     def generate_json_list(client, model, prompt):
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
+        config = GeminiJsonHelper.afc_disabled_config()
+
+        if config is None:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+        else:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
 
         response_text = GeminiJsonHelper.clean_json_response(response.text)
         results = json.loads(response_text)
