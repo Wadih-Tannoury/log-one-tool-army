@@ -57,7 +57,23 @@ When `request_number` is `1`, treat `shipment_instructions` as covered by `ups_a
 
 Always require human intervention for `address_translation`, `exporter_ein`, and `address_correction`.
 
-Always require human intervention when `shipment_order_number` / `shipmentOrderNumber` starts with `SC`.
+When `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, process the request exactly like any other row (same requested-data rules, same documents, same automatic Zendesk reply). The only difference is the closing section of the public response, which must be:
+
+```text
+Sincerely,
+
+Scarosso | Customer Care
+```
+
+In an Italian reply, only the closing phrase is translated; the signature line is unchanged:
+
+```text
+Cordiali saluti,
+
+Scarosso | Customer Care
+```
+
+This closing replaces the standard closing phrase of the template (`Kind regards,`, `Best regards,`, `Cordiali saluti,`) and any signer line that would normally follow it (e.g. `Piero T.`). Internal drafts (human intervention, excluded-from-processing, solved-without-reply notes) keep their internal format and never receive this closing.
 
 When the ticket request body contains `sdoganamento`, include `export_tracking_number` in the draft and final response data, unless the ticket is routed to human intervention.
 
