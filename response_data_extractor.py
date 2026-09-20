@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
-import fitz
+try:  # PyMuPDF >= 1.24.3 exposes the `pymupdf` module; `fitz` is deprecated
+    import pymupdf
+except ImportError:  # pragma: no cover - older PyMuPDF releases only ship `fitz`
+    import fitz as pymupdf
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -2109,7 +2112,7 @@ def _output_path(document_type: str, tracking_number: str) -> Path:
     return output_dir / f"{safe_filename(tracking_number)}.pdf"
 
 
-def _first_rect(page: fitz.Page, text: str, *, occurrence: int = 0) -> fitz.Rect:
+def _first_rect(page: pymupdf.Page, text: str, *, occurrence: int = 0) -> pymupdf.Rect:
     rects = page.search_for(text)
     if not rects:
         raise DocumentGenerationError(f"Could not locate LOA template label: {text}")
@@ -2117,7 +2120,7 @@ def _first_rect(page: fitz.Page, text: str, *, occurrence: int = 0) -> fitz.Rect
 
 
 def _replace_value_after_label(
-    page: fitz.Page,
+    page: pymupdf.Page,
     label: str,
     value: str,
     *,
@@ -2130,13 +2133,13 @@ def _replace_value_after_label(
     x0 = label_rect.x1 + x_padding
     y0 = label_rect.y0 - 1
     y1 = label_rect.y1 + 2
-    value_width = fitz.get_text_length(value, fontname="helv", fontsize=font_size) + 10
+    value_width = pymupdf.get_text_length(value, fontname="helv", fontsize=font_size) + 10
     x1 = min(page.rect.width - 36, x0 + max(cover_width, value_width))
-    cover_rect = fitz.Rect(x0, y0, x1, y1)
+    cover_rect = pymupdf.Rect(x0, y0, x1, y1)
     page.add_redact_annot(cover_rect, fill=(1, 1, 1))
     page.apply_redactions()
     page.insert_text(
-        fitz.Point(x0, label_rect.y1 - 1.5),
+        pymupdf.Point(x0, label_rect.y1 - 1.5),
         value,
         fontname="helv",
         fontsize=font_size,
@@ -2170,7 +2173,7 @@ def generate_authorization_letter(row: Mapping[str, Any]) -> str:
     today = today_ddmmyyyy()
     output_path = _output_path("authorization_letter", tracking_number)
 
-    doc = fitz.open(LOA_TEMPLATE_PATH)
+    doc = pymupdf.open(LOA_TEMPLATE_PATH)
     page = doc[0]
 
     _replace_value_after_label(
@@ -2222,7 +2225,7 @@ def generate_power_of_attorney(row: Mapping[str, Any]) -> str:
     output_path = _output_path("power_of_attorney", tracking_number)
     today = today_mmddyyyy()
 
-    doc = fitz.open(POA_TEMPLATE_PATH)
+    doc = pymupdf.open(POA_TEMPLATE_PATH)
     updated_fields = set()
 
     for page in doc:
