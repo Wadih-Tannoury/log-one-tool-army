@@ -33,6 +33,8 @@ ZENDESK_COMMENT_FETCH_WORKERS=20
 ZENDESK_MAX_RETRIES=5
 ```
 
+`ZENDESK_MAX_RETRIES` applies to **every** Zendesk call, reads and writes alike (ticket updates, solve-without-response updates, attachment uploads, ticket-field lookups). All of them go through `ticket_fetcher.zendesk_request()`, which retries dropped connections (`Connection reset by peer`, chunked-encoding errors, timeouts) with exponential backoff (2s, 4s, 8s, ... capped at 30s), honors `Retry-After` on 429, and retries 500/502/503/504. Before re-sending a ticket update that carries a public comment, it checks whether the comment is already on the ticket, so a connection that Zendesk resets *after* applying the update can never produce a duplicate reply. Status/custom-field-only updates are idempotent and are simply re-sent. Non-retryable responses (e.g. 422) are returned unchanged so the existing required-field/closed-ticket handling still applies.
+
 `ZENDESK_FETCH_STRATEGY=broad_active` is the recommended default. It avoids several repeated domain/full-text searches and is usually faster because user lookup is batched and comments are fetched only after domain filtering. For diagnostics only, `ZENDESK_FETCH_STRATEGY=narrow` restores the older configured-requester/domain-term query behavior. When using the narrow diagnostic mode, these legacy switches are still available:
 
 ```text
@@ -222,7 +224,7 @@ The brand → field-id mapping lives in `customs_rules.country_ticket_field_id_f
 ZENDESK_COUNTRY_FIELD_IDS_JSON='{"DJ": 360012198399, "DG": 123456789}'
 ```
 
-If the brand's country value can't be resolved (unmapped brand, missing shipping country, etc.) but Zendesk still requires the field to solve the ticket, `submit_ticket_response()` detects the resulting `"... is required when solving a ticket"` 422 error and automatically retries the same update without the status change. The customer-facing reply is still posted, but the ticket is left in its current status (not `solved`) so it can be solved manually once the field is filled in.
+If the brand's country value can't be resolved (unmapped brand, missing shipping country, etc.) and Zendesk rejects the solve with `"Country <BRAND>: is required when solving a ticket"`, `submit_ticket_response()` first tries to recover: the 422 error names the exact `ticket_field_id`, `customs_rules.brand_for_country_ticket_field_id()` maps that id back to the brand, and the tag is rebuilt as `country_{brand}_{iso}` using the ISO code from `full_order_country_code` (falling back to the ISO suffix of an existing tag). The update is then retried with the status included, so the ticket is still solved in one go. Only when there is no country code at all does it fall back to posting the comment without the status change, leaving the ticket for manual solving.
 
 Additional response guardrails:
 
