@@ -660,6 +660,90 @@ def shipment_order_number_starts_with_sc(row):
     return False
 
 
+# Rows whose shipment_order_number / shipmentOrderNumber starts with "SC" are
+# processed exactly like every other row; the only difference is the closing
+# section of the public reply, which must be:
+#
+#     Sincerely,
+#
+#     Scarosso | Customer Care
+#
+# In Italian only the closing phrase itself is translated ("Cordiali saluti,"),
+# the signature line stays unchanged.
+SC_CLOSING_SIGNATURE = "Scarosso | Customer Care"
+SC_CLOSING_PHRASES = {
+    "en": "Sincerely,",
+    "it": "Cordiali saluti,",
+}
+
+# Every closing phrase used by the response templates in this module (and the
+# signer lines that can follow them), so the SC closing replaces the whole
+# closing section instead of being appended after it.
+_CLOSING_PHRASE_LINE_RE = re.compile(
+    r"^(?:kind regards|best regards|warm regards|regards|sincerely|"
+    r"cordiali saluti|distinti saluti|cordialmente|saluti)\s*[,.]?\s*$",
+    re.IGNORECASE,
+)
+
+# Internal (non customer-facing) drafts must never receive the public closing.
+_INTERNAL_DRAFT_PREFIXES = (
+    "HUMAN INTERVENTION REQUIRED",
+    "Ticket submitted as solved",
+    "Excluded from processing",
+)
+
+
+def is_internal_draft_note(text):
+    stripped = str(text or "").lstrip()
+    return stripped.startswith(_INTERNAL_DRAFT_PREFIXES)
+
+
+def sc_closing_section(language):
+    phrase = SC_CLOSING_PHRASES.get(
+        str(language or "").strip().lower(),
+        SC_CLOSING_PHRASES["en"],
+    )
+    return f"{phrase}\n\n{SC_CLOSING_SIGNATURE}"
+
+
+def apply_sc_closing(row, message, language=None):
+    """Rewrite the closing section of an SC reply.
+
+    The body of the reply is left untouched: only the trailing closing
+    phrase (and any signer line after it) is replaced by the Scarosso
+    Customer Care closing. When the message has no recognizable closing
+    phrase, the closing section is appended at the end.
+    """
+    text = normalize_text(message)
+    if not text:
+        return message
+
+    if not shipment_order_number_starts_with_sc(row):
+        return message
+
+    if is_internal_draft_note(text):
+        return message
+
+    language = language if language is not None else row_language(row)
+    closing = sc_closing_section(language)
+
+    lines = text.split("\n")
+    closing_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        if _CLOSING_PHRASE_LINE_RE.match(lines[index].strip()):
+            closing_index = index
+            break
+
+    if closing_index is None:
+        return normalize_text(f"{text}\n\n{closing}")
+
+    body = "\n".join(lines[:closing_index]).rstrip()
+    if not body:
+        return normalize_text(closing)
+
+    return normalize_text(f"{body}\n\n{closing}")
+
+
 def is_tracking_lookup_not_found(row):
     engine = str(row.get("engine", "") or "").strip().lower()
     return (
@@ -1955,8 +2039,10 @@ def should_force_human_intervention(row, requested_data):
     if is_request_number_3_or_higher(row.get("request_number")):
         return True, "Request number is 3 or higher. Human intervention is required by automation policy."
 
-    if shipment_order_number_starts_with_sc(row):
-        return True, "shipmentOrderNumber starts with SC. Human intervention is required by automation policy."
+    # shipment_order_number / shipmentOrderNumber values starting with "SC"
+    # are no longer routed to human intervention: they are processed like
+    # every other row and only get a dedicated closing section
+    # (see apply_sc_closing).
 
     if is_platform_handoff_request(request_text):
         return True, "FedEx Support Hub handoff request. A human must handle the external portal."
@@ -2082,6 +2168,17 @@ def should_force_human_intervention(row, requested_data):
 
 
 def build_response(row):
+    """Draft response for a row, with the SC closing section applied.
+
+    The body is built exactly the same way for every row; rows whose
+    shipment_order_number starts with "SC" only differ in the closing
+    section (see apply_sc_closing). Internal notes (human intervention,
+    excluded, solved-without-reply) are returned unchanged.
+    """
+    return apply_sc_closing(row, _build_response_body(row))
+
+
+def _build_response_body(row):
     requester_email = normalize_email(row.get("requester_email"))
     request_number = row.get("request_number", 1)
     request_text = row_request_text(row)
@@ -2448,7 +2545,12 @@ def build_final_response(row):
         requested_data,
         attached_only=False,
     )
-    return _remove_document_values_from_response(draft_response, document_values)
+    final_response = _remove_document_values_from_response(draft_response, document_values)
+
+    # Applied again on the final text: the draft may come from BigQuery
+    # history (built before the SC rule existed) and link/document stripping
+    # can also reshape the end of the message.
+    return apply_sc_closing(row, final_response)
 
 
 def _row_request_id(row):
