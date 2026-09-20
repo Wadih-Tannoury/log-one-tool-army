@@ -124,6 +124,30 @@ def country_ticket_field_id_for_brand(brand: str):
     return _COUNTRY_TICKET_FIELD_IDS.get(brand_key)
 
 
+def brand_for_country_ticket_field_id(field_id) -> str | None:
+    """Reverse of country_ticket_field_id_for_brand().
+
+    Given a Zendesk ticket field id (e.g. the one Zendesk names in a
+    "Country <BRAND>: is required when solving a ticket" 422 error), return
+    the brand prefix that field belongs to, or None when it is not a known
+    country field. Runtime overrides win over the built-in table.
+    """
+    try:
+        wanted = int(field_id)
+    except (TypeError, ValueError):
+        return None
+
+    for brand, mapped in _country_field_id_overrides().items():
+        if int(mapped) == wanted:
+            return brand
+
+    for brand, mapped in _COUNTRY_TICKET_FIELD_IDS.items():
+        if int(mapped) == wanted:
+            return brand
+
+    return None
+
+
 def is_missing_extracted_tracking_number(value: object) -> bool:
     """Return True when the ticket did not contain a usable tracking/AWB number.
 
