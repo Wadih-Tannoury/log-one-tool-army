@@ -1131,6 +1131,22 @@ def _brand_from_country_tag(tag: str) -> str:
     return ""
 
 
+def _iso_code_from(country_code: object, country_tag: object) -> str:
+    """Return the lowercase ISO 3166-1 alpha-2 code for a row.
+
+    Prefers the GET_FULL_ORDER shipping-address country code and falls back to
+    the ISO suffix of an already-built tag ("country_dj_us" -> "us").
+    """
+    iso = str(country_code or "").strip().lower()
+    if iso:
+        return iso
+
+    parts = str(country_tag or "").strip().lower().rsplit("_", 1)
+    if len(parts) == 2 and parts[1]:
+        return parts[1]
+    return ""
+
+
 def submit_ticket_response(
     ticket_id: int,
     body: str,
@@ -1188,12 +1204,27 @@ def submit_ticket_response(
     # resolved from the GET_FULL_ORDER shippingAddress (e.g. "country_dj_us").
     # The tag encodes both the brand and the ISO country code so we can derive
     # the Zendesk field id from the brand prefix without an extra API call.
-    if country_tag:
+    if country_tag or country_code:
         brand_code = _brand_from_country_tag(country_tag)
         from customs_rules import country_ticket_field_id_for_brand
         field_id = country_ticket_field_id_for_brand(brand_code)
         if field_id:
-            custom_fields.append({"id": field_id, "value": country_tag})
+            # The tag shape is only a guess; Zendesk stores a FieldTagger value
+            # only when it exists in the field's own option list, so resolve
+            # the real option value and fall back to the tag if the lookup
+            # yields nothing.
+            iso_code = _iso_code_from(country_code, country_tag)
+            option_value = _country_field_option_value(
+                field_id,
+                iso_code,
+                brand_code,
+                auth,
+                base_url,
+            )
+            if option_value or country_tag:
+                custom_fields.append(
+                    {"id": field_id, "value": option_value or country_tag}
+                )
 
     ticket_update["custom_fields"] = custom_fields
 
@@ -1259,13 +1290,22 @@ def submit_ticket_response(
                 order_note_value,
                 country_tag=country_tag,
                 country_code=country_code,
+                auth=auth,
+                base_url=base_url,
             )
             if extra_fields:
                 # Merge the newly resolved fields into custom_fields and retry
                 # the original update (with status) so the ticket is solved in
                 # one call without any separate follow-up request.
-                existing_ids = {f["id"] for f in ticket_update.get("custom_fields", [])}
-                merged_fields = list(ticket_update.get("custom_fields", []))
+                # Resolved values override whatever was sent the first time:
+                # the original attempt may have carried a constructed country
+                # tag that Zendesk does not accept as an option.
+                resolved_by_id = {f["id"]: f for f in extra_fields}
+                merged_fields = [
+                    resolved_by_id.get(f["id"], f)
+                    for f in ticket_update.get("custom_fields", [])
+                ]
+                existing_ids = {f["id"] for f in merged_fields}
                 for field in extra_fields:
                     if field["id"] not in existing_ids:
                         merged_fields.append(field)
@@ -1369,12 +1409,27 @@ def submit_ticket_solved_without_response(
     ]
 
     # Same per-brand "Country <BRAND>" field handling as submit_ticket_response().
-    if country_tag:
+    if country_tag or country_code:
         brand_code = _brand_from_country_tag(country_tag)
         from customs_rules import country_ticket_field_id_for_brand
         field_id = country_ticket_field_id_for_brand(brand_code)
         if field_id:
-            custom_fields.append({"id": field_id, "value": country_tag})
+            # The tag shape is only a guess; Zendesk stores a FieldTagger value
+            # only when it exists in the field's own option list, so resolve
+            # the real option value and fall back to the tag if the lookup
+            # yields nothing.
+            iso_code = _iso_code_from(country_code, country_tag)
+            option_value = _country_field_option_value(
+                field_id,
+                iso_code,
+                brand_code,
+                auth,
+                base_url,
+            )
+            if option_value or country_tag:
+                custom_fields.append(
+                    {"id": field_id, "value": option_value or country_tag}
+                )
 
     ticket_update["custom_fields"] = custom_fields
 
@@ -1415,10 +1470,19 @@ def submit_ticket_solved_without_response(
                 order_note_value,
                 country_tag=country_tag,
                 country_code=country_code,
+                auth=auth,
+                base_url=base_url,
             )
             if extra_fields:
-                existing_ids = {f["id"] for f in ticket_update.get("custom_fields", [])}
-                merged_fields = list(ticket_update.get("custom_fields", []))
+                # Resolved values override whatever was sent the first time:
+                # the original attempt may have carried a constructed country
+                # tag that Zendesk does not accept as an option.
+                resolved_by_id = {f["id"]: f for f in extra_fields}
+                merged_fields = [
+                    resolved_by_id.get(f["id"], f)
+                    for f in ticket_update.get("custom_fields", [])
+                ]
+                existing_ids = {f["id"] for f in merged_fields}
                 for field in extra_fields:
                     if field["id"] not in existing_ids:
                         merged_fields.append(field)
@@ -1534,38 +1598,89 @@ _FIELD_ID_TO_SHIPMENT_DATA: dict[int, str] = {
 }
 
 
-def _country_field_value(
+def _country_field_option_value(
     field_id: int,
-    country_tag: str | None,
-    country_code: str | None,
+    iso_code: str,
+    brand: str,
+    auth,
+    base_url: str,
 ) -> str | None:
-    """Rebuild the ``country_<brand>_<iso>`` tag for a required country field.
+    """Return the option value the Zendesk country drop-down actually accepts.
 
-    Zendesk's 422 error names the exact ticket_field_id it wants, which tells
-    us the brand even when the brand prefix could not be read from
-    shipment_order_number (that is why zendesk_country_tag_for_row() returned
-    None and nothing was sent in the first place). Combined with the ISO
-    country code from the GET_FULL_ORDER shipping address, that is enough to
-    fill the field and solve the ticket in one retry.
+    "Country <BRAND>" is a FieldTagger: Zendesk only stores values that exist
+    in the field's own ``custom_field_options`` list. A constructed tag such
+    as ``country_dj_us`` is silently discarded when it is not one of those
+    options, which leaves the field empty and makes Zendesk reject the solve
+    with "Country <BRAND>: is required when solving a ticket" even though we
+    did send a value. So the real option list is fetched (and cached) and the
+    ISO code is matched against it.
+
+    Returns None when no option matches; the caller then falls back to
+    posting the comment without the status change, as before. The first
+    option is deliberately never used as a fallback: that would file the
+    ticket under an arbitrary wrong country.
     """
-    from customs_rules import brand_for_country_ticket_field_id
+    from customs_rules import country_names_for_iso2
 
-    brand = brand_for_country_ticket_field_id(field_id)
-    if not brand:
-        return None
-
-    iso = str(country_code or "").strip().lower()
-    if not iso and country_tag:
-        # Fall back to the ISO suffix of an already-built tag, e.g.
-        # "country_dj_us" -> "us".
-        parts = str(country_tag).strip().lower().rsplit("_", 1)
-        if len(parts) == 2:
-            iso = parts[1]
-
+    iso = str(iso_code or "").strip().lower()
     if not iso:
         return None
+    brand_key = str(brand or "").strip().lower()
 
-    return f"country_{brand.lower()}_{iso}"
+    try:
+        field = _zendesk_ticket_field(int(field_id), auth, base_url)
+    except Exception as exc:  # noqa: BLE001 - diagnostics only; the caller
+        # still falls back to the comment-only retry.
+        print(f"Could not read Zendesk ticket field {field_id}: {exc}")
+        return None
+
+    options = field.get("custom_field_options") or []
+    if not options:
+        return None
+
+    def _value(option) -> str:
+        return str(option.get("value") or "").strip()
+
+    def _name(option) -> str:
+        return str(option.get("name") or "").strip()
+
+    # 1. Exact value match against the shapes we know are in use.
+    exact_candidates = {f"country_{iso}", iso}
+    if brand_key:
+        exact_candidates.update({f"country_{brand_key}_{iso}", f"{brand_key}_{iso}"})
+    for option in options:
+        if _value(option).lower() in exact_candidates:
+            return _value(option)
+
+    # 2. Any option value whose last segment is the ISO code
+    #    (e.g. "dj::country_us", "country-dj-us").
+    for option in options:
+        tail = re.split(r"[^a-z0-9]+", _value(option).lower())
+        if tail and tail[-1] == iso:
+            return _value(option)
+
+    # 3. Match on the human-readable option name (or a name-shaped value),
+    #    e.g. name "United States" / value "united_states".
+    wanted_names = {iso}
+    for country_name in country_names_for_iso2(iso):
+        lowered = country_name.strip().lower()
+        wanted_names.add(lowered)
+        wanted_names.add(re.sub(r"[^a-z0-9]+", "_", lowered).strip("_"))
+    for option in options:
+        if _name(option).lower() in wanted_names:
+            return _value(option)
+        if _value(option).lower() in wanted_names:
+            return _value(option)
+
+    sample = ", ".join(
+        f"{_name(option)!r}={_value(option)!r}" for option in options[:10]
+    )
+    print(
+        f"Zendesk ticket field {field_id}: no option matches country "
+        f"'{iso.upper()}' (brand {brand_key.upper() or 'unknown'}). "
+        f"First options: {sample}"
+    )
+    return None
 
 
 def _resolve_missing_fields(
@@ -1574,6 +1689,8 @@ def _resolve_missing_fields(
     *,
     country_tag: str | None = None,
     country_code: str | None = None,
+    auth=None,
+    base_url: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return custom-field dicts for every field_id we know how to populate.
 
@@ -1581,6 +1698,8 @@ def _resolve_missing_fields(
     per-brand "Country <BRAND>" field are silently skipped; the caller falls
     back to a comment-only retry for those.
     """
+    from customs_rules import brand_for_country_ticket_field_id
+
     resolved = []
     context = {"order_note": order_note}
     for fid in field_ids:
@@ -1589,9 +1708,22 @@ def _resolve_missing_fields(
             resolved.append({"id": fid, "value": context[data_key]})
             continue
 
-        country_value = _country_field_value(fid, country_tag, country_code)
-        if country_value:
-            resolved.append({"id": fid, "value": country_value})
+        brand = brand_for_country_ticket_field_id(fid)
+        if not brand:
+            continue
+
+        iso = _iso_code_from(country_code, country_tag)
+        if not iso:
+            continue
+
+        if auth is not None and base_url:
+            option_value = _country_field_option_value(fid, iso, brand, auth, base_url)
+            if option_value:
+                resolved.append({"id": fid, "value": option_value})
+            continue
+
+        # No API access to the option list: fall back to the constructed tag.
+        resolved.append({"id": fid, "value": f"country_{brand.lower()}_{iso}"})
     return resolved
 
 
