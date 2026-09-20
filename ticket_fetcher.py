@@ -791,15 +791,52 @@ def _env_int(
     return value
 
 
-def zendesk_get(
+class ZendeskUpdateAlreadyApplied(Exception):
+    """Raised when a retried write turns out to have landed already.
+
+    Zendesk sometimes drops the TCP connection *after* it has processed a
+    ticket update (``Connection reset by peer``). Blindly retrying such a
+    PUT would post the same public comment twice, so the retry loop asks
+    the caller-supplied probe whether the write is already visible on the
+    ticket and, if it is, stops instead of sending it again.
+    """
+
+
+# Transport-level failures that are always worth retrying: the request either
+# never reached Zendesk or the answer never came back.
+_ZENDESK_TRANSPORT_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.Timeout,
+)
+
+
+def _zendesk_retry_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff (2s, 4s, 8s, ...) capped at 30 seconds."""
+
+    return float(min(2 ** attempt, 30))
+
+
+def zendesk_request(
+    method: str,
     url: str,
     *,
     auth,
     session: requests.Session | None = None,
-    params: Mapping[str, Any] | None = None,
-    timeout: int = 60,
+    already_applied_probe=None,
+    **kwargs: Any,
 ) -> requests.Response:
-    """GET wrapper with retry handling for Zendesk rate limits/errors."""
+    """Zendesk HTTP call with retries for resets, rate limits and 5xx errors.
+
+    The response is returned as-is (no ``raise_for_status()``) so callers keep
+    their existing status-code handling, such as the 422 required-field
+    fallbacks in submit_ticket_response().
+
+    ``already_applied_probe`` is an optional callable used only for
+    non-idempotent writes: after a dropped connection it is asked whether the
+    update is already on the ticket, and ZendeskUpdateAlreadyApplied is raised
+    instead of resending the request.
+    """
 
     http = session or requests
     max_retries = _env_int(
@@ -809,15 +846,43 @@ def zendesk_get(
         maximum=10,
     )
     last_response: requests.Response | None = None
+    last_transport_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
-        response = http.get(
-            url,
-            auth=auth,
-            params=params,
-            timeout=timeout,
-        )
+        try:
+            response = http.request(method, url, auth=auth, **kwargs)
+        except _ZENDESK_TRANSPORT_ERRORS as exc:
+            last_transport_error = exc
+            if attempt >= max_retries:
+                break
+
+            if already_applied_probe is not None:
+                try:
+                    if already_applied_probe():
+                        raise ZendeskUpdateAlreadyApplied(
+                            "Zendesk closed the connection after applying the "
+                            "update; not resending it."
+                        )
+                except ZendeskUpdateAlreadyApplied:
+                    raise
+                except Exception as probe_exc:  # noqa: BLE001 - the probe is
+                    # best-effort; if it fails we still retry the write.
+                    print(
+                        "Could not verify whether the Zendesk update was already "
+                        f"applied ({probe_exc}). Retrying the request."
+                    )
+
+            sleep_seconds = _zendesk_retry_backoff_seconds(attempt)
+            print(
+                f"Zendesk connection error on {method.upper()} ({exc}). "
+                f"Retrying in {sleep_seconds:.0f} seconds "
+                f"(attempt {attempt + 1}/{max_retries})."
+            )
+            time.sleep(sleep_seconds)
+            continue
+
         last_response = response
+        last_transport_error = None
 
         if response.status_code == 429 and attempt < max_retries:
             retry_after_raw = response.headers.get("Retry-After", "60")
@@ -834,20 +899,43 @@ def zendesk_get(
             continue
 
         if response.status_code in {500, 502, 503, 504} and attempt < max_retries:
-            sleep_seconds = min(2 ** attempt, 30)
+            sleep_seconds = _zendesk_retry_backoff_seconds(attempt)
             print(
                 f"Transient Zendesk error {response.status_code}. "
-                f"Retrying in {sleep_seconds} seconds."
+                f"Retrying in {sleep_seconds:.0f} seconds."
             )
             time.sleep(sleep_seconds)
             continue
 
-        response.raise_for_status()
         return response
 
     if last_response is not None:
-        last_response.raise_for_status()
+        return last_response
+    if last_transport_error is not None:
+        raise last_transport_error
     raise RuntimeError("Zendesk request failed without a response.")
+
+
+def zendesk_get(
+    url: str,
+    *,
+    auth,
+    session: requests.Session | None = None,
+    params: Mapping[str, Any] | None = None,
+    timeout: int = 60,
+) -> requests.Response:
+    """GET wrapper with retry handling for Zendesk rate limits/errors."""
+
+    response = zendesk_request(
+        "GET",
+        url,
+        auth=auth,
+        session=session,
+        params=params,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response
 
 
 def zendesk_response_submission_enabled() -> bool:
@@ -921,14 +1009,18 @@ def upload_zendesk_attachment(
     base_url = (base_url or zendesk_base_url()).rstrip("/")
     url = f"{base_url}/uploads.json?filename={quote(file_path.name)}"
 
-    with file_path.open("rb") as file_obj:
-        response = requests.post(
-            url,
-            auth=auth,
-            data=file_obj,
-            headers={"Content-Type": "application/pdf"},
-            timeout=60,
-        )
+    # The bytes are read up front (instead of streaming the open file handle)
+    # so the upload can be retried after a dropped connection: a consumed file
+    # object cannot be replayed on a second attempt.
+    file_bytes = file_path.read_bytes()
+    response = zendesk_request(
+        "POST",
+        url,
+        auth=auth,
+        data=file_bytes,
+        headers={"Content-Type": "application/pdf"},
+        timeout=60,
+    )
     response.raise_for_status()
     token = str(response.json().get("upload", {}).get("token", "") or "").strip()
     if not token:
@@ -1018,8 +1110,7 @@ _ZENDESK_FIELD_CACHE={}
 def _zendesk_ticket_field(field_id:int,auth,base_url):
     if field_id in _ZENDESK_FIELD_CACHE:
         return _ZENDESK_FIELD_CACHE[field_id]
-    r=requests.get(f"{base_url}/ticket_fields/{field_id}.json",auth=auth,timeout=60)
-    r.raise_for_status()
+    r=zendesk_get(f"{base_url}/ticket_fields/{field_id}.json",auth=auth,timeout=60)
     fld=r.json()["ticket_field"]
     _ZENDESK_FIELD_CACHE[field_id]=fld
     return fld
@@ -1048,6 +1139,7 @@ def submit_ticket_response(
     reason_of_contact: str = 'Altro',
     order_note: str = '-',
     country_tag: str | None = None,
+    country_code: str | None = None,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1105,12 +1197,31 @@ def submit_ticket_response(
 
     ticket_update["custom_fields"] = custom_fields
 
-    response = requests.put(
-        f"{base_url}/tickets/{int(ticket_id)}.json",
-        auth=auth,
-        json={"ticket": ticket_update},
-        timeout=60,
-    )
+    ticket_url = f"{base_url}/tickets/{int(ticket_id)}.json"
+
+    # Zendesk sometimes resets the connection after it has already applied the
+    # update. Before resending the comment, check whether it is already on the
+    # ticket, so a dropped connection can never produce a duplicate reply.
+    def _comment_already_posted() -> bool:
+        return zendesk_public_comment_exists(
+            ticket_id,
+            body,
+            auth=auth,
+            base_url=base_url,
+        )
+
+    try:
+        response = zendesk_request(
+            "PUT",
+            ticket_url,
+            auth=auth,
+            json={"ticket": ticket_update},
+            timeout=60,
+            already_applied_probe=_comment_already_posted,
+        )
+    except ZendeskUpdateAlreadyApplied as exc:
+        print(f"Zendesk ticket {ticket_id}: {exc}")
+        return True
 
     try:
         response.raise_for_status()
@@ -1143,7 +1254,12 @@ def submit_ticket_response(
         ):
             missing_field_ids = _extract_missing_field_ids(error_detail)
             order_note_value = str(order_note or "-")
-            extra_fields = _resolve_missing_fields(missing_field_ids, order_note_value)
+            extra_fields = _resolve_missing_fields(
+                missing_field_ids,
+                order_note_value,
+                country_tag=country_tag,
+                country_code=country_code,
+            )
             if extra_fields:
                 # Merge the newly resolved fields into custom_fields and retry
                 # the original update (with status) so the ticket is solved in
@@ -1158,11 +1274,13 @@ def submit_ticket_response(
                     f"Zendesk ticket {ticket_id}: retrying with resolved fields "
                     f"{[f['id'] for f in extra_fields]} populated from shipment data."
                 )
-                retry_response = requests.put(
-                    f"{base_url}/tickets/{int(ticket_id)}.json",
+                retry_response = zendesk_request(
+                    "PUT",
+                    ticket_url,
                     auth=auth,
                     json={"ticket": retry_update},
                     timeout=60,
+                    already_applied_probe=_comment_already_posted,
                 )
                 try:
                     retry_response.raise_for_status()
@@ -1185,11 +1303,13 @@ def submit_ticket_response(
                 "solving."
             )
             retry_update = {k: v for k, v in ticket_update.items() if k != "status"}
-            retry_response = requests.put(
-                f"{base_url}/tickets/{int(ticket_id)}.json",
+            retry_response = zendesk_request(
+                "PUT",
+                ticket_url,
                 auth=auth,
                 json={"ticket": retry_update},
                 timeout=60,
+                already_applied_probe=_comment_already_posted,
             )
             try:
                 retry_response.raise_for_status()
@@ -1217,6 +1337,7 @@ def submit_ticket_solved_without_response(
     reason_of_contact: str = 'Altro',
     order_note: str = '-',
     country_tag: str | None = None,
+    country_code: str | None = None,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1257,8 +1378,13 @@ def submit_ticket_solved_without_response(
 
     ticket_update["custom_fields"] = custom_fields
 
-    response = requests.put(
-        f"{base_url}/tickets/{int(ticket_id)}.json",
+    ticket_url = f"{base_url}/tickets/{int(ticket_id)}.json"
+
+    # This update carries no comment: re-sending the same status/custom-field
+    # values after a dropped connection is idempotent.
+    response = zendesk_request(
+        "PUT",
+        ticket_url,
         auth=auth,
         json={"ticket": ticket_update},
         timeout=60,
@@ -1284,7 +1410,12 @@ def submit_ticket_solved_without_response(
         if response.status_code == 422 and _is_zendesk_required_field_for_solve_error(error_detail):
             missing_field_ids = _extract_missing_field_ids(error_detail)
             order_note_value = str(order_note or "-")
-            extra_fields = _resolve_missing_fields(missing_field_ids, order_note_value)
+            extra_fields = _resolve_missing_fields(
+                missing_field_ids,
+                order_note_value,
+                country_tag=country_tag,
+                country_code=country_code,
+            )
             if extra_fields:
                 existing_ids = {f["id"] for f in ticket_update.get("custom_fields", [])}
                 merged_fields = list(ticket_update.get("custom_fields", []))
@@ -1296,8 +1427,9 @@ def submit_ticket_solved_without_response(
                     f"Zendesk ticket {ticket_id}: retrying solve-without-response with "
                     f"resolved fields {[f['id'] for f in extra_fields]} populated from shipment data."
                 )
-                retry_response = requests.put(
-                    f"{base_url}/tickets/{int(ticket_id)}.json",
+                retry_response = zendesk_request(
+                    "PUT",
+                    ticket_url,
                     auth=auth,
                     json={"ticket": retry_update},
                     timeout=60,
@@ -1320,8 +1452,9 @@ def submit_ticket_solved_without_response(
                 "are still saved; ticket needs manual solving."
             )
             retry_update = {k: v for k, v in ticket_update.items() if k != "status"}
-            retry_response = requests.put(
-                f"{base_url}/tickets/{int(ticket_id)}.json",
+            retry_response = zendesk_request(
+                "PUT",
+                ticket_url,
                 auth=auth,
                 json={"ticket": retry_update},
                 timeout=60,
@@ -1401,13 +1534,52 @@ _FIELD_ID_TO_SHIPMENT_DATA: dict[int, str] = {
 }
 
 
+def _country_field_value(
+    field_id: int,
+    country_tag: str | None,
+    country_code: str | None,
+) -> str | None:
+    """Rebuild the ``country_<brand>_<iso>`` tag for a required country field.
+
+    Zendesk's 422 error names the exact ticket_field_id it wants, which tells
+    us the brand even when the brand prefix could not be read from
+    shipment_order_number (that is why zendesk_country_tag_for_row() returned
+    None and nothing was sent in the first place). Combined with the ISO
+    country code from the GET_FULL_ORDER shipping address, that is enough to
+    fill the field and solve the ticket in one retry.
+    """
+    from customs_rules import brand_for_country_ticket_field_id
+
+    brand = brand_for_country_ticket_field_id(field_id)
+    if not brand:
+        return None
+
+    iso = str(country_code or "").strip().lower()
+    if not iso and country_tag:
+        # Fall back to the ISO suffix of an already-built tag, e.g.
+        # "country_dj_us" -> "us".
+        parts = str(country_tag).strip().lower().rsplit("_", 1)
+        if len(parts) == 2:
+            iso = parts[1]
+
+    if not iso:
+        return None
+
+    return f"country_{brand.lower()}_{iso}"
+
+
 def _resolve_missing_fields(
-    field_ids: list[int], order_note: str
+    field_ids: list[int],
+    order_note: str,
+    *,
+    country_tag: str | None = None,
+    country_code: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return custom-field dicts for every field_id we know how to populate.
 
-    Fields whose IDs are not in ``_FIELD_ID_TO_SHIPMENT_DATA`` are silently
-    skipped; the caller falls back to a comment-only retry for those.
+    Fields whose IDs are neither in ``_FIELD_ID_TO_SHIPMENT_DATA`` nor a known
+    per-brand "Country <BRAND>" field are silently skipped; the caller falls
+    back to a comment-only retry for those.
     """
     resolved = []
     context = {"order_note": order_note}
@@ -1415,6 +1587,11 @@ def _resolve_missing_fields(
         data_key = _FIELD_ID_TO_SHIPMENT_DATA.get(fid)
         if data_key and context.get(data_key):
             resolved.append({"id": fid, "value": context[data_key]})
+            continue
+
+        country_value = _country_field_value(fid, country_tag, country_code)
+        if country_value:
+            resolved.append({"id": fid, "value": country_value})
     return resolved
 
 
@@ -1558,6 +1735,10 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 ),
                 order_note=str(row.get('shipment_order_number') or row.get('order_number') or '-'),
                 country_tag=row.get('zendesk_country_tag') or None,
+                # Used only if Zendesk rejects the solve with a missing
+                # "Country <BRAND>" field: the 422 names the field id, which
+                # gives the brand, and this gives the ISO country code.
+                country_code=row.get('full_order_country_code') or None,
                 auth=auth,
                 base_url=base_url,
             ):
@@ -1580,6 +1761,10 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 reason_of_contact=str(row.get('reason_of_contact') or row.get('contact_reason') or row.get('zendesk_reason_of_contact') or 'Altro'),
                 order_note=str(row.get('shipment_order_number') or row.get('order_number') or '-'),
                 country_tag=row.get('zendesk_country_tag') or None,
+                # Used only if Zendesk rejects the solve with a missing
+                # "Country <BRAND>" field: the 422 names the field id, which
+                # gives the brand, and this gives the ISO country code.
+                country_code=row.get('full_order_country_code') or None,
                 auth=auth,
                 base_url=base_url,
             ):
