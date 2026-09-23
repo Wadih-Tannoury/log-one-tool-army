@@ -72,6 +72,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_noreply_fedex_requester_email,
+    is_noreply_autoreply_first_request,
     is_purely_informative_request,
     is_returns_customs_clearance,
     is_unpaid_extra_charges_request as rules_is_unpaid_extra_charges_request,
@@ -930,6 +931,36 @@ def build_noreply_fedex_solved_note(row):
     )
 
 
+def build_noreply_autoreply_first_request_solved_note(row):
+    """Note used for BOTH draft_response and final_response on request number 1
+    from a requester email starting with noreply or autoreply.
+
+    These rows are never analyzed (no regex, no LLM, no GET_FULL_ORDER, no
+    documents) and never receive a public Zendesk reply; the ticket is
+    submitted as ``solved`` via a status-only update. The text only documents
+    the outcome in the BigQuery history table.
+    """
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+    requester = normalize_email(row.get("requester_email"))
+
+    return (
+        "Ticket submitted as solved, without a response and without analysis, "
+        "because the requester email starts with noreply/autoreply and this "
+        "is request number 1.\n\n"
+        f"Requester: {requester}\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
+    )
+
+
+def is_noreply_autoreply_first_request_row(row):
+    return is_noreply_autoreply_first_request(
+        row.get("requester_email"),
+        row.get("request_number", 1),
+    )
+
+
 def build_missing_tracking_solved_note(row):
     """Note used for BOTH draft_response and final_response when the tracking
     number could not be extracted from the ticket, but the message is purely
@@ -1345,6 +1376,8 @@ def requested_data_for_response(row):
 
 def row_needs_full_order_lookup(row, requested_data=None):
     if is_noreply_requester_email(row.get("requester_email")):
+        return False
+    if is_noreply_autoreply_first_request_row(row):
         return False
 
     request_text = row_request_text(row)
@@ -2185,6 +2218,9 @@ def build_response(row):
 
 
 def _build_response_body(row):
+    if is_noreply_autoreply_first_request_row(row):
+        return build_noreply_autoreply_first_request_solved_note(row)
+
     requester_email = normalize_email(row.get("requester_email"))
     request_number = row.get("request_number", 1)
     request_text = row_request_text(row)
@@ -2324,6 +2360,9 @@ def _append_missing_invoice_note(row, requested_data, language, message):
 
 
 def requires_human_intervention(row):
+    if is_noreply_autoreply_first_request_row(row):
+        return False
+
     if (
         not is_noreply_requester_email(row.get("requester_email"))
         and is_excluded_from_processing(row)
@@ -2354,6 +2393,8 @@ def document_data_keys_for_response(row, requested_data=None):
 
 def document_attachment_paths_for_response(row, requested_data=None):
     if is_noreply_requester_email(row.get("requester_email")):
+        return []
+    if is_noreply_autoreply_first_request_row(row):
         return []
 
     paths = []
@@ -2494,6 +2535,12 @@ def _remove_document_values_from_response(response_text, document_values):
 
 
 def build_final_response(row):
+    if is_noreply_autoreply_first_request_row(row):
+        # Deliberately non-blank, same treatment as noreply@fedex.com below:
+        # never posted as a comment; ticket_fetcher solves with a status-only
+        # update.
+        return build_noreply_autoreply_first_request_solved_note(row)
+
     if is_noreply_fedex_requester_email(row.get("requester_email")):
         # Deliberately non-blank: this is the one case where final_response
         # is populated even though no public Zendesk comment is ever sent.
@@ -2565,6 +2612,8 @@ MISSING_ORDER_DATA_REASON_PREFIX = "GET_FULL_ORDER API data is missing"
 def _is_solve_without_response_row(row):
     """Rows that ticket_fetcher solves with a status-only update."""
 
+    if is_noreply_autoreply_first_request_row(row):
+        return True
     if is_noreply_fedex_requester_email(row.get("requester_email")):
         return True
     if is_purely_informative_solved_row(row):
