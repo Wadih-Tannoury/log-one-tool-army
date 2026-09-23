@@ -38,6 +38,12 @@ from response_data_extractor import (
 )
 
 from ticket_fetcher import (
+    SUBMISSION_STATUS_AWAITING_ORDER_DATA,
+    SUBMISSION_STATUS_EXCLUDED,
+    SUBMISSION_STATUS_HUMAN,
+    SUBMISSION_STATUS_NO_FINAL_RESPONSE,
+    SUBMISSION_STATUS_NOREPLY,
+    SUBMISSION_STATUS_PENDING,
     append_history_rows,
     new_history_request_ids,
     submit_final_responses,
@@ -2553,6 +2559,87 @@ def build_final_response(row):
     return apply_sc_closing(row, final_response)
 
 
+MISSING_ORDER_DATA_REASON_PREFIX = "GET_FULL_ORDER API data is missing"
+
+
+def _is_solve_without_response_row(row):
+    """Rows that ticket_fetcher solves with a status-only update."""
+
+    if is_noreply_fedex_requester_email(row.get("requester_email")):
+        return True
+    if is_purely_informative_solved_row(row):
+        return True
+    request_text = row_request_text(row)
+    if is_missing_extracted_tracking_number(
+        row.get("extracted_tracking_number")
+    ) and is_purely_informative_request(request_text):
+        return True
+    return (
+        not is_noreply_requester_email(row.get("requester_email"))
+        and is_no_action_carrier_notification(request_text)
+    )
+
+
+def enforce_reply_consistency(row):
+    """Never leave a row as "no human needed" with a draft but no reply.
+
+    That combination is exactly the silent failure the pipeline used to have:
+    the data was found and the draft was written, but final_response ended up
+    blank, so nothing was posted and nobody was told. If it happens, the row is
+    flagged for human intervention with an explicit reason instead.
+    """
+
+    if as_bool(row.get("human_intervention_required")):
+        return row
+    if _is_solve_without_response_row(row):
+        return row
+    if is_noreply_requester_email(row.get("requester_email")):
+        return row
+    if is_excluded_from_processing(row):
+        return row
+    if not is_blank(row.get("final_response")):
+        return row
+
+    draft = row.get("draft_response")
+    if is_blank(draft) or is_internal_draft_note(str(draft)):
+        return row
+
+    row = dict(row)
+    row["human_intervention_required"] = True
+    row["draft_response"] = (
+        "HUMAN INTERVENTION REQUIRED\n\n"
+        "Reason: a draft response was built but no public final_response could "
+        "be produced from it, so no automatic reply was sent.\n"
+        f"Ticket: {row.get('zendesk_ticket_id', '')}\n"
+        f"Request number: {row.get('request_number', '')}\n\n"
+        "Draft for human review:\n\n"
+        f"{draft}"
+    )
+    return row
+
+
+def pre_submission_status(row):
+    """History status before Zendesk submission (submission may override it)."""
+
+    if _is_solve_without_response_row(row):
+        return SUBMISSION_STATUS_PENDING
+    if is_noreply_requester_email(row.get("requester_email")):
+        return SUBMISSION_STATUS_NOREPLY
+    if as_bool(row.get("human_intervention_required")):
+        # A reply blocked only because GET_FULL_ORDER data / the invoice PDF
+        # was not available yet is retried on the next run instead of being
+        # abandoned: the document is often downloadable a bit later.
+        _, reason = should_force_human_intervention(row, requested_data_for_response(row))
+        if str(reason or "").startswith(MISSING_ORDER_DATA_REASON_PREFIX):
+            return SUBMISSION_STATUS_AWAITING_ORDER_DATA
+        return SUBMISSION_STATUS_HUMAN
+    if is_excluded_from_processing(row):
+        return SUBMISSION_STATUS_EXCLUDED
+    if is_blank(row.get("final_response")):
+        return SUBMISSION_STATUS_NO_FINAL_RESPONSE
+    return SUBMISSION_STATUS_PENDING
+
+
 def _row_request_id(row):
     request_id = row.get("request_id")
     if not is_blank(request_id):
@@ -2624,23 +2711,49 @@ def main():
     )
     df["zendesk_country_tag"] = df.apply(zendesk_country_tag_for_row, axis=1)
 
+    df = pd.DataFrame(
+        [enforce_reply_consistency(row) for row in df.to_dict(orient="records")]
+    )
+    df["zendesk_submission_status"] = df.apply(pre_submission_status, axis=1)
+
     zendesk_submission_enabled = zendesk_response_submission_enabled()
     print(f"Zendesk final-response submission enabled: {zendesk_submission_enabled}")
 
-    new_request_ids = new_history_request_ids(df)
-    rows_to_log = _rows_for_inserted_request_ids(df, new_request_ids)
+    # Submit FIRST, then log. History used to be written before submission,
+    # and the fetcher skipped every request already in history, so any reply
+    # that failed or was not sent (dry run, Zendesk error, crash) was never
+    # retried. Now the real outcome is logged per request, and only terminal
+    # outcomes stop the request from being picked up again.
+    #
+    # The duplicate-comment guard in ticket_fetcher keeps retries safe when the
+    # exact public response already exists on the ticket.
+    outcomes = {}
+    zendesk_submitted = 0
+    submission_error = None
+    try:
+        zendesk_submitted = submit_final_responses(df, outcomes=outcomes)
+    except Exception as exc:  # noqa: BLE001 - log history, then re-raise
+        submission_error = exc
+    finally:
+        if outcomes:
+            df["zendesk_submission_status"] = df.apply(
+                lambda row: outcomes.get(_row_request_id(row), row.get("zendesk_submission_status")),
+                axis=1,
+            )
+        print(
+            "Zendesk submission status counts: "
+            + json.dumps(df["zendesk_submission_status"].value_counts().to_dict())
+        )
 
-    logged_rows, inserted_request_ids = append_history_rows(
-        rows_to_log,
-        return_inserted_request_ids=True,
-    )
+        new_request_ids = new_history_request_ids(df)
+        rows_to_log = _rows_for_inserted_request_ids(df, new_request_ids)
+        logged_rows, inserted_request_ids = append_history_rows(
+            rows_to_log,
+            return_inserted_request_ids=True,
+        )
 
-    # Submission is controlled only by SUBMIT_ZENDESK_RESPONSES.  We evaluate all
-    # current rows, not only newly inserted history rows, so a dry run with the
-    # flag set to false can be followed by a true run that submits the same
-    # final_response values.  The duplicate-comment guard in ticket_fetcher keeps
-    # retries safe when the exact public response already exists on the ticket.
-    zendesk_submitted = submit_final_responses(df)
+    if submission_error is not None:
+        raise submission_error
 
     print(
         f"Generated draft responses for {len(df)} rows. "
