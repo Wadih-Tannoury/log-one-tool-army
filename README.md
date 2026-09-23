@@ -200,6 +200,29 @@ ALTER TABLE `tlg-business-intelligence-prd.til.log_one_tool_army_logs_history`
 ADD COLUMN IF NOT EXISTS final_response STRING;
 ```
 
+### Retrying requests that were never answered (`zendesk_submission_status`)
+
+Previously `ticket_fetcher.py` skipped **every** request_id already present in the history table, and `response_generator.py` wrote the history row *before* submitting to Zendesk. So a request whose reply was built but not posted (dry run, Zendesk error, invoice PDF not yet downloadable, or an older code version that logged an empty `final_response`) was logged once and then ignored forever, while the ticket stayed open.
+
+Now:
+
+1. `response_generator.py` submits to Zendesk **first**, then logs history (in a `finally`, so failures are logged too).
+2. Each history row records `zendesk_submission_status` (column added automatically with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`):
+   - terminal (request is not picked up again): `submitted`, `already_present`, `solved_without_response`, `human_intervention`, `excluded`, `noreply`, `no_final_response`;
+   - retried on the next run while the ticket is still new/open/pending: `dry_run`, `failed`, `pending_submission`, `awaiting_order_data` (human-intervention only because GET_FULL_ORDER data / the invoice PDF was missing).
+3. The fetcher and the history logger skip a request only when its **latest** history row is terminal. A retried request gets a new history row per run (new `request_run_id`), so the latest row always shows the latest outcome.
+4. Legacy rows (NULL status) are skipped only if they were human-intervention (unless blocked only by missing GET_FULL_ORDER data) or excluded; every other legacy row on a still-active ticket is re-processed, which picks up the backlog of drafted-but-unanswered tickets.
+5. A row can no longer end up as `human_intervention_required=false` with a draft but a blank `final_response`: `enforce_reply_consistency()` flags it for human review with an explicit reason.
+6. `HISTORY_MAX_RETRY_RUNS` (default `12`) caps how many runs a request is retried.
+
+To see the backlog that will be retried on the next run:
+
+```sql
+SELECT request_id, zendesk_submission_status, human_intervention_required, final_response IS NULL OR final_response = '' AS blank_final
+FROM `tlg-business-intelligence-prd.til.log_one_tool_army_logs_history`
+QUALIFY ROW_NUMBER() OVER (PARTITION BY request_id ORDER BY ingestion_timestamp DESC) = 1
+```
+
 Zendesk submission is controlled by one explicit flag:
 
 ```bash
