@@ -47,6 +47,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_noreply_fedex_requester_email,
+    is_noreply_autoreply_first_request,
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
     normalize_email,
@@ -1964,6 +1965,15 @@ def submit_final_responses(
     for row in raw_rows:
         requester_email = row.get("requester_email")
 
+        # Request number 1 from a noreply*/autoreply* sender: solved with no
+        # public comment and no analysis. Must be checked before the general
+        # is_noreply_requester_email() / human-intervention skips below.
+        if is_noreply_autoreply_first_request(requester_email, row.get("request_number", 1)):
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
+            continue
+
         # noreply@fedex.com is a special case: FedEx's automated mailbox
         # never reads replies, so instead of leaving the ticket untouched
         # (the general noreply* behavior below) the agent solves it with no
@@ -2053,7 +2063,7 @@ def submit_final_responses(
             f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
             f"{len(response_rows)} Zendesk response(s) and "
             f"{len(solve_without_response_rows)} solve-without-response ticket(s) "
-            "(FedEx noreply / missing-tracking informative)."
+            "(noreply/autoreply first request / FedEx noreply / informative)."
         )
         return 0
 
