@@ -47,6 +47,7 @@ from customs_rules import (
     is_atr_certificate_mandate_request,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
+    is_noreply_autoreply_first_request,
     is_ups_uk_import_clearance_instructions_request,
     normalize_email,
     normalize_requested_data,
@@ -538,6 +539,8 @@ def row_needs_full_order_lookup(
 ) -> bool:
     if is_noreply_requester_email(row.get("requester_email")):
         return False
+    if is_noreply_autoreply_first_request(row.get("requester_email"), row.get("request_number", 1)):
+        return False
 
     request_text = _row_request_text(row)
     if is_no_action_carrier_notification(request_text):
@@ -561,6 +564,8 @@ def row_needs_document_generation(
     requested_data: list[str] | None = None,
 ) -> bool:
     if is_noreply_requester_email(row.get("requester_email")):
+        return False
+    if is_noreply_autoreply_first_request(row.get("requester_email"), row.get("request_number", 1)):
         return False
 
     request_text = _row_request_text(row)
