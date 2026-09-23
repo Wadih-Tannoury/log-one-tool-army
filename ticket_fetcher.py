@@ -644,21 +644,78 @@ def history_schema(bigquery):
     ]
 
 
-def _ensure_history_schema(client) -> None:
-    """Apply additive history-table schema changes required by this version."""
+# Columns added to the history table after it was first created.
+_ADDITIVE_HISTORY_COLUMNS = (
+    ("final_response", "STRING"),
+    ("zendesk_submission_status", "STRING"),
+)
+_HISTORY_SCHEMA_ENSURED = False
 
-    client.query(
-        f"""
-        ALTER TABLE `{HISTORY_TABLE}`
-        ADD COLUMN IF NOT EXISTS final_response STRING
-        """
-    ).result()
-    client.query(
-        f"""
-        ALTER TABLE `{HISTORY_TABLE}`
-        ADD COLUMN IF NOT EXISTS zendesk_submission_status STRING
-        """
-    ).result()
+
+def _ensure_history_schema(client) -> None:
+    """Apply additive history-table schema changes required by this version.
+
+    BigQuery rate-limits table metadata updates (about 5 per 10 seconds per
+    table), and every ALTER TABLE counts as one even with ADD COLUMN IF NOT
+    EXISTS when the column already exists. So: read the schema first (a read,
+    not an update), ALTER only for columns that are really missing, and do
+    this at most once per process.
+    """
+
+    global _HISTORY_SCHEMA_ENSURED
+    if _HISTORY_SCHEMA_ENSURED:
+        return
+
+    existing = {field.name for field in client.get_table(HISTORY_TABLE).schema}
+    for column, column_type in _ADDITIVE_HISTORY_COLUMNS:
+        if column in existing:
+            continue
+        print(f"Adding missing column {column} to {HISTORY_TABLE}.")
+        client.query(
+            f"""
+            ALTER TABLE `{HISTORY_TABLE}`
+            ADD COLUMN IF NOT EXISTS {column} {column_type}
+            """
+        ).result()
+
+    _HISTORY_SCHEMA_ENSURED = True
+
+
+def _is_bigquery_rate_limit_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return (
+        getattr(exc, "code", None) == 429
+        or "rateLimitExceeded" in text
+        or "Exceeded rate limits" in text
+    )
+
+
+def _run_history_load_job(client, rows, job_config, *, max_attempts: int | None = None):
+    """Run the history append, retrying BigQuery 429 rate-limit errors.
+
+    A load job that failed with rateLimitExceeded wrote nothing, so a fresh
+    job with the same rows cannot create duplicates.
+    """
+
+    attempts = max_attempts or int(os.getenv("BIGQUERY_HISTORY_LOAD_MAX_ATTEMPTS", "6"))
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        try:
+            load_job = client.load_table_from_json(
+                rows,
+                HISTORY_TABLE,
+                job_config=job_config,
+            )
+            return load_job.result()
+        except Exception as exc:  # noqa: BLE001 - only rate limits are retried
+            if attempt >= attempts or not _is_bigquery_rate_limit_error(exc):
+                raise
+            print(
+                f"BigQuery rate limit on history append (attempt {attempt}/{attempts}); "
+                f"retrying in {delay:.0f}s: {exc}"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
 
 
 def _target_history_schema(client):
@@ -835,12 +892,7 @@ def append_history_rows(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
 
-    load_job = client.load_table_from_json(
-        rows_to_insert,
-        HISTORY_TABLE,
-        job_config=job_config,
-    )
-    load_job.result()
+    _run_history_load_job(client, rows_to_insert, job_config)
 
     print(
         f"Logged {len(rows_to_insert)} rows to {HISTORY_TABLE} "
