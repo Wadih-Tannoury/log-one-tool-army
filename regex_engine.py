@@ -37,6 +37,7 @@ from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
+    NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED,
     align_invoice_requested_data_with_tracking_context,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
@@ -60,6 +61,7 @@ from customs_rules import (
     is_platform_handoff_request,
     is_purely_informative_request,
     is_request_number_2_or_higher,
+    is_noreply_autoreply_first_request,
     normalize_request_number,
     is_special_followup_ticket,
     is_tracking_reference_only,
@@ -365,6 +367,33 @@ class RegexEngine:
         tracking_not_found = str(
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
+
+        if is_noreply_autoreply_first_request(requester_email, request_number):
+            # Policy: every request number 1 from a sender whose address
+            # starts with noreply or autoreply is submitted as solved
+            # without a response and WITHOUT analysis: no regex matching, no
+            # guardrails, no LLM. Checked before every other rule.
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+                requested_data=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "Requester email starts with noreply/autoreply and this is "
+                    "request number 1. Submitted as solved without a response; "
+                    "the request was not analyzed."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=False,
+                human_intervention_required=False,
+                regex_request_types=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+                regex_requested_data=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         if is_no_action_carrier_notification(cleaned_text):
             return self._as_output(
