@@ -138,7 +138,51 @@ HISTORY_COLUMNS = [
     "requested_data",
     "draft_response",
     "final_response",
+    "zendesk_submission_status",
 ]
+
+# ---------------------------------------------------------------------------
+# Zendesk submission outcome, logged per request in the history table.
+#
+# The fetcher used to skip every request_id already present in the history
+# table. History rows are written in the same run that builds the reply, so a
+# request whose reply was built but never actually posted (dry run, Zendesk
+# error, document not downloaded yet, older buggy code version that logged an
+# empty final_response...) was logged once and then never looked at again,
+# while the ticket stayed open in Zendesk. Now only requests whose latest
+# history row has a *terminal* status are skipped; everything else on a still
+# active ticket is re-processed on the next run.
+# ---------------------------------------------------------------------------
+SUBMISSION_STATUS_SUBMITTED = "submitted"
+SUBMISSION_STATUS_ALREADY_PRESENT = "already_present"
+SUBMISSION_STATUS_SOLVED_WITHOUT_RESPONSE = "solved_without_response"
+SUBMISSION_STATUS_HUMAN = "human_intervention"
+SUBMISSION_STATUS_AWAITING_ORDER_DATA = "awaiting_order_data"
+SUBMISSION_STATUS_EXCLUDED = "excluded"
+SUBMISSION_STATUS_NOREPLY = "noreply"
+SUBMISSION_STATUS_NO_FINAL_RESPONSE = "no_final_response"
+SUBMISSION_STATUS_PENDING = "pending_submission"
+SUBMISSION_STATUS_DRY_RUN = "dry_run"
+SUBMISSION_STATUS_FAILED = "failed"
+
+TERMINAL_SUBMISSION_STATUSES = {
+    SUBMISSION_STATUS_SUBMITTED,
+    SUBMISSION_STATUS_ALREADY_PRESENT,
+    SUBMISSION_STATUS_SOLVED_WITHOUT_RESPONSE,
+    SUBMISSION_STATUS_HUMAN,
+    SUBMISSION_STATUS_EXCLUDED,
+    SUBMISSION_STATUS_NOREPLY,
+    SUBMISSION_STATUS_NO_FINAL_RESPONSE,
+}
+# Anything else (dry_run, failed, pending_submission, awaiting_order_data) is
+# retried on the next run while the ticket is still new/open/pending.
+
+# Safety valve: stop retrying a request after this many logged runs.
+HISTORY_MAX_RETRY_RUNS = int(os.getenv("HISTORY_MAX_RETRY_RUNS", "12"))
+
+LEGACY_RETRYABLE_HUMAN_DRAFT_MARKERS = (
+    "GET_FULL_ORDER API data is missing",
+)
 
 VALID_CATEGORIES = list(VALID_TICKET_CATEGORIES)
 # Zendesk statuses the workflow should process. The previous broad query
@@ -331,6 +375,90 @@ def existing_history_request_ids(
     return _existing_request_ids(client, bigquery, request_ids)
 
 
+def history_row_is_completed(
+    *,
+    status: Any,
+    human_intervention_required: Any,
+    draft_response: Any,
+    run_count: Any = 1,
+) -> bool:
+    """Decide from the latest history row whether a request is finished.
+
+    Rows written before zendesk_submission_status existed have a NULL status.
+    For those, only human-intervention rows (a person owns them now) and
+    excluded rows are treated as finished; a human row that was blocked only
+    because GET_FULL_ORDER data/PDFs were missing is retried. Any other legacy
+    row on a ticket that is still active was evidently never answered.
+    """
+
+    count = _to_int(run_count) or 1
+    if HISTORY_MAX_RETRY_RUNS > 0 and count >= HISTORY_MAX_RETRY_RUNS:
+        return True
+
+    status_text = (_to_str(status) or "").strip().lower()
+    if status_text:
+        return status_text in TERMINAL_SUBMISSION_STATUSES
+
+    draft = _to_str(draft_response) or ""
+    if draft.lstrip().startswith("Excluded from processing"):
+        return True
+    if bool(_to_bool(human_intervention_required)):
+        return not any(marker in draft for marker in LEGACY_RETRYABLE_HUMAN_DRAFT_MARKERS)
+    return False
+
+
+def _completed_request_ids(client, bigquery, request_ids: Iterable[str]) -> set[str]:
+    request_ids = sorted({str(request_id) for request_id in request_ids if request_id})
+    if not request_ids:
+        return set()
+
+    _ensure_history_schema(client)
+
+    query = f"""
+    SELECT
+        request_id,
+        zendesk_submission_status,
+        human_intervention_required,
+        draft_response,
+        COUNT(*) OVER (PARTITION BY request_id) AS run_count
+    FROM `{HISTORY_TABLE}`
+    WHERE request_id IN UNNEST(@request_ids)
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY request_id
+        ORDER BY ingestion_timestamp DESC
+    ) = 1
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("request_ids", "STRING", request_ids)
+        ]
+    )
+
+    completed: set[str] = set()
+    for row in client.query(query, job_config=job_config).result():
+        if history_row_is_completed(
+            status=row["zendesk_submission_status"],
+            human_intervention_required=row["human_intervention_required"],
+            draft_response=row["draft_response"],
+            run_count=row["run_count"],
+        ):
+            completed.add(row["request_id"])
+    return completed
+
+
+def completed_history_request_ids(
+    request_ids: Iterable[str],
+    client=None,
+    bigquery=None,
+) -> set[str]:
+    """Return request_ids whose latest history row means "nothing left to do"."""
+
+    if client is None or bigquery is None:
+        client, bigquery = bigquery_client()
+    return _completed_request_ids(client, bigquery, request_ids)
+
+
 # ============================================================================
 # HISTORY TABLE LOGGING HELPERS
 # ============================================================================
@@ -512,6 +640,7 @@ def history_schema(bigquery):
         bigquery.SchemaField("requested_data", "STRING", mode="REPEATED"),
         bigquery.SchemaField("draft_response", "STRING"),
         bigquery.SchemaField("final_response", "STRING"),
+        bigquery.SchemaField("zendesk_submission_status", "STRING"),
     ]
 
 
@@ -522,6 +651,12 @@ def _ensure_history_schema(client) -> None:
         f"""
         ALTER TABLE `{HISTORY_TABLE}`
         ADD COLUMN IF NOT EXISTS final_response STRING
+        """
+    ).result()
+    client.query(
+        f"""
+        ALTER TABLE `{HISTORY_TABLE}`
+        ADD COLUMN IF NOT EXISTS zendesk_submission_status STRING
         """
     ).result()
 
@@ -614,6 +749,7 @@ def prepare_history_row(
         "requested_data": _string_list(row.get("requested_data")),
         "draft_response": _to_str(row.get("draft_response")),
         "final_response": _to_str(row.get("final_response")),
+        "zendesk_submission_status": _to_str(row.get("zendesk_submission_status")),
     }
 
     return {column: prepared.get(column) for column in HISTORY_COLUMNS}
@@ -672,7 +808,11 @@ def append_history_rows(
     client, bigquery = bigquery_client()
     target_schema = _target_history_schema(client)
 
-    existing_ids = _existing_request_ids(
+    # Only requests whose latest history row is terminal are skipped. Retried
+    # requests (dry run, failed submission, awaiting documents, legacy rows
+    # that were never answered) get a new row for this run, so the latest row
+    # always reflects the latest outcome.
+    existing_ids = _completed_request_ids(
         client,
         bigquery,
         [row["request_id"] for row in unique_rows],
@@ -684,7 +824,7 @@ def append_history_rows(
 
     skipped_count = len(unique_rows) - len(rows_to_insert)
     if skipped_count:
-        print(f"Skipped {skipped_count} rows already present in {HISTORY_TABLE}.")
+        print(f"Skipped {skipped_count} rows already completed in {HISTORY_TABLE}.")
 
     if not rows_to_insert:
         print("No new rows to append to BigQuery history.")
@@ -714,7 +854,7 @@ def append_history_rows(
 
 
 def new_history_request_ids(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> list[str]:
-    """Return request_ids that are not already present in the history table."""
+    """Return request_ids that still need a history row (not yet completed)."""
 
     if isinstance(rows, pd.DataFrame):
         raw_rows = rows.to_dict(orient="records")
@@ -749,7 +889,7 @@ def new_history_request_ids(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) ->
 
     client, bigquery = bigquery_client()
     _target_history_schema(client)
-    existing_ids = _existing_request_ids(client, bigquery, request_ids)
+    existing_ids = _completed_request_ids(client, bigquery, request_ids)
     return [request_id for request_id in request_ids if request_id not in existing_ids]
 
 
@@ -1739,8 +1879,22 @@ def _is_zendesk_required_field_for_solve_error(error_detail: str) -> bool:
     return "is required when solving a ticket" in lowered
 
 
-def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int:
+def _outcome_key(row: Mapping[str, Any]) -> str:
+    return _to_str(row.get("request_id")) or build_request_id(
+        _to_int(row.get("zendesk_ticket_id")),
+        _to_int(row.get("request_number")),
+    ) or ""
+
+
+def submit_final_responses(
+    rows: Iterable[Mapping[str, Any]] | pd.DataFrame,
+    outcomes: dict[str, str] | None = None,
+) -> int:
     """Submit non-empty final_response values to Zendesk when enabled.
+
+    When ``outcomes`` is given it is filled with request_id -> submission
+    status (see SUBMISSION_STATUS_*) for every row that was a submission
+    candidate, so the caller can log what really happened in Zendesk.
 
     Human-intervention rows and blank final responses are intentionally skipped.
     The actual public Zendesk side effect is controlled by the
@@ -1835,7 +1989,14 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
         print("No Zendesk final responses to submit.")
         return 0
 
+    if outcomes is None:
+        outcomes = {}
+
     if not zendesk_response_submission_enabled():
+        for _ticket_id, row in solve_without_response_rows:
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_DRY_RUN
+        for _ticket_id, _body, row in response_rows:
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_DRY_RUN
         print(
             f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
             f"{len(response_rows)} Zendesk response(s) and "
@@ -1875,12 +2036,16 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 base_url=base_url,
             ):
                 submitted += 1
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_SOLVED_WITHOUT_RESPONSE
         except ZendeskTicketClosedError as exc:
             print(f"Skipped Zendesk ticket {ticket_id}: {exc}")
+            # A closed ticket can never be updated again: nothing left to do.
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_ALREADY_PRESENT
             failed.append((ticket_id, str(exc)))
         except Exception as exc:  # noqa: BLE001 - one bad ticket must not
             # abort the rest of the batch.
             print(f"Failed to solve-without-response Zendesk ticket {ticket_id}: {exc}")
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_FAILED
             failed.append((ticket_id, str(exc)))
 
     for ticket_id, final_response, row in response_rows:
@@ -1901,16 +2066,23 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 base_url=base_url,
             ):
                 submitted += 1
+                outcomes[_outcome_key(row)] = SUBMISSION_STATUS_SUBMITTED
+            else:
+                # submit_ticket_response() returns False when the exact same
+                # public comment is already on the ticket.
+                outcomes[_outcome_key(row)] = SUBMISSION_STATUS_ALREADY_PRESENT
         except ZendeskTicketClosedError as exc:
             # Already-closed tickets can never be fixed by retrying this
             # same request, so log it and keep going with the rest of the
             # batch instead of aborting every remaining submission.
             print(f"Skipped Zendesk ticket {ticket_id}: {exc}")
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_ALREADY_PRESENT
             failed.append((ticket_id, str(exc)))
         except Exception as exc:  # noqa: BLE001 - intentionally broad: one
             # bad ticket (network blip, validation error, etc.) must not
             # prevent the rest of the batch from being submitted.
             print(f"Failed to submit Zendesk ticket {ticket_id}: {exc}")
+            outcomes[_outcome_key(row)] = SUBMISSION_STATUS_FAILED
             failed.append((ticket_id, str(exc)))
 
     print(f"Submitted {submitted} Zendesk final response(s).")
@@ -3008,7 +3180,10 @@ def fetch_tickets_to_active_table() -> int:
 
     df.drop_duplicates(subset=["request_id"], inplace=True)
 
-    existing_ids = existing_history_request_ids(
+    # Skip only requests that are actually finished (replied, solved without
+    # reply, handed to a human, excluded). Requests that were logged but never
+    # answered are re-processed so the reply is finally posted.
+    existing_ids = completed_history_request_ids(
         df["request_id"].dropna().unique().tolist(),
         client,
         bigquery,
@@ -3018,7 +3193,7 @@ def fetch_tickets_to_active_table() -> int:
         before_count = len(df)
         df = df[~df["request_id"].isin(existing_ids)].copy()
         print(
-            f"Skipped {before_count - len(df)} requests already present in "
+            f"Skipped {before_count - len(df)} requests already completed in "
             f"{HISTORY_TABLE}."
         )
 
