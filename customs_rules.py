@@ -24,6 +24,8 @@ PLACEHOLDER = "[TO BE RETRIEVED]"
 HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
 PURELY_INFORMATIVE_SOLVED = "purely_informative_solved"
+NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED = "noreply_autoreply_first_request_solved"
+NOREPLY_AUTOREPLY_PREFIXES = ("noreply", "autoreply")
 DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE = "dichiarazione_di_libera_esportazione"
 LIBERA_ESPORTAZIONE_REQUEST_TYPES = {
     DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE,
@@ -2044,6 +2046,41 @@ def is_noreply_fedex_requester_email(email: object) -> bool:
             return True
 
     return False
+
+
+def is_noreply_or_autoreply_requester_email(email: object) -> bool:
+    """Return True when the requester/sender email starts with ``noreply`` or ``autoreply``.
+
+    Same matching rules as ``is_noreply_requester_email`` (case-insensitive,
+    tolerates ``Name <autoreply@example.com>`` display-name wrapping), but also
+    accepts the ``autoreply`` prefix.
+    """
+    normalized = normalize_email(email)
+    if not normalized:
+        return False
+
+    if normalized.startswith(NOREPLY_AUTOREPLY_PREFIXES):
+        return True
+
+    for match in re.finditer(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", normalized):
+        local_part = match.group(0).split("@", 1)[0]
+        if local_part.startswith(NOREPLY_AUTOREPLY_PREFIXES):
+            return True
+
+    return False
+
+
+def is_noreply_autoreply_first_request(requester_email: object, request_number: object) -> bool:
+    """Policy: noreply*/autoreply* senders on request number 1 are solved unanalyzed.
+
+    These rows skip regex and LLM analysis entirely, skip GET_FULL_ORDER and
+    document generation, and are submitted to Zendesk as ``solved`` with no
+    public comment (same status-only path as ``noreply@fedex.com``).
+    """
+    return (
+        is_noreply_or_autoreply_requester_email(requester_email)
+        and normalize_request_number(request_number) == 1
+    )
 
 
 def normalize_request_number(value: object) -> int:
