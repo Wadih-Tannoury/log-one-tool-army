@@ -13,6 +13,16 @@ on:
         required: false
         type: boolean
         default: false
+      assign_unhandled_tickets_to_group:
+        description: "Assign unresolved tickets to the second-level logistics group"
+        required: false
+        type: boolean
+        default: true
+      escalation_group_name:
+        description: "Zendesk group that receives unresolved tickets"
+        required: false
+        type: string
+        default: "LOG II lvl"
 
 jobs:
   process_requests:
@@ -34,10 +44,22 @@ jobs:
       SUBMIT_ZENDESK_RESPONSES: ${{ inputs.submit_zendesk_responses }}
       ZENDESK_STATUS_AFTER_REPLY: solved
       PERSIST_GENERATED_DOCUMENTS: ${{ inputs.persist_generated_documents }}
+      # Tickets the workflow could not resolve (no data found, no action taken)
+      # are handed to this Zendesk group instead of being left unattended.
+      ZENDESK_ESCALATION_GROUP_NAME: ${{ inputs.escalation_group_name }}
+      ASSIGN_UNHANDLED_TICKETS_TO_GROUP: ${{ inputs.assign_unhandled_tickets_to_group }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Install Tesseract OCR
+        # Used only to read order references out of scanned PDF attachments.
+        # The pipeline degrades gracefully to "no order reference found" when
+        # this engine is unavailable.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -60,7 +82,8 @@ jobs:
             google-genai \
             pymupdf \
             Pillow \
-            reportlab
+            reportlab \
+            pytesseract
 
       - name: Initialize Workflow Run
         run: python -c "import uuid; print(f'WORKFLOW_RUN_ID={uuid.uuid4()}')" >> "$GITHUB_ENV"
@@ -74,6 +97,8 @@ jobs:
           echo "Zendesk response submission: $SUBMIT_ZENDESK_RESPONSES"
           echo "Zendesk status after automatic reply: $ZENDESK_STATUS_AFTER_REPLY"
           echo "Persist generated documents: $PERSIST_GENERATED_DOCUMENTS"
+          echo "Assign unresolved tickets to group: $ASSIGN_UNHANDLED_TICKETS_TO_GROUP"
+          echo "Escalation group: $ZENDESK_ESCALATION_GROUP_NAME"
 
       - name: Fetch Tickets
         run: python ticket_fetcher.py
