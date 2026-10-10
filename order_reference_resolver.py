@@ -40,7 +40,7 @@ from __future__ import annotations
 import io
 import os
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 try:  # PyMuPDF >= 1.24.3 exposes `pymupdf`; older releases only ship `fitz`.
     import pymupdf  # type: ignore
@@ -451,18 +451,25 @@ def find_order_references_in_pdf_bytes(pdf_bytes: bytes) -> tuple[list[str], str
 
 def find_order_references_in_pdfs(
     pdf_blobs: Iterable[tuple[str, bytes]],
+    *,
+    log: Callable[[str], None] = print,
 ) -> list[str]:
-    """Scan several PDFs and return every order reference found, de-duplicated."""
+    """Scan several PDFs and return every order reference found, de-duplicated.
+
+    ``log`` receives one line per PDF. It defaults to ``print`` so existing
+    callers are unchanged; concurrent callers pass a collector instead and
+    replay the lines on the main thread, keeping the run log readable.
+    """
 
     references: list[str] = []
     for file_name, pdf_bytes in pdf_blobs:
         try:
             found, method = find_order_references_in_pdf_bytes(pdf_bytes)
         except Exception as exc:  # noqa: BLE001 - one bad PDF must not stop the rest
-            print(f"      could not read PDF {file_name}: {exc}")
+            log(f"      could not read PDF {file_name}: {exc}")
             continue
         if found:
-            print(f"      order reference(s) in {file_name}: {found} (via {method})")
+            log(f"      order reference(s) in {file_name}: {found} (via {method})")
         for reference in found:
             if reference not in references:
                 references.append(reference)
