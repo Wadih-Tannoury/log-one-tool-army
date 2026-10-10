@@ -37,8 +37,13 @@ from response_data_extractor import (
     ups_account_number_for_documents,
 )
 
+from order_reference_resolver import (
+    BLOCKED_ORDER_REFERENCE_PREFIXES,
+    contains_blocked_order_reference,
+)
 from ticket_fetcher import (
     SUBMISSION_STATUS_AWAITING_ORDER_DATA,
+    SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX,
     SUBMISSION_STATUS_EXCLUDED,
     SUBMISSION_STATUS_HUMAN,
     SUBMISSION_STATUS_NO_FINAL_RESPONSE,
@@ -767,6 +772,41 @@ def row_has_request_type(row, request_type):
         if wanted in normalize_requested_data(row.get(column)):
             return True
     return False
+
+
+def is_blocked_order_prefix_row(row):
+    """True for RC-US / RC-EU / LN-EU / LN-US orders, which are never processed."""
+
+    if as_bool(row.get("order_processing_blocked")):
+        return True
+    return contains_blocked_order_reference(
+        row.get("shipment_order_number"),
+        row.get("extracted_order_reference"),
+    )
+
+
+def build_blocked_order_prefix_note(row):
+    """Internal note explaining why the ticket was deliberately left untouched.
+
+    This is never posted to Zendesk: build_final_response() returns an empty
+    string for these rows and submit_final_responses() performs no ticket
+    update at all -- not a reply, not a solve, not even a group re-assignment.
+    """
+
+    order_number = first_available_value(
+        row.get("shipment_order_number"),
+        row.get("extracted_order_reference"),
+        default="(unknown)",
+    )
+    return (
+        "NO ACTION TAKEN\n\n"
+        f"Order {order_number} is on a blocked prefix "
+        f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}).\n"
+        "By policy these requests are not processed: no reply was sent, the "
+        "ticket was not solved, and it was not re-assigned to another group.\n"
+        f"Ticket: {row.get('zendesk_ticket_id', '')}\n"
+        f"Request number: {row.get('request_number', '')}"
+    )
 
 
 def is_excluded_from_processing(row):
@@ -2237,6 +2277,11 @@ def _build_response_body(row):
             if item != "ups_account_number"
         ]
 
+    if is_blocked_order_prefix_row(row):
+        # RC-US / RC-EU / LN-EU / LN-US: leave the ticket exactly as it is.
+        # Checked before every other rule.
+        return build_blocked_order_prefix_note(row)
+
     if is_purely_informative_solved_row(row):
         # Regardless of request number, and regardless of whether the
         # tracking number was found in the ticket or in
@@ -2245,7 +2290,12 @@ def _build_response_body(row):
         # without a response.
         return build_purely_informative_solved_note(row)
 
-    if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+    if is_missing_extracted_tracking_number(
+        row.get("extracted_tracking_number")
+    ) and is_blank(row.get("shipment_order_number")):
+        # Only a guard when nothing identifies the order. When an order
+        # reference was found in the ticket text or in a PDF attachment, the
+        # request is analyzed and answered normally.
         if is_purely_informative_request(request_text):
             return build_missing_tracking_solved_note(row)
         return build_human_intervention_note(
@@ -2535,6 +2585,11 @@ def _remove_document_values_from_response(response_text, document_values):
 
 
 def build_final_response(row):
+    if is_blocked_order_prefix_row(row):
+        # Blocked order prefix: nothing is ever posted and the ticket is not
+        # touched at all.
+        return ""
+
     if is_noreply_autoreply_first_request_row(row):
         # Deliberately non-blank, same treatment as noreply@fedex.com below:
         # never posted as a comment; ticket_fetcher solves with a status-only
@@ -2560,7 +2615,9 @@ def build_final_response(row):
 
     if is_missing_extracted_tracking_number(
         row.get("extracted_tracking_number")
-    ) and is_purely_informative_request(row_request_text(row)):
+    ) and is_blank(row.get("shipment_order_number")) and is_purely_informative_request(
+        row_request_text(row)
+    ):
         # Deliberately non-blank, same treatment as noreply@fedex.com above:
         # ticket_fetcher.submit_final_responses() routes these rows to a
         # status-only "solved" update instead of posting this text as a
@@ -2638,6 +2695,10 @@ def enforce_reply_consistency(row):
     flagged for human intervention with an explicit reason instead.
     """
 
+    if is_blocked_order_prefix_row(row):
+        # A blank final_response is the intended outcome here: the ticket is
+        # deliberately left untouched, so this is not a silent failure.
+        return row
     if as_bool(row.get("human_intervention_required")):
         return row
     if _is_solve_without_response_row(row):
@@ -2670,6 +2731,8 @@ def enforce_reply_consistency(row):
 def pre_submission_status(row):
     """History status before Zendesk submission (submission may override it)."""
 
+    if is_blocked_order_prefix_row(row):
+        return SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX
     if _is_solve_without_response_row(row):
         return SUBMISSION_STATUS_PENDING
     if is_noreply_requester_email(row.get("requester_email")):
