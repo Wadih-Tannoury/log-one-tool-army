@@ -261,6 +261,8 @@ ZENDESK_COMMENT_FETCH_WORKERS_ENV = "ZENDESK_COMMENT_FETCH_WORKERS"
 DEFAULT_ZENDESK_COMMENT_FETCH_WORKERS = 20
 ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
 DEFAULT_ZENDESK_MAX_RETRIES = 5
+MAX_TICKETS_PER_RUN_ENV = "MAX_TICKETS_PER_RUN"
+DEFAULT_MAX_TICKETS_PER_RUN = 200
 ORDER_REFERENCE_PDF_SCAN_WORKERS_ENV = "ORDER_REFERENCE_PDF_SCAN_WORKERS"
 # PDF scanning is download + Tesseract OCR. Both release the GIL (one is a
 # socket wait, the other a subprocess wait), so threads give real parallelism.
@@ -4075,6 +4077,68 @@ def apply_order_reference_fallback(
     return df
 
 
+def _max_tickets_per_run() -> int:
+    return _env_int(
+        MAX_TICKETS_PER_RUN_ENV,
+        DEFAULT_MAX_TICKETS_PER_RUN,
+        minimum=1,
+        maximum=100_000,
+    )
+
+
+def limit_to_max_tickets(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep at most ``MAX_TICKETS_PER_RUN`` tickets, oldest first.
+
+    The cap counts *tickets*, not rows: one ticket can carry several requests
+    and they are kept together, because answering half a ticket's requests in
+    this run and half in the next would produce a partial reply.
+
+    Oldest first (by ticket submission, ties broken by ticket id) so the
+    backlog drains in order and no ticket can starve across runs. Whatever is
+    left over is simply picked up next run: the history de-duplication above
+    means a completed request is never fetched again.
+    """
+
+    limit = _max_tickets_per_run()
+    if df.empty or "zendesk_ticket_id" not in df.columns:
+        return df
+
+    ticket_ids = df["zendesk_ticket_id"].dropna().unique()
+    if len(ticket_ids) <= limit:
+        return df
+
+    ordering = pd.DataFrame({"zendesk_ticket_id": df["zendesk_ticket_id"]})
+    ordering["_submitted_at"] = pd.to_datetime(
+        df.get("ticket_submission_timestamp"), utc=True, errors="coerce"
+    )
+    oldest_first = (
+        ordering.dropna(subset=["zendesk_ticket_id"])
+        .groupby("zendesk_ticket_id", dropna=True)["_submitted_at"]
+        .min()
+        .reset_index()
+        # A ticket with no usable timestamp goes last rather than first, so a
+        # bad timestamp can never crowd out a ticket we know to be older.
+        .sort_values(
+            by=["_submitted_at", "zendesk_ticket_id"], na_position="last"
+        )
+    )
+    keep = set(oldest_first["zendesk_ticket_id"].head(limit))
+
+    # Rows without a ticket id are kept rather than silently dropped; they are
+    # not countable against a ticket cap.
+    limited = df[
+        df["zendesk_ticket_id"].isin(keep) | df["zendesk_ticket_id"].isna()
+    ].copy()
+
+    print(
+        f"Limiting this run to {limit} ticket(s) of {len(ticket_ids)} "
+        f"({len(ticket_ids) - limit} left for the next run): "
+        f"{len(limited)} of {len(df)} request(s) kept. "
+        f"Set {MAX_TICKETS_PER_RUN_ENV} to change the cap."
+    )
+    return limited
+
+
 def fetch_tickets_to_active_table() -> int:
     client, bigquery = bigquery_client()
     email_to_category = load_requester_configuration(
@@ -4137,6 +4201,11 @@ def fetch_tickets_to_active_table() -> int:
             bigquery,
         )
         return 0
+
+    # Capped here, after the completed-request skip and before the expensive
+    # enrichment: capping earlier would spend the budget on requests that are
+    # already done, so a run could make no progress at all.
+    df = limit_to_max_tickets(df)
 
     df = enrich_with_shipment_numbers(
         df,
