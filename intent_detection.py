@@ -37,7 +37,9 @@ from pipeline_io import (
     read_dataframe,
     write_dataframe,
 )
+from order_reference_resolver import contains_blocked_order_reference
 from customs_rules import (
+    BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
@@ -472,6 +474,11 @@ def base_output_row(source_row) -> Dict[str, object]:
         "tracking_not_found_in_shipping_platform_shipments": as_bool(
             source_row.get("tracking_not_found_in_shipping_platform_shipments")
         ),
+        "extracted_order_reference": source_row.get("extracted_order_reference"),
+        "order_reference_source": source_row.get("order_reference_source"),
+        "shipment_selection_mode": source_row.get("shipment_selection_mode"),
+        "order_processing_blocked": as_bool(source_row.get("order_processing_blocked")),
+        "order_resolution_complete": source_row.get("order_resolution_complete"),
         "llm_human_intervention_draft_response": source_row.get(
             "llm_human_intervention_draft_response",
             "",
@@ -538,6 +545,58 @@ def build_exclude_output_row(source_row, reason, engine="no_action_guardrail"):
 
 def is_tracking_lookup_not_found(row) -> bool:
     return as_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
+
+
+def has_resolved_order(row) -> bool:
+    """True when the request is tied to an order by any resolution route.
+
+    The order may come from the tracking number via
+    bi.shipping_platform_shipments, or from an order reference found in the
+    ticket text or inside a PDF attachment. Either way the tracking-number
+    guards below no longer apply, because GET_FULL_ORDER can be queried.
+    """
+
+    if not str(row.get("shipment_order_number") or "").strip():
+        return False
+    # On a ticket with several tracking numbers, only some of which resolved,
+    # order_resolution_complete is False and the request must stay in human
+    # review instead of being answered with partial data.
+    flag = row.get("order_resolution_complete")
+    if flag is None or (isinstance(flag, str) and not flag.strip()):
+        return True
+    return as_bool(flag)
+
+
+def is_order_processing_blocked(row) -> bool:
+    return as_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
+        row.get("shipment_order_number"),
+        row.get("extracted_order_reference"),
+    )
+
+
+def build_blocked_order_output_row(source_row):
+    output = base_output_row(source_row)
+    output.update(
+        {
+            "engine": "blocked_order_prefix_guard",
+            "matched": True,
+            "excluded": True,
+            "request_types": [BLOCKED_ORDER_PREFIX_SKIPPED],
+            "requested_data": [BLOCKED_ORDER_PREFIX_SKIPPED],
+            "confidence": 0.99,
+            "llm_confidence": None,
+            "notes": (
+                "The order number is on a blocked prefix (RC-US, RC-EU, LN-EU "
+                "or LN-US). The request is not processed and the ticket is "
+                "left untouched."
+            ),
+            "human_intervention_required": False,
+            "llm_was_used": False,
+            "llm_model_used": "",
+            "llm_model_attempts": "",
+        }
+    )
+    return output
 
 
 def requested_data_summary(values: List[str]) -> str:
@@ -834,9 +893,15 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if is_missing_extracted_tracking_number(
+        if is_order_processing_blocked(row):
+            # RC-US / RC-EU / LN-EU / LN-US: never analyzed, never answered,
+            # and the ticket is left exactly as it is.
+            llm_results.append(build_blocked_order_output_row(row))
+        elif is_missing_extracted_tracking_number(
             row.get("extracted_tracking_number")
-        ) and not is_request_number_2_or_higher(row.get("request_number")):
+        ) and not has_resolved_order(row) and not is_request_number_2_or_higher(
+            row.get("request_number")
+        ):
             # This guard only applies to request number 1. From request
             # number 2 onward, policy requires always sending the ticket to
             # the LLM regardless of tracking-number status (see
@@ -859,7 +924,7 @@ def main():
                         engine="missing_tracking_number_guard",
                     )
                 )
-        elif is_tracking_lookup_not_found(row):
+        elif is_tracking_lookup_not_found(row) and not has_resolved_order(row):
             # User requirement: when the extracted tracking number is missing from
             # shipping_platform_shipments, bypass regex/hard guards and let the
             # LLM summarize what it understood before routing to human review.
