@@ -3884,7 +3884,11 @@ def apply_order_reference_fallback(
         pending_ticket_ids: list[int] = []
         seen_ticket_ids: set[int] = set()
         for _, row in df.iterrows():
-            if (_to_str(row.get("shipment_order_number")) or "").strip():
+            # Mirrors the loop exactly, including its rejection of a stored
+            # order that is not a real reference: such a row is re-resolved
+            # there, so it must be scanned here too.
+            stored_order = (_to_str(row.get("shipment_order_number")) or "").strip()
+            if stored_order and split_order_references(stored_order):
                 continue
             if split_order_references(row.get("extracted_order_reference")):
                 continue
@@ -3910,6 +3914,7 @@ def apply_order_reference_fallback(
     resolved_from_text = 0
     resolved_from_pdf = 0
     unresolved = 0
+    discarded_stored_orders = 0
 
     try:
         for _, row in df.iterrows():
@@ -3917,6 +3922,19 @@ def apply_order_reference_fallback(
             # is NaN, not None, and str(NaN) is the *truthy* string "nan" --
             # which would make every unresolved row look already resolved.
             existing_order = (_to_str(row.get("shipment_order_number")) or "").strip()
+            # A run made before split_order_references() validated its input
+            # could persist a literal "NAN" here, and a non-empty value in this
+            # column otherwise means "already resolved" and marks the request
+            # complete. Anything that is not a real order reference is dropped
+            # so the row goes through resolution and, failing that, to a human.
+            if existing_order and not split_order_references(existing_order):
+                print(
+                    f"  Ignoring unusable stored order {existing_order!r} on ticket "
+                    f"{_to_str(row.get('zendesk_ticket_id'))}; re-resolving."
+                )
+                discarded_stored_orders += 1
+                existing_order = ""
+
             tracking_value = (_to_str(row.get("extracted_tracking_number")) or "").strip()
             has_tracking = bool(
                 tracking_value and tracking_value.upper() != "N/A"
@@ -4038,11 +4056,18 @@ def apply_order_reference_fallback(
     df["order_resolution_complete"] = complete_flags
 
     blocked_count = sum(1 for flag in blocked_flags if flag)
+    incomplete_count = sum(1 for flag in complete_flags if not flag)
+    if discarded_stored_orders:
+        print(
+            f"Discarded {discarded_stored_orders} unusable stored order(s) "
+            "written by an earlier run; those rows were re-resolved."
+        )
     print(
         "Order-reference fallback: "
         f"{resolved_from_text} resolved from subject/description, "
         f"{resolved_from_pdf} resolved from PDF attachments, "
         f"{unresolved} still without an order. "
+        f"{incomplete_count} request(s) are incomplete and go to human review. "
         f"{blocked_count} request(s) are on a blocked prefix "
         f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}) and will be left untouched."
     )
