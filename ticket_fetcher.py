@@ -53,6 +53,21 @@ from customs_rules import (
     normalize_email,
     normalize_requested_data,
 )
+from order_reference_resolver import (
+    BLOCKED_ORDER_REFERENCE_PREFIXES,
+    ORDER_REFERENCE_SOURCE_PDF,
+    ORDER_REFERENCE_SOURCE_TEXT,
+    ORDER_REFERENCE_SOURCE_TRACKING,
+    SHIPMENT_SELECTION_ALL,
+    SHIPMENT_SELECTION_BY_TRACKING,
+    SHIPMENT_SELECTION_EXACT,
+    contains_blocked_order_reference,
+    find_order_references,
+    find_order_references_in_pdfs,
+    is_pdf_attachment,
+    is_shipment_shaped_order_reference,
+    split_order_references,
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -105,6 +120,11 @@ ACTIVE_TICKET_COLUMNS = [
     "shipment_carrier_code",
     "return_carrier_code",
     "tracking_not_found_in_shipping_platform_shipments",
+    "extracted_order_reference",
+    "order_reference_source",
+    "shipment_selection_mode",
+    "order_processing_blocked",
+    "order_resolution_complete",
 ]
 
 HISTORY_COLUMNS = [
@@ -125,6 +145,11 @@ HISTORY_COLUMNS = [
     "shipment_order_number",
     "shipment_tracking_number",
     "return_tracking_number",
+    "extracted_order_reference",
+    "order_reference_source",
+    "shipment_selection_mode",
+    "order_processing_blocked",
+    "order_resolution_complete",
     "notes",
     "human_intervention_required",
     "regex_request_types",
@@ -165,6 +190,12 @@ SUBMISSION_STATUS_NO_FINAL_RESPONSE = "no_final_response"
 SUBMISSION_STATUS_PENDING = "pending_submission"
 SUBMISSION_STATUS_DRY_RUN = "dry_run"
 SUBMISSION_STATUS_FAILED = "failed"
+# The workflow could not find the data / took no action on the ticket, so the
+# ticket was handed to the second-level logistics group instead.
+SUBMISSION_STATUS_ASSIGNED_TO_GROUP = "assigned_to_group"
+# RC-US / RC-EU / LN-EU / LN-US order: the ticket is deliberately left exactly
+# as it is, with no reply, no solve and no group re-assignment.
+SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX = "blocked_order_prefix"
 
 TERMINAL_SUBMISSION_STATUSES = {
     SUBMISSION_STATUS_SUBMITTED,
@@ -174,7 +205,32 @@ TERMINAL_SUBMISSION_STATUSES = {
     SUBMISSION_STATUS_EXCLUDED,
     SUBMISSION_STATUS_NOREPLY,
     SUBMISSION_STATUS_NO_FINAL_RESPONSE,
+    SUBMISSION_STATUS_ASSIGNED_TO_GROUP,
+    SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX,
 }
+
+# ---------------------------------------------------------------------------
+# Second-level logistics escalation group.
+#
+# Every ticket the workflow could not resolve -- no data found and no action
+# taken on the ticket, not even a solve -- is assigned to this Zendesk group so
+# a human picks it up, following the same approach as the standalone
+# assign_tickets_to_group.py script. Tickets on a blocked order prefix are the
+# one exception: they are left completely untouched.
+# ---------------------------------------------------------------------------
+ZENDESK_ESCALATION_GROUP_NAME = os.getenv(
+    "ZENDESK_ESCALATION_GROUP_NAME",
+    "LOG II lvl",
+).strip()
+ZENDESK_ESCALATION_GROUP_ID_ENV = "ZENDESK_ESCALATION_GROUP_ID"
+ZENDESK_ESCALATION_CLEAR_ASSIGNEE_ENV = "ZENDESK_ESCALATION_CLEAR_ASSIGNEE"
+ASSIGN_UNHANDLED_TICKETS_TO_GROUP_ENV = "ASSIGN_UNHANDLED_TICKETS_TO_GROUP"
+DEFAULT_ASSIGN_UNHANDLED_TICKETS_TO_GROUP = True
+# A ticket already sitting with the escalation group has been handed to a human
+# on an earlier run. It is dropped at fetch time: not analyzed, not answered,
+# and not written to the history table at all.
+SKIP_TICKETS_IN_ESCALATION_GROUP_ENV = "SKIP_TICKETS_IN_ESCALATION_GROUP"
+DEFAULT_SKIP_TICKETS_IN_ESCALATION_GROUP = True
 # Anything else (dry_run, failed, pending_submission, awaiting_order_data) is
 # retried on the next run while the ticket is still new/open/pending.
 
@@ -273,6 +329,11 @@ def active_tickets_schema(bigquery):
             "tracking_not_found_in_shipping_platform_shipments",
             "BOOL",
         ),
+        bigquery.SchemaField("extracted_order_reference", "STRING"),
+        bigquery.SchemaField("order_reference_source", "STRING"),
+        bigquery.SchemaField("shipment_selection_mode", "STRING"),
+        bigquery.SchemaField("order_processing_blocked", "BOOL"),
+        bigquery.SchemaField("order_resolution_complete", "BOOL"),
     ]
 
 
@@ -296,7 +357,12 @@ def empty_active_tickets_table(client) -> None:
             return_tracking_number STRING,
             shipment_carrier_code STRING,
             return_carrier_code STRING,
-            tracking_not_found_in_shipping_platform_shipments BOOL
+            tracking_not_found_in_shipping_platform_shipments BOOL,
+            extracted_order_reference STRING,
+            order_reference_source STRING,
+            shipment_selection_mode STRING,
+            order_processing_blocked BOOL,
+            order_resolution_complete BOOL
         )
         """
     ).result()
@@ -617,6 +683,11 @@ def history_schema(bigquery):
         bigquery.SchemaField("shipment_order_number", "STRING"),
         bigquery.SchemaField("shipment_tracking_number", "STRING"),
         bigquery.SchemaField("return_tracking_number", "STRING"),
+        bigquery.SchemaField("extracted_order_reference", "STRING"),
+        bigquery.SchemaField("order_reference_source", "STRING"),
+        bigquery.SchemaField("shipment_selection_mode", "STRING"),
+        bigquery.SchemaField("order_processing_blocked", "BOOL"),
+        bigquery.SchemaField("order_resolution_complete", "BOOL"),
         bigquery.SchemaField("notes", "STRING"),
         bigquery.SchemaField("human_intervention_required", "BOOL"),
         bigquery.SchemaField("regex_request_types", "STRING", mode="REPEATED"),
@@ -649,6 +720,11 @@ def history_schema(bigquery):
 _ADDITIVE_HISTORY_COLUMNS = (
     ("final_response", "STRING"),
     ("zendesk_submission_status", "STRING"),
+    ("extracted_order_reference", "STRING"),
+    ("order_reference_source", "STRING"),
+    ("shipment_selection_mode", "STRING"),
+    ("order_processing_blocked", "BOOL"),
+    ("order_resolution_complete", "BOOL"),
 )
 _HISTORY_SCHEMA_ENSURED = False
 
@@ -791,6 +867,11 @@ def prepare_history_row(
         "shipment_order_number": _to_str(row.get("shipment_order_number")),
         "shipment_tracking_number": _to_str(row.get("shipment_tracking_number")),
         "return_tracking_number": _to_str(row.get("return_tracking_number")),
+        "extracted_order_reference": _to_str(row.get("extracted_order_reference")),
+        "order_reference_source": _to_str(row.get("order_reference_source")),
+        "shipment_selection_mode": _to_str(row.get("shipment_selection_mode")),
+        "order_processing_blocked": bool(_to_bool(row.get("order_processing_blocked"))),
+        "order_resolution_complete": bool(_to_bool(row.get("order_resolution_complete"))),
         "notes": _to_str(row.get("notes")),
         "human_intervention_required": bool(
             _to_bool(row.get("human_intervention_required"))
@@ -1932,6 +2013,218 @@ def _is_zendesk_required_field_for_solve_error(error_detail: str) -> bool:
     return "is required when solving a ticket" in lowered
 
 
+def assign_unhandled_tickets_to_group_enabled() -> bool:
+    return _env_bool(
+        ASSIGN_UNHANDLED_TICKETS_TO_GROUP_ENV,
+        DEFAULT_ASSIGN_UNHANDLED_TICKETS_TO_GROUP,
+    )
+
+
+_ESCALATION_GROUP_ID_CACHE: int | None = None
+
+
+def resolve_escalation_group_id(
+    *,
+    auth,
+    base_url: str,
+    session: requests.Session | None = None,
+) -> int | None:
+    """Resolve ZENDESK_ESCALATION_GROUP_NAME to a Zendesk group id, cached.
+
+    Same approach as assign_tickets_to_group.py: an explicit id wins, otherwise
+    the group list is paged through and matched on name, case-insensitively.
+    Returns None (and logs the available group names) when nothing matches, so
+    an unknown group name degrades to "no assignment" instead of an exception.
+    """
+
+    global _ESCALATION_GROUP_ID_CACHE
+
+    if _ESCALATION_GROUP_ID_CACHE is not None:
+        return _ESCALATION_GROUP_ID_CACHE
+
+    configured_id = os.getenv(ZENDESK_ESCALATION_GROUP_ID_ENV, "").strip()
+    if configured_id:
+        try:
+            _ESCALATION_GROUP_ID_CACHE = int(configured_id)
+            return _ESCALATION_GROUP_ID_CACHE
+        except ValueError:
+            print(
+                f"Ignoring non-numeric {ZENDESK_ESCALATION_GROUP_ID_ENV}="
+                f"{configured_id!r}; resolving the group by name instead."
+            )
+
+    wanted = ZENDESK_ESCALATION_GROUP_NAME.strip().casefold()
+    if not wanted:
+        return None
+
+    url = f"{base_url}/groups.json?page[size]=100"
+    names: list[str] = []
+
+    while url:
+        try:
+            payload = zendesk_get(url, auth=auth, session=session, timeout=60).json() or {}
+        except Exception as exc:  # noqa: BLE001 - never abort the run over this
+            print(f"Could not list Zendesk groups: {exc}")
+            return None
+
+        for group in payload.get("groups") or []:
+            name = str(group.get("name") or "").strip()
+            names.append(name)
+            if name.casefold() == wanted:
+                print(f"Zendesk escalation group {name!r} -> id {group['id']}")
+                _ESCALATION_GROUP_ID_CACHE = int(group["id"])
+                return _ESCALATION_GROUP_ID_CACHE
+
+        meta = payload.get("meta") or {}
+        links = payload.get("links") or {}
+        next_url = links.get("next") if _zendesk_meta_has_more(meta) else payload.get("next_page")
+        url = _absolute_zendesk_url(base_url, next_url) if next_url else None
+
+    print(
+        f"Zendesk group {ZENDESK_ESCALATION_GROUP_NAME!r} not found. "
+        "Available groups: " + ", ".join(sorted(name for name in names if name))
+    )
+    return None
+
+
+def assign_ticket_to_group(
+    ticket_id: int,
+    group_id: int,
+    *,
+    auth,
+    base_url: str,
+    session: requests.Session | None = None,
+) -> bool:
+    """Move one ticket to a group, leaving its status untouched.
+
+    Mirrors assign_tickets_to_group.py: the group is set and (by default) the
+    individual assignee is cleared so the ticket sits with the group unclaimed.
+    The status is deliberately not changed -- these are exactly the tickets the
+    workflow did not resolve, so they must stay actionable for a human. Already
+    closed/archived tickets are skipped.
+    """
+
+    try:
+        current = zendesk_get(
+            f"{base_url}/tickets/{ticket_id}.json",
+            auth=auth,
+            session=session,
+            timeout=60,
+        ).json() or {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not read Zendesk ticket {ticket_id} before assignment: {exc}")
+        return False
+
+    ticket = current.get("ticket") or {}
+    if not ticket:
+        print(f"Zendesk ticket {ticket_id} not found; skipped group assignment.")
+        return False
+
+    if str(ticket.get("status") or "").strip().lower() in {"closed", "archived"}:
+        print(f"Zendesk ticket {ticket_id} is closed; skipped group assignment.")
+        return False
+
+    if _to_int(ticket.get("group_id")) == int(group_id):
+        # Already with the group; nothing to do, and re-sending would only add
+        # a pointless audit event.
+        return True
+
+    fields: dict[str, Any] = {"group_id": int(group_id)}
+    if _env_bool(ZENDESK_ESCALATION_CLEAR_ASSIGNEE_ENV, True):
+        fields["assignee_id"] = None
+
+    response = zendesk_request(
+        "PUT",
+        f"{base_url}/tickets/{ticket_id}.json",
+        auth=auth,
+        session=session,
+        json={"ticket": fields},
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+
+    if not response.ok:
+        print(
+            f"Failed to assign Zendesk ticket {ticket_id} to group {group_id}: "
+            f"{_zendesk_error_detail(response)}"
+        )
+        return False
+
+    return True
+
+
+def assign_unhandled_tickets_to_escalation_group(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    auth,
+    base_url: str,
+    outcomes: dict[str, str] | None = None,
+) -> int:
+    """Assign every unresolved ticket to the second-level logistics group."""
+
+    rows = list(rows)
+    if not rows:
+        return 0
+
+    if not assign_unhandled_tickets_to_group_enabled():
+        print(
+            f"{ASSIGN_UNHANDLED_TICKETS_TO_GROUP_ENV}=false; skipped "
+            f"{len(rows)} unresolved ticket(s) that would have been assigned to "
+            f"{ZENDESK_ESCALATION_GROUP_NAME!r}."
+        )
+        return 0
+
+    assigned = 0
+
+    with requests.Session() as session:
+        group_id = resolve_escalation_group_id(
+            auth=auth,
+            base_url=base_url,
+            session=session,
+        )
+        if group_id is None:
+            print(
+                "No Zendesk escalation group id available; "
+                f"{len(rows)} unresolved ticket(s) were left untouched."
+            )
+            return 0
+
+        seen_ticket_ids: set[int] = set()
+
+        for row in rows:
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is None:
+                continue
+
+            if ticket_id in seen_ticket_ids:
+                # Several requests can belong to the same ticket.
+                if outcomes is not None:
+                    outcomes[_outcome_key(row)] = SUBMISSION_STATUS_ASSIGNED_TO_GROUP
+                continue
+            seen_ticket_ids.add(ticket_id)
+
+            try:
+                if assign_ticket_to_group(
+                    ticket_id,
+                    group_id,
+                    auth=auth,
+                    base_url=base_url,
+                    session=session,
+                ):
+                    assigned += 1
+                    if outcomes is not None:
+                        outcomes[_outcome_key(row)] = SUBMISSION_STATUS_ASSIGNED_TO_GROUP
+            except Exception as exc:  # noqa: BLE001 - one bad ticket must not
+                # stop the rest of the batch.
+                print(f"Failed to assign Zendesk ticket {ticket_id} to a group: {exc}")
+
+    print(
+        f"Assigned {assigned} unresolved ticket(s) to Zendesk group "
+        f"{ZENDESK_ESCALATION_GROUP_NAME!r}."
+    )
+    return assigned
+
+
 def _outcome_key(row: Mapping[str, Any]) -> str:
     return _to_str(row.get("request_id")) or build_request_id(
         _to_int(row.get("zendesk_ticket_id")),
@@ -1962,8 +2255,23 @@ def submit_final_responses(
 
     response_rows = []
     solve_without_response_rows = []
+    # Rows the workflow takes no Zendesk action on at all. They are handed to
+    # the second-level logistics group at the end of this function.
+    unhandled_rows: list[Mapping[str, Any]] = []
+    blocked_rows: list[Mapping[str, Any]] = []
+
     for row in raw_rows:
         requester_email = row.get("requester_email")
+
+        # RC-US / RC-EU / LN-EU / LN-US orders are never processed: no reply,
+        # no solve, and no group re-assignment either. The ticket is left
+        # exactly as it is. Checked before every other rule.
+        if _to_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
+            row.get("shipment_order_number"),
+            row.get("extracted_order_reference"),
+        ):
+            blocked_rows.append(row)
+            continue
 
         # Request number 1 from a noreply*/autoreply* sender: solved with no
         # public comment and no analysis. Must be checked before the general
@@ -2022,8 +2330,12 @@ def submit_final_responses(
             continue
 
         if is_noreply_requester_email(requester_email):
+            # No public reply is ever sent to an automated mailbox, and the
+            # ticket is not solved either: hand it to the logistics group.
+            unhandled_rows.append(row)
             continue
         if bool(_to_bool(row.get("human_intervention_required"))):
+            unhandled_rows.append(row)
             continue
         request_text = "\n".join(
             str(row.get(column) or "")
@@ -2038,6 +2350,9 @@ def submit_final_responses(
             continue
         final_response = strip_links_from_public_response(row.get("final_response"))
         if _response_is_blank(final_response):
+            # Nothing was found to answer with and nothing will be posted:
+            # hand the ticket to the logistics group.
+            unhandled_rows.append(row)
             continue
         ticket_id = _to_int(row.get("zendesk_ticket_id"))
         if ticket_id is None:
@@ -2047,12 +2362,33 @@ def submit_final_responses(
             )
         response_rows.append((ticket_id, str(final_response).strip(), row))
 
-    if not response_rows and not solve_without_response_rows:
-        print("No Zendesk final responses to submit.")
-        return 0
-
     if outcomes is None:
         outcomes = {}
+
+    for row in blocked_rows:
+        outcomes[_outcome_key(row)] = SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX
+
+    if blocked_rows:
+        print(
+            f"Left {len(blocked_rows)} request(s) untouched: the order prefix is "
+            f"one of {', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}."
+        )
+
+    if not response_rows and not solve_without_response_rows:
+        print("No Zendesk final responses to submit.")
+        if unhandled_rows and zendesk_response_submission_enabled():
+            assign_unhandled_tickets_to_escalation_group(
+                unhandled_rows,
+                auth=zendesk_auth(),
+                base_url=zendesk_base_url(),
+                outcomes=outcomes,
+            )
+        elif unhandled_rows:
+            print(
+                f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped group assignment "
+                f"for {len(unhandled_rows)} unresolved ticket(s)."
+            )
+        return 0
 
     if not zendesk_response_submission_enabled():
         for _ticket_id, row in solve_without_response_rows:
@@ -2061,9 +2397,10 @@ def submit_final_responses(
             outcomes[_outcome_key(row)] = SUBMISSION_STATUS_DRY_RUN
         print(
             f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
-            f"{len(response_rows)} Zendesk response(s) and "
+            f"{len(response_rows)} Zendesk response(s), "
             f"{len(solve_without_response_rows)} solve-without-response ticket(s) "
-            "(noreply/autoreply first request / FedEx noreply / informative)."
+            "(noreply/autoreply first request / FedEx noreply / informative), and "
+            f"group assignment for {len(unhandled_rows)} unresolved ticket(s)."
         )
         return 0
 
@@ -2148,6 +2485,23 @@ def submit_final_responses(
             failed.append((ticket_id, str(exc)))
 
     print(f"Submitted {submitted} Zendesk final response(s).")
+
+    # Tickets whose submission failed also end up with no action applied, so
+    # they are escalated alongside the rows that never produced a response.
+    failed_ticket_ids = {ticket_id for ticket_id, _ in failed}
+    for _ticket_id, row in solve_without_response_rows:
+        if _to_int(row.get("zendesk_ticket_id")) in failed_ticket_ids:
+            unhandled_rows.append(row)
+    for _ticket_id, _body, row in response_rows:
+        if _to_int(row.get("zendesk_ticket_id")) in failed_ticket_ids:
+            unhandled_rows.append(row)
+
+    assign_unhandled_tickets_to_escalation_group(
+        unhandled_rows,
+        auth=auth,
+        base_url=base_url,
+        outcomes=outcomes,
+    )
 
     if failed:
         failed_ids = ", ".join(str(ticket_id) for ticket_id, _ in failed)
@@ -2818,7 +3172,27 @@ def fetch_ticket_rows(
     user_email_cache: dict[int, str] = {}
     skipped_non_carrier = 0
     skipped_unexpected_status = 0
+    skipped_escalation_group = 0
     comment_error_count = 0
+
+    # Tickets already assigned to the escalation group are waiting on a human,
+    # so the agent must not touch them again -- and must not log them either.
+    escalation_group_id: int | None = None
+    if _env_bool(
+        SKIP_TICKETS_IN_ESCALATION_GROUP_ENV,
+        DEFAULT_SKIP_TICKETS_IN_ESCALATION_GROUP,
+    ):
+        escalation_group_id = resolve_escalation_group_id(auth=auth, base_url=base_url)
+        if escalation_group_id is None:
+            print(
+                "Could not resolve the escalation group id; tickets already "
+                "assigned to it cannot be filtered out this run."
+            )
+        else:
+            print(
+                f"Tickets already in group {ZENDESK_ESCALATION_GROUP_NAME!r} "
+                f"(id {escalation_group_id}) will be skipped entirely."
+            )
 
     query_specs = _zendesk_fetch_query_specs(email_to_category)
 
@@ -2864,6 +3238,16 @@ def fetch_ticket_rows(
                     ticket_status = str(ticket.get("status") or "").strip().lower()
                     if ticket_status not in ACTIVE_ZENDESK_STATUSES:
                         skipped_unexpected_status += 1
+                        continue
+
+                    # Already handed to the second-level logistics group on an
+                    # earlier run: skip before any further work, so the request
+                    # is never analyzed and never reaches the history table.
+                    if (
+                        escalation_group_id is not None
+                        and _to_int(ticket.get("group_id")) == escalation_group_id
+                    ):
+                        skipped_escalation_group += 1
                         continue
 
                     candidate_tickets.append(ticket)
@@ -3034,6 +3418,17 @@ def fetch_ticket_rows(
                                 f"{description}\n{request_body}",
                                 carrier,
                             )
+                            # Fallback identifier used when the tracking number
+                            # is missing or unknown to
+                            # bi.shipping_platform_shipments. Collected here
+                            # because the ticket description is available only
+                            # at fetch time; PDF attachments are scanned later,
+                            # and only for the rows that still need an order.
+                            order_references = find_order_references(
+                                subject,
+                                description,
+                                request_body,
+                            )
 
                             rows.append(
                                 {
@@ -3053,6 +3448,9 @@ def fetch_ticket_rows(
                                     "request_number": request["request_number"],
                                     "ticket_category": ticket_category,
                                     "extracted_tracking_number": tracking_number,
+                                    "extracted_order_reference": ";".join(
+                                        order_references
+                                    ),
                                 }
                             )
 
@@ -3062,13 +3460,31 @@ def fetch_ticket_rows(
     print(
         f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
         f"skipped {skipped_non_carrier} non-carrier ticket(s), "
-        f"{skipped_unexpected_status} ticket(s) with unexpected statuses, and "
+        f"{skipped_unexpected_status} ticket(s) with unexpected statuses, "
+        f"{skipped_escalation_group} ticket(s) already assigned to "
+        f"{ZENDESK_ESCALATION_GROUP_NAME!r}, and "
         f"{comment_error_count} ticket(s) with comment-fetch errors."
     )
     return rows
 
 
-def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataFrame:
+def enrich_with_shipment_numbers(
+    df: pd.DataFrame,
+    client,
+    bigquery,
+    *,
+    auth=None,
+    base_url: str | None = None,
+) -> pd.DataFrame:
+    """Resolve each request to a shipment/order.
+
+    The tracking number is tried first against
+    bi.shipping_platform_shipments.  Rows it cannot resolve then go through
+    apply_order_reference_fallback(), which looks for an order reference in the
+    subject/description and, failing that, inside the ticket's PDF attachments.
+    ``auth``/``base_url`` are required only for that PDF step.
+    """
+
     tracking_numbers = []
 
     for value in df["extracted_tracking_number"].dropna():
@@ -3202,6 +3618,293 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
             for tracking in re.split(r"[;,]", str(value or ""))
         )
     )
+
+    df = apply_order_reference_fallback(df, auth=auth, base_url=base_url)
+
+    return df
+
+
+# ============================================================================
+# ORDER-REFERENCE FALLBACK
+# ============================================================================
+
+
+def ticket_pdf_attachments(
+    ticket_id: int,
+    *,
+    auth,
+    base_url: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Return every PDF attached to any comment of the ticket, de-duplicated."""
+
+    attachments: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    url = f"{base_url}/tickets/{ticket_id}/comments.json?page[size]=100"
+
+    while url:
+        payload = zendesk_get(url, auth=auth, session=session, timeout=60).json() or {}
+        for comment in payload.get("comments") or []:
+            for attachment in comment.get("attachments") or []:
+                attachment_id = attachment.get("id")
+                if is_pdf_attachment(attachment) and attachment_id not in seen:
+                    seen.add(attachment_id)
+                    attachments.append(attachment)
+        meta = payload.get("meta") or {}
+        links = payload.get("links") or {}
+        next_url = links.get("next") if _zendesk_meta_has_more(meta) else payload.get("next_page")
+        url = _absolute_zendesk_url(base_url, next_url) if next_url else None
+
+    return attachments
+
+
+def download_zendesk_attachment(
+    attachment: Mapping[str, Any],
+    *,
+    auth,
+    session: requests.Session | None = None,
+) -> bytes:
+    """Fetch an attachment. Content URLs are usually public; fall back to auth."""
+
+    content_url = attachment.get("content_url")
+    if not content_url:
+        raise RuntimeError("attachment has no content_url")
+
+    requester = session or requests
+    response = requester.get(content_url, timeout=120)
+    if response.status_code in (401, 403):
+        response = requester.get(content_url, auth=auth, timeout=120)
+    if not response.ok:
+        raise RuntimeError(
+            f"{response.status_code} downloading {attachment.get('file_name')}"
+        )
+    return response.content
+
+
+def order_references_from_ticket_pdfs(
+    ticket_id: int,
+    *,
+    auth,
+    base_url: str,
+    session: requests.Session | None = None,
+) -> list[str]:
+    """Open the ticket's PDF attachments and look for an order reference.
+
+    Mirrors ticket_order_numbers.py: embedded text layer first, local Tesseract
+    OCR as a fallback for scanned invoices.  Any failure (download, unreadable
+    PDF, OCR not installed) is reported and treated as "no reference found" so
+    one bad attachment can never abort the run.
+    """
+
+    try:
+        attachments = ticket_pdf_attachments(
+            ticket_id,
+            auth=auth,
+            base_url=base_url,
+            session=session,
+        )
+    except Exception as exc:  # noqa: BLE001 - never abort the fetch over one ticket
+        print(f"  Could not list attachments for ticket {ticket_id}: {exc}")
+        return []
+
+    if not attachments:
+        return []
+
+    blobs: list[tuple[str, bytes]] = []
+    for attachment in attachments:
+        file_name = str(attachment.get("file_name") or "attachment.pdf")
+        try:
+            blobs.append(
+                (
+                    file_name,
+                    download_zendesk_attachment(attachment, auth=auth, session=session),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"      download failed for {file_name}: {exc}")
+
+    if not blobs:
+        return []
+
+    return find_order_references_in_pdfs(blobs)
+
+
+def apply_order_reference_fallback(
+    df: pd.DataFrame,
+    *,
+    auth=None,
+    base_url: str | None = None,
+) -> pd.DataFrame:
+    """Resolve an order for rows the tracking-number lookup could not resolve.
+
+    Order of resolution, per the workflow specification:
+
+    1. tracking number -> bi.shipping_platform_shipments (already done);
+    2. order reference in the subject / description / request body;
+    3. order reference inside a PDF attached to the ticket.
+
+    The resolved reference is written into ``shipment_order_number`` so the
+    existing GET_FULL_ORDER URL builder keeps working unchanged (it already
+    turns both ``XX-YYA123...`` and ``XX-YY-123...`` into the order URL).
+    ``shipment_selection_mode`` then tells response_data_extractor.py which
+    shipment block(s) of the GET_FULL_ORDER payload to read.
+    """
+
+    df = df.copy()
+
+    if "extracted_order_reference" not in df.columns:
+        df["extracted_order_reference"] = ""
+
+    session = requests.Session() if (auth and base_url) else None
+    pdf_reference_cache: dict[int, list[str]] = {}
+
+    resolved_orders: list[Any] = []
+    references_out: list[str] = []
+    sources: list[str] = []
+    modes: list[str] = []
+    blocked_flags: list[bool] = []
+    complete_flags: list[bool] = []
+
+    resolved_from_text = 0
+    resolved_from_pdf = 0
+    unresolved = 0
+
+    try:
+        for _, row in df.iterrows():
+            # NOTE: read through _to_str(). A missing value in a pandas column
+            # is NaN, not None, and str(NaN) is the *truthy* string "nan" --
+            # which would make every unresolved row look already resolved.
+            existing_order = (_to_str(row.get("shipment_order_number")) or "").strip()
+            tracking_value = (_to_str(row.get("extracted_tracking_number")) or "").strip()
+            has_tracking = bool(
+                tracking_value and tracking_value.upper() != "N/A"
+            )
+
+            references = split_order_references(row.get("extracted_order_reference"))
+            source = ""
+            mode = SHIPMENT_SELECTION_EXACT
+            # True when every shipment the ticket talks about is covered by a
+            # resolved order. False means at least one tracking number is still
+            # unaccounted for, which must keep the request in human review.
+            resolution_complete = True
+            tracking_not_found = bool(
+                _to_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
+            )
+
+            if existing_order:
+                # The tracking number resolved to a shipment in
+                # bi.shipping_platform_shipments: unchanged historic behavior.
+                source = ORDER_REFERENCE_SOURCE_TRACKING
+                resolved_order = existing_order
+
+                if tracking_not_found:
+                    # Partial resolution: the ticket carries several tracking
+                    # numbers and only some are in the shipments table. Merge
+                    # in any order reference from the ticket text so the
+                    # unresolved shipment is not silently dropped from the
+                    # reply. Without a reference the request stays incomplete
+                    # and is routed to human review as before.
+                    merged = [
+                        reference
+                        for reference in references
+                        if reference.upper()
+                        not in {
+                            part.strip().upper()
+                            for part in existing_order.split(";")
+                            if part.strip()
+                        }
+                    ]
+                    if merged:
+                        resolved_order = ";".join([existing_order, *merged])
+                        source = f"{ORDER_REFERENCE_SOURCE_TRACKING}+{ORDER_REFERENCE_SOURCE_TEXT}"
+                        mode = SHIPMENT_SELECTION_BY_TRACKING
+                        resolved_from_text += 1
+                    else:
+                        resolution_complete = False
+            else:
+                if references:
+                    source = ORDER_REFERENCE_SOURCE_TEXT
+
+                if not references and session is not None:
+                    ticket_id = _to_int(row.get("zendesk_ticket_id"))
+                    if ticket_id is not None:
+                        if ticket_id not in pdf_reference_cache:
+                            print(
+                                f"  No tracking/order reference in ticket {ticket_id}; "
+                                "scanning PDF attachments."
+                            )
+                            pdf_reference_cache[ticket_id] = order_references_from_ticket_pdfs(
+                                ticket_id,
+                                auth=auth,
+                                base_url=base_url,
+                                session=session,
+                            )
+                        references = list(pdf_reference_cache[ticket_id])
+                        if references:
+                            source = ORDER_REFERENCE_SOURCE_PDF
+
+                resolved_order = ";".join(references)
+
+                if references:
+                    # The shape of the reference decides what is read:
+                    #
+                    # * shipment number (a letter after the prefix, e.g.
+                    #   DG-EUA01663254) identifies one specific shipment, so
+                    #   only that shipment block is read;
+                    # * order number (a dash after the prefix, e.g.
+                    #   DG-EU-01663254) covers the whole order, so every
+                    #   shipment block is read -- narrowed to the block
+                    #   carrying the ticket's tracking number when the ticket
+                    #   had one that the shipments table did not know.
+                    #
+                    # A mixed list keeps the row-level mode here; the extractor
+                    # then narrows each shipment-shaped reference on its own.
+                    if all(
+                        is_shipment_shaped_order_reference(reference)
+                        for reference in references
+                    ):
+                        mode = SHIPMENT_SELECTION_EXACT
+                    elif has_tracking:
+                        mode = SHIPMENT_SELECTION_BY_TRACKING
+                    else:
+                        mode = SHIPMENT_SELECTION_ALL
+                    if source == ORDER_REFERENCE_SOURCE_PDF:
+                        resolved_from_pdf += 1
+                    else:
+                        resolved_from_text += 1
+                else:
+                    unresolved += 1
+                    resolution_complete = False
+
+            blocked = contains_blocked_order_reference(resolved_order, *references)
+
+            resolved_orders.append(resolved_order or None)
+            references_out.append(";".join(references))
+            sources.append(source)
+            modes.append(mode)
+            blocked_flags.append(blocked)
+            complete_flags.append(resolution_complete)
+    finally:
+        if session is not None:
+            session.close()
+
+    df["shipment_order_number"] = resolved_orders
+    df["extracted_order_reference"] = references_out
+    df["order_reference_source"] = sources
+    df["shipment_selection_mode"] = modes
+    df["order_processing_blocked"] = blocked_flags
+    df["order_resolution_complete"] = complete_flags
+
+    blocked_count = sum(1 for flag in blocked_flags if flag)
+    print(
+        "Order-reference fallback: "
+        f"{resolved_from_text} resolved from subject/description, "
+        f"{resolved_from_pdf} resolved from PDF attachments, "
+        f"{unresolved} still without an order. "
+        f"{blocked_count} request(s) are on a blocked prefix "
+        f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}) and will be left untouched."
+    )
+
     return df
 
 
@@ -3268,7 +3971,13 @@ def fetch_tickets_to_active_table() -> int:
         )
         return 0
 
-    df = enrich_with_shipment_numbers(df, client, bigquery)
+    df = enrich_with_shipment_numbers(
+        df,
+        client,
+        bigquery,
+        auth=zendesk_auth(),
+        base_url=zendesk_base_url(),
+    )
 
     print(f"Replacing active ticket table with {len(df)} new requests...")
     replace_active_tickets(df, client, bigquery)
