@@ -33,7 +33,9 @@ from pipeline_io import (
     UNMATCHED_TICKETS_PATH,
     write_dataframe,
 )
+from order_reference_resolver import contains_blocked_order_reference
 from customs_rules import (
+    BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
@@ -199,7 +201,12 @@ class RegexEngine:
             return_tracking_number,
             shipment_carrier_code,
             return_carrier_code,
-            tracking_not_found_in_shipping_platform_shipments
+            tracking_not_found_in_shipping_platform_shipments,
+            extracted_order_reference,
+            order_reference_source,
+            shipment_selection_mode,
+            order_processing_blocked,
+            order_resolution_complete
         FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
         """
 
@@ -230,6 +237,10 @@ class RegexEngine:
                 extracted_tracking_number=ticket.get("extracted_tracking_number"),
                 shipment_tracking_number=ticket.get("shipment_tracking_number"),
                 return_tracking_number=ticket.get("return_tracking_number"),
+                shipment_order_number=ticket.get("shipment_order_number"),
+                order_reference_source=ticket.get("order_reference_source"),
+                order_processing_blocked=ticket.get("order_processing_blocked"),
+                order_resolution_complete=ticket.get("order_resolution_complete"),
             )
 
             output_row = {
@@ -252,6 +263,11 @@ class RegexEngine:
                 "tracking_not_found_in_shipping_platform_shipments": ticket.get(
                     "tracking_not_found_in_shipping_platform_shipments"
                 ),
+                "extracted_order_reference": ticket.get("extracted_order_reference"),
+                "order_reference_source": ticket.get("order_reference_source"),
+                "shipment_selection_mode": ticket.get("shipment_selection_mode"),
+                "order_processing_blocked": ticket.get("order_processing_blocked"),
+                "order_resolution_complete": ticket.get("order_resolution_complete"),
                 **result,
             }
 
@@ -357,6 +373,10 @@ class RegexEngine:
         extracted_tracking_number: object = "",
         shipment_tracking_number: object = "",
         return_tracking_number: object = "",
+        shipment_order_number: object = "",
+        order_reference_source: object = "",
+        order_processing_blocked: object = False,
+        order_resolution_complete: object = True,
     ):
         text_details = clean_latest_request_text(request_text)
         cleaned_text = str(text_details["cleaned_request_text"] or "")
@@ -367,6 +387,50 @@ class RegexEngine:
         tracking_not_found = str(
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
+
+        # An order resolved from an order reference (ticket text or PDF
+        # attachment) is just as usable as one resolved from the tracking
+        # number, so the tracking-number guards below must stand down for it.
+        # order_resolution_complete is what makes this safe on tickets with
+        # several tracking numbers: when only some of them resolved and no
+        # reference covers the rest, the request stays in human review rather
+        # than being answered with partial data.
+        order_resolved = bool(str(shipment_order_number or "").strip()) and str(
+            order_resolution_complete
+        ).strip().lower() not in {"false", "0", "no", "n"}
+
+        blocked_order = str(order_processing_blocked or "").strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "y",
+        } or contains_blocked_order_reference(shipment_order_number)
+
+        if blocked_order:
+            # RC-US / RC-EU / LN-EU / LN-US: do not process the request at
+            # all. The ticket is left exactly as it is. Checked before every
+            # other rule, including the noreply/autoreply solve.
+            return self._as_output(
+                matched=True,
+                excluded=True,
+                request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "The order number is on a blocked prefix "
+                    "(RC-US, RC-EU, LN-EU or LN-US). The request is not "
+                    "processed and the ticket is left untouched."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=False,
+                human_intervention_required=False,
+                regex_request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                regex_requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         if is_noreply_autoreply_first_request(requester_email, request_number):
             # Policy: every request number 1 from a sender whose address
@@ -485,7 +549,7 @@ class RegexEngine:
                 signature_removed=signature_removed,
             )
 
-        if is_missing_extracted_tracking_number(extracted_tracking_number):
+        if is_missing_extracted_tracking_number(extracted_tracking_number) and not order_resolved:
             return self._as_output(
                 matched=True,
                 excluded=False,
@@ -507,7 +571,7 @@ class RegexEngine:
                 signature_removed=signature_removed,
             )
 
-        if tracking_not_found:
+        if tracking_not_found and not order_resolved:
             return self._as_output(
                 matched=False,
                 excluded=False,
