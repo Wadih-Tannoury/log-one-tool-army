@@ -371,14 +371,44 @@ def is_blocked_order_reference(value: object) -> bool:
     return order_reference_prefix(value) in BLOCKED_ORDER_REFERENCE_PREFIX_SET
 
 
+def is_missing_value(value: object) -> bool:
+    """True for None and for a float NaN, without importing pandas here.
+
+    A NULL BigQuery column arrives as a float NaN once pandas has read it, and
+    NaN is *truthy*: ``str(nan)`` is ``"nan"``. Anything that stringifies a
+    column value has to rule that out first or the string "nan" leaks through
+    and is treated as real data.
+    """
+
+    if value is None:
+        return True
+    return value != value  # only NaN is unequal to itself
+
+
 def split_order_references(value: object) -> list[str]:
-    """Split a stored ``a;b`` order-reference column into single references."""
+    """Split a stored ``a;b`` order-reference column into single references.
+
+    Every token is validated against the known-prefix pattern, so only strings
+    that really are order references survive. This is what keeps a NULL column
+    (NaN -> "nan" -> "NAN") or any other junk from becoming a phantom order:
+    an unresolvable row has to come out of here *empty*, because that is what
+    routes it to human review instead of to a confidently wrong answer.
+    """
+
+    if is_missing_value(value):
+        return []
 
     references: list[str] = []
-    for part in re.split(r"[;,]", str(value or "")):
+    for part in re.split(r"[;,]", str(value)):
         normalized = normalize_order_reference(part)
-        if normalized and normalized.upper() != "N/A" and normalized not in references:
-            references.append(normalized)
+        if not normalized or normalized.upper() == "N/A":
+            continue
+        # find_order_references() enforces prefix + marker + tail and returns
+        # the canonical form, so the stored-column path and the ticket-text
+        # path can never disagree about what counts as a reference.
+        for reference in find_order_references(normalized):
+            if reference not in references:
+                references.append(reference)
     return references
 
 
