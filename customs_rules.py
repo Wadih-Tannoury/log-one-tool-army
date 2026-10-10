@@ -25,6 +25,10 @@ HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
 PURELY_INFORMATIVE_SOLVED = "purely_informative_solved"
 NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED = "noreply_autoreply_first_request_solved"
+# Orders on a blocked prefix (RC-US / RC-EU / LN-EU / LN-US) are never
+# processed: the ticket is left exactly as it is, with no reply, no solve and
+# no group re-assignment.
+BLOCKED_ORDER_PREFIX_SKIPPED = "blocked_order_prefix_skipped"
 NOREPLY_AUTOREPLY_PREFIXES = ("noreply", "autoreply")
 DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE = "dichiarazione_di_libera_esportazione"
 LIBERA_ESPORTAZIONE_REQUEST_TYPES = {
