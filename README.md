@@ -269,6 +269,168 @@ Additional response guardrails:
 - DHL `DATA / FROM / OGGETTO` current-message headers are preserved during cleaning so actionable Italian requests such as missing return invoice or HAWB/AWB export requests are not discarded as quoted history.
 - The sender's own closing corporate signature block (name/title followed by labeled contact lines such as `Work Email:`, `Phone Number:`, `CER Team Email:`, `UPS Customer Support Numbers:`) is stripped from the cleaned request text via `customs_rules.strip_contact_signature_block()` before regex/LLM matching. Without this, a short acknowledgement like "Thank you, this invoice has been uploaded." followed by that block could be misread as the customer requesting our `customer_phone`/`customer_email`.
 
+## Resolving the order when the tracking number is not usable
+
+`order_reference_resolver.py` holds the shared order-reference rules. The
+pipeline resolves every request to a GET_FULL_ORDER order in this order, and
+stops at the first step that succeeds:
+
+1. **Tracking number -> `bi.shipping_platform_shipments`.** Unchanged historic
+   behavior, in `ticket_fetcher.enrich_with_shipment_numbers()`.
+2. **Order reference in the ticket subject, description or request body.**
+   Collected at fetch time into the new `extracted_order_reference` column.
+3. **Order reference inside a PDF attached to the ticket.** Only for requests
+   steps 1 and 2 could not resolve. The PDF is read through its embedded text
+   layer, falling back to local Tesseract OCR for scanned invoices, exactly as
+   in the standalone `ticket_order_numbers.py` script.
+
+An order reference always begins with one of the 113 five-character prefixes in
+`ORDER_REFERENCE_PREFIXES` (`AL-EU`, `DG-US`, `CVXEU`, ...). The character
+immediately after the prefix decides what it is:
+
+| Next character | Meaning | Example | GET_FULL_ORDER order number |
+| --- | --- | --- | --- |
+| a letter | shipment number | `DG-EUA01663254` | `DG-EU-01663254` |
+| `-` | order number | `DG-EU-01663254` | `DG-EU-01663254` |
+
+A shipment-shaped reference therefore has the letter replaced by `-` before the
+lookup. That is the same rule as the existing
+`response_data_extractor._replace_sixth_character_with_dash()`, so a resolved
+reference is written straight into `shipment_order_number` and the existing URL
+builder handles both shapes unchanged. `CVXEU`-style prefixes without an
+internal dash are now recognized by that helper too.
+
+### Which shipment blocks are read
+
+**The shape of the reference decides what is read.** A shipment number names
+one specific shipment, so only that shipment block is read. An order number
+covers the whole order, so every shipment block is read.
+
+`shipment_selection_mode` records that decision and tells
+`response_data_extractor.extract_shipment_order_data()` which shipment block(s)
+of the GET_FULL_ORDER payload to read:
+
+- `exact` — the order came from the tracking number, **or** from a
+  shipment-shaped reference such as `DG-EUA01663254`. Only the matching
+  shipment block is read.
+- `all` — an order-shaped reference such as `DG-EU-01663254` with no usable
+  tracking number: the data is taken from **every** shipment of the order.
+- `by_tracking` — an order-shaped reference where the ticket did carry a
+  tracking number that `bi.shipping_platform_shipments` did not know. The
+  shipment block whose shipping label **or** return label carries that tracking
+  number is used; when no block matches, every shipment is read.
+
+| Reference found | Tracking in the ticket | Shipments read |
+| --- | --- | --- |
+| `DG-EUA01663254` (shipment) | any | that shipment only |
+| `DG-EU-01663254` (order) | none / not usable | every shipment |
+| `DG-EU-01663254` (order) | present but unknown to the shipments table | the block carrying it, else every shipment |
+
+When a ticket carries several references of mixed shape, the row keeps the
+order-level mode and the extractor narrows each shipment-shaped reference to its
+own block individually.
+
+When several shipments are read, invoice/RPI links are semicolon-joined (the
+downloader already splits on `;`, so every shipment's document is attached) and
+the returned-items block is newline-joined. Order-level values (customer,
+shipping address, country, shipped date) keep the first non-blank value, so
+`full_order_country_code` stays usable for the per-brand "Country `<BRAND>`"
+ticket field.
+
+### Blocked order prefixes
+
+Orders starting with `RC-US`, `RC-EU`, `LN-EU` or `LN-US` are never processed.
+The ticket is left **exactly** as it is: no public reply, no solve, and no group
+re-assignment either. The flag is computed once into `order_processing_blocked`
+and honored at every stage — `regex_engine.detect()` returns an excluded row
+before any other rule, `intent_detection` skips the LLM, the extractor makes no
+GET_FULL_ORDER call even with `--fetch-all`, `final_response` is empty, and
+`submit_final_responses()` performs no ticket update. These rows are logged with
+`zendesk_submission_status = blocked_order_prefix`.
+
+### Tickets already in `LOG II lvl` are skipped entirely
+
+A ticket already assigned to the escalation group was handed to a human on an
+earlier run, so the agent must not touch it again. `fetch_ticket_rows()`
+resolves the group id once per run and drops those tickets immediately after the
+status filter, before requester lookup, comment fetching and analysis. They
+never reach the active-ticket table, so **no history row is written for them at
+all** — they are invisible to the run rather than logged with a skip status. The
+per-run log line reports how many were dropped this way.
+
+Set `SKIP_TICKETS_IN_ESCALATION_GROUP=false` to disable the filter. When the
+group name cannot be resolved the filter is reported as unavailable and the run
+continues without it.
+
+### Unresolved tickets go to `LOG II lvl`
+
+Any ticket the workflow neither answers nor solves — no data found, human
+intervention required, `noreply*` sender, blank `final_response`, or a failed
+submission — is assigned to the second-level logistics group, following the same
+approach as the standalone `assign_tickets_to_group.py` script: the group is
+set, the individual assignee is cleared, and the **status is deliberately left
+untouched** so the ticket stays actionable for a human. Blocked-prefix tickets
+are the one exception and are never re-assigned. These rows are logged with
+`zendesk_submission_status = assigned_to_group`.
+
+Group assignment respects `SUBMIT_ZENDESK_RESPONSES`, so a dry run never
+modifies a ticket. Relevant environment variables:
+
+```text
+ASSIGN_UNHANDLED_TICKETS_TO_GROUP=true   # master switch, default true
+SKIP_TICKETS_IN_ESCALATION_GROUP=true    # drop tickets already in the group
+ZENDESK_ESCALATION_GROUP_NAME=LOG II lvl # resolved to an id via /api/v2/groups
+ZENDESK_ESCALATION_GROUP_ID=             # optional, takes precedence over the name
+ZENDESK_ESCALATION_CLEAR_ASSIGNEE=true   # clear the individual assignee
+ORDER_REFERENCE_PDF_OCR_ENABLED=true     # OCR fallback for scanned PDFs
+ORDER_REFERENCE_PDF_OCR_DPI=300
+TESSERACT_EXE=                           # only when tesseract is not on PATH
+```
+
+Both `assign_unhandled_tickets_to_group` and `escalation_group_name` are also
+exposed as `workflow_dispatch` inputs. The GitHub Actions workflow installs the
+`tesseract-ocr` apt package and `pytesseract`; when either is unavailable the
+PDF step degrades to "no order reference found" rather than failing the run.
+
+### Tickets with several tracking or order numbers
+
+Multi-value handling is preserved end to end. `extract_tracking_number()` still
+returns every tracking number it finds as a `;`-joined string, the shipments
+lookup maps each one, `find_order_references()` returns every reference in the
+ticket, and `enrich_dataframe_with_full_order_data()` still queries
+GET_FULL_ORDER once per `;`-separated order and merges the results, so every
+shipment's invoice/RPI is attached.
+
+Partial resolution is handled explicitly. When a ticket carries several
+tracking numbers and only some of them are in
+`bi.shipping_platform_shipments`, any order reference found in the ticket text
+is **merged into** the orders already resolved from tracking, so the unresolved
+shipment is not silently dropped from the reply. When no reference covers the
+gap, the new `order_resolution_complete` column is set to `False` and the
+request stays in human review exactly as it did before this feature existed —
+it is never answered with partial data. Legacy rows without the column are
+treated as complete.
+
+Note that the blocked-prefix check is deliberately aggressive here: if **any**
+order on a multi-order ticket is on a blocked prefix, the whole ticket is left
+untouched.
+
+### New columns
+
+`extracted_order_reference`, `order_reference_source` (`tracking_lookup` /
+`subject_or_description` / `pdf_attachment`, or `tracking_lookup+subject_or_description`
+when the two were merged), `shipment_selection_mode`, `order_processing_blocked`
+and `order_resolution_complete` are added to the active-ticket table and to the
+history table. The history table is migrated additively at runtime through the
+existing `_ADDITIVE_HISTORY_COLUMNS` mechanism, so no manual DDL is needed.
+
+Because the tracking-number guardrails now stand down whenever an order was
+resolved, a ticket with no tracking number — or with a tracking number unknown
+to `bi.shipping_platform_shipments` — is analyzed and answered normally as long
+as an order reference was found. It is only routed to human intervention when
+nothing at all identifies the order.
+
+
 ## Response data extractor script
 
 All GET_FULL_ORDER API extraction and generated-PDF logic lives in `response_data_extractor.py`. The older split-module design (`full_order_api.py` plus `document_generator.py`) is no longer used.
