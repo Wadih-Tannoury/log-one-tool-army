@@ -22,7 +22,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
@@ -261,6 +261,12 @@ ZENDESK_COMMENT_FETCH_WORKERS_ENV = "ZENDESK_COMMENT_FETCH_WORKERS"
 DEFAULT_ZENDESK_COMMENT_FETCH_WORKERS = 20
 ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
 DEFAULT_ZENDESK_MAX_RETRIES = 5
+ORDER_REFERENCE_PDF_SCAN_WORKERS_ENV = "ORDER_REFERENCE_PDF_SCAN_WORKERS"
+# PDF scanning is download + Tesseract OCR. Both release the GIL (one is a
+# socket wait, the other a subprocess wait), so threads give real parallelism.
+# Kept well below the comment-fetch pool: each worker holds a whole rendered
+# page in memory and Zendesk still rate-limits the attachment listing call.
+DEFAULT_ORDER_REFERENCE_PDF_SCAN_WORKERS = 8
 
 LLM_ENGINE_PREFIXES = ("llm",)
 LLM_ENGINE_NAMES = {
@@ -3687,6 +3693,7 @@ def order_references_from_ticket_pdfs(
     auth,
     base_url: str,
     session: requests.Session | None = None,
+    log: Callable[[str], None] = print,
 ) -> list[str]:
     """Open the ticket's PDF attachments and look for an order reference.
 
@@ -3694,6 +3701,9 @@ def order_references_from_ticket_pdfs(
     OCR as a fallback for scanned invoices.  Any failure (download, unreadable
     PDF, OCR not installed) is reported and treated as "no reference found" so
     one bad attachment can never abort the run.
+
+    ``log`` defaults to ``print``; concurrent callers pass a collector so the
+    lines for one ticket stay together instead of interleaving across threads.
     """
 
     try:
@@ -3704,7 +3714,7 @@ def order_references_from_ticket_pdfs(
             session=session,
         )
     except Exception as exc:  # noqa: BLE001 - never abort the fetch over one ticket
-        print(f"  Could not list attachments for ticket {ticket_id}: {exc}")
+        log(f"  Could not list attachments for ticket {ticket_id}: {exc}")
         return []
 
     if not attachments:
@@ -3721,12 +3731,119 @@ def order_references_from_ticket_pdfs(
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"      download failed for {file_name}: {exc}")
+            log(f"      download failed for {file_name}: {exc}")
 
     if not blobs:
         return []
 
-    return find_order_references_in_pdfs(blobs)
+    return find_order_references_in_pdfs(blobs, log=log)
+
+
+def _order_reference_pdf_scan_workers(ticket_count: int) -> int:
+    if ticket_count <= 0:
+        return 0
+    configured = _env_int(
+        ORDER_REFERENCE_PDF_SCAN_WORKERS_ENV,
+        DEFAULT_ORDER_REFERENCE_PDF_SCAN_WORKERS,
+        minimum=1,
+        maximum=32,
+    )
+    return min(configured, ticket_count)
+
+
+def scan_ticket_pdfs_for_order_references(
+    ticket_id: int,
+    *,
+    auth,
+    base_url: str,
+) -> dict[str, Any]:
+    """Scan one ticket's PDFs; safe for ThreadPoolExecutor workers.
+
+    Each worker owns its requests.Session -- a Session is not thread-safe and
+    must never be shared across workers.  Log lines are collected rather than
+    printed so the caller can replay them in ticket order.
+    """
+
+    messages: list[str] = [
+        f"  No tracking/order reference in ticket {ticket_id}; "
+        "scanning PDF attachments."
+    ]
+    try:
+        with requests.Session() as session:
+            references = order_references_from_ticket_pdfs(
+                ticket_id,
+                auth=auth,
+                base_url=base_url,
+                session=session,
+                log=messages.append,
+            )
+        return {"ticket_id": ticket_id, "references": references, "messages": messages}
+    except Exception as exc:  # noqa: BLE001 - one bad ticket must not stop the rest
+        messages.append(f"      PDF scan failed for ticket {ticket_id}: {exc}")
+        return {"ticket_id": ticket_id, "references": [], "messages": messages}
+
+
+def _prefetch_pdf_order_references(
+    ticket_ids: list[int],
+    *,
+    auth,
+    base_url: str,
+) -> dict[int, list[str]]:
+    """Resolve the PDF order references for many tickets concurrently.
+
+    The per-ticket work (list attachments, download, OCR) is independent, so it
+    parallelizes cleanly.  Results are returned as a cache the sequential
+    row loop then reads, leaving its resolution logic untouched.
+    """
+
+    cache: dict[int, list[str]] = {}
+    if not ticket_ids:
+        return cache
+
+    workers = _order_reference_pdf_scan_workers(len(ticket_ids))
+    print(
+        f"Scanning PDF attachments for {len(ticket_ids)} ticket(s) "
+        f"with {workers} worker(s)."
+    )
+
+    if workers <= 1:
+        results = [
+            scan_ticket_pdfs_for_order_references(
+                ticket_id,
+                auth=auth,
+                base_url=base_url,
+            )
+            for ticket_id in ticket_ids
+        ]
+    else:
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    scan_ticket_pdfs_for_order_references,
+                    ticket_id,
+                    auth=auth,
+                    base_url=base_url,
+                )
+                for ticket_id in ticket_ids
+            ]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+    # Replay in submission order: as_completed yields whichever worker
+    # finished first, which would otherwise scramble the run log.
+    by_ticket = {result["ticket_id"]: result for result in results}
+    for position, ticket_id in enumerate(ticket_ids, start=1):
+        result = by_ticket.get(ticket_id)
+        if result is None:
+            continue
+        for message in result["messages"]:
+            print(message)
+        cache[ticket_id] = result["references"]
+        if position % 25 == 0 or position == len(ticket_ids):
+            print(f"  ...scanned {position}/{len(ticket_ids)} ticket(s).")
+
+    return cache
 
 
 def apply_order_reference_fallback(
@@ -3756,7 +3873,32 @@ def apply_order_reference_fallback(
         df["extracted_order_reference"] = ""
 
     session = requests.Session() if (auth and base_url) else None
+
+    # Resolve every ticket that will need a PDF scan up front, in parallel.
+    # The condition below must stay identical to the one guarding the scan
+    # inside the loop: a row needs a scan when the tracking lookup found no
+    # order AND the ticket text carried no reference. Both are pure functions
+    # of the row, so hoisting the work out of the loop cannot change results.
     pdf_reference_cache: dict[int, list[str]] = {}
+    if session is not None:
+        pending_ticket_ids: list[int] = []
+        seen_ticket_ids: set[int] = set()
+        for _, row in df.iterrows():
+            if (_to_str(row.get("shipment_order_number")) or "").strip():
+                continue
+            if split_order_references(row.get("extracted_order_reference")):
+                continue
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is None or ticket_id in seen_ticket_ids:
+                continue
+            seen_ticket_ids.add(ticket_id)
+            pending_ticket_ids.append(ticket_id)
+
+        pdf_reference_cache = _prefetch_pdf_order_references(
+            pending_ticket_ids,
+            auth=auth,
+            base_url=base_url,
+        )
 
     resolved_orders: list[Any] = []
     references_out: list[str] = []
