@@ -55,6 +55,15 @@ from customs_rules import (
     only_libera_esportazione_requested_data,
     strip_libera_esportazione_requested_data,
 )
+from order_reference_resolver import (
+    ORDER_REFERENCE_PREFIX_SET,
+    PREFIX_LENGTH as ORDER_REFERENCE_PREFIX_LENGTH,
+    SHIPMENT_SELECTION_ALL,
+    SHIPMENT_SELECTION_BY_TRACKING,
+    SHIPMENT_SELECTION_EXACT,
+    contains_blocked_order_reference,
+    is_shipment_shaped_order_reference,
+)
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe, write_dataframe
 
 DEFAULT_BASE_URL = "https://zelda.thelevelgroup.com/return/api/v1"
@@ -533,10 +542,28 @@ def is_ups_requester_email(email: object) -> bool:
     return normalized == UPS_BROKERAGE_EMAIL or domain == "ups.com" or domain.endswith(".ups.com")
 
 
+def row_order_processing_blocked(row: Mapping[str, Any]) -> bool:
+    """True for RC-US / RC-EU / LN-EU / LN-US orders, which are never processed."""
+
+    flag = row.get("order_processing_blocked")
+    if isinstance(flag, bool):
+        if flag:
+            return True
+    elif not is_blank(flag) and str(flag).strip().lower() in {"true", "1", "yes", "y"}:
+        return True
+
+    return contains_blocked_order_reference(
+        row.get("shipment_order_number"),
+        row.get("extracted_order_reference"),
+    )
+
+
 def row_needs_full_order_lookup(
     row: Mapping[str, Any],
     requested_data: list[str] | None = None,
 ) -> bool:
+    if row_order_processing_blocked(row):
+        return False
     if is_noreply_requester_email(row.get("requester_email")):
         return False
     if is_noreply_autoreply_first_request(row.get("requester_email"), row.get("request_number", 1)):
@@ -563,6 +590,8 @@ def row_needs_document_generation(
     row: Mapping[str, Any],
     requested_data: list[str] | None = None,
 ) -> bool:
+    if row_order_processing_blocked(row):
+        return False
     if is_noreply_requester_email(row.get("requester_email")):
         return False
     if is_noreply_autoreply_first_request(row.get("requester_email"), row.get("request_number", 1)):
@@ -626,6 +655,10 @@ def enrich_dataframe_with_full_order_data(
     for index, row in df.iterrows():
         if skip_existing and row_has_full_order_attempt(row):
             continue
+        if row_order_processing_blocked(row):
+            # Blocked order prefix: the ticket is left exactly as it is, so no
+            # GET_FULL_ORDER call is made even with --fetch-all.
+            continue
         if fetch_all:
             needs_lookup = not is_blank(row.get("shipment_order_number"))
         else:
@@ -657,9 +690,26 @@ def enrich_dataframe_with_full_order_data(
     # That meant GET_FULL_ORDER data was never fetched once the API client
     # *was* configured -- the root cause of tickets with multiple
     # shipment_order_number values only ever getting one invoice attached.
-    cache: dict[str, dict[str, Any]] = {}
+    cache: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
 
     for index in lookup_indices:
+
+        # How to pick shipment blocks out of the GET_FULL_ORDER payload. Rows
+        # resolved from the tracking number keep the historic "exact" mode;
+        # rows resolved from an order reference read the tracking-matched block
+        # or every shipment. See order_reference_resolver for the modes.
+        selection_mode = str(
+            df.at[index, "shipment_selection_mode"]
+            if "shipment_selection_mode" in df.columns
+            else ""
+        ).strip().lower() or SHIPMENT_SELECTION_EXACT
+        row_tracking_numbers = tuple(
+            split_tracking_numbers(
+                df.at[index, "extracted_tracking_number"]
+                if "extracted_tracking_number" in df.columns
+                else ""
+            )
+        )
 
         shipment_orders = [
             x.strip()
@@ -682,13 +732,30 @@ def enrich_dataframe_with_full_order_data(
 
         for shipment_order_number in shipment_orders:
 
-            cache_key = shipment_order_number.upper()
+            # A shipment-shaped reference (a letter after the prefix, e.g.
+            # DG-EUA01663254) names one specific shipment, so it is always read
+            # on its own even when the row's mode is "all"/"by_tracking"
+            # because of another reference on the same ticket. An order-shaped
+            # reference (DG-EU-01663254) keeps the row's mode.
+            effective_mode = (
+                SHIPMENT_SELECTION_EXACT
+                if is_shipment_shaped_order_reference(shipment_order_number)
+                else selection_mode
+            )
+
+            cache_key = (
+                shipment_order_number.upper(),
+                effective_mode,
+                row_tracking_numbers if effective_mode == SHIPMENT_SELECTION_BY_TRACKING else (),
+            )
 
             if cache_key not in cache:
                 try:
                     cache[cache_key] = fetch_shipment_order_data(
                         shipment_order_number,
                         client=api_client,
+                        selection_mode=effective_mode,
+                        tracking_numbers=row_tracking_numbers,
                     )
                 except Exception as exc:
                     print(
@@ -924,7 +991,15 @@ def brand_from_shipment_order_number(shipment_order_number: object) -> str:
 
 
 def _looks_like_brand_prefixed_shipment_order(value: str) -> bool:
-    return bool(re.match(r"^[A-Z0-9]{2}-.{3,}$", value))
+    if re.match(r"^[A-Z0-9]{2}-.{3,}$", value):
+        return True
+    # A few known order prefixes have no internal dash (e.g. CVXEU), so the
+    # generic "XX-" shape above does not recognize them. They still follow the
+    # same rule: 5-character prefix, then a letter (shipment) or "-" (order).
+    return (
+        len(value) > ORDER_REFERENCE_PREFIX_LENGTH
+        and value[:ORDER_REFERENCE_PREFIX_LENGTH] in ORDER_REFERENCE_PREFIX_SET
+    )
 
 
 def _has_euf_or_usf_market_code(value: str) -> bool:
@@ -1094,6 +1169,101 @@ def shipment_block_from_order_payload(
             return shipment
 
     return None
+
+
+def _normalize_tracking_value(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def split_tracking_numbers(value: object) -> list[str]:
+    """Split the stored ``a;b`` tracking column into normalized values."""
+
+    numbers: list[str] = []
+    for part in re.split(r"[;,]", str(value or "")):
+        normalized = _normalize_tracking_value(part)
+        if normalized and normalized != "NA" and normalized not in numbers:
+            numbers.append(normalized)
+    return numbers
+
+
+_TRACKING_KEY_HINTS = ("tracking", "awb", "waybill", "labelnumber", "parcelnumber")
+
+
+def _collect_tracking_values(value: Any, found: set[str]) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_name = str(key).lower().replace("_", "")
+            if any(hint in key_name for hint in _TRACKING_KEY_HINTS) and isinstance(
+                child, (str, int)
+            ):
+                normalized = _normalize_tracking_value(child)
+                if normalized:
+                    found.add(normalized)
+            else:
+                _collect_tracking_values(child, found)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_tracking_values(child, found)
+
+
+def tracking_numbers_in_shipment(shipment: Mapping[str, Any] | None) -> set[str]:
+    """Every tracking number carried by a shipment block.
+
+    The search is a deep walk over the whole block, so it covers both the
+    shipping-label and the return-label sub-objects regardless of how the
+    GET_FULL_ORDER payload nests them.
+    """
+
+    found: set[str] = set()
+    _collect_tracking_values(shipment, found)
+    return found
+
+
+def shipment_blocks_for_selection(
+    payload: Mapping[str, Any],
+    shipment_order_number: object,
+    *,
+    selection_mode: str = SHIPMENT_SELECTION_EXACT,
+    tracking_numbers: Iterable[str] = (),
+) -> list[Mapping[str, Any]]:
+    """Return the shipment block(s) to read out of a GET_FULL_ORDER payload.
+
+    * ``exact``       - the order came from the tracking number via
+      bi.shipping_platform_shipments, so the matching shipment block is known.
+    * ``by_tracking`` - the order came from an order reference while a tracking
+      number was present in the ticket but unknown to the shipments table. The
+      block whose shipping/return label carries that tracking number is used;
+      when no block matches, every shipment is read.
+    * ``all``         - no usable tracking number, so every shipment of the
+      order is read.
+    """
+
+    mode = str(selection_mode or SHIPMENT_SELECTION_EXACT).strip().lower()
+    shipments = _shipments_from_payload(payload)
+
+    if mode == SHIPMENT_SELECTION_ALL:
+        return shipments
+
+    if mode == SHIPMENT_SELECTION_BY_TRACKING:
+        wanted = {
+            _normalize_tracking_value(number)
+            for number in tracking_numbers
+            if _normalize_tracking_value(number)
+        }
+        if wanted:
+            matched = [
+                shipment
+                for shipment in shipments
+                if tracking_numbers_in_shipment(shipment) & wanted
+            ]
+            if matched:
+                return matched
+        # The ticket's tracking number is in none of the shipment blocks:
+        # fall back to extracting the data from all of them.
+        return shipments
+
+    block = shipment_block_from_order_payload(payload, shipment_order_number)
+    return [block] if block is not None else []
 
 
 def _invoice_documents_from_shipment(shipment: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
@@ -1403,19 +1573,74 @@ def _shipped_at_from_shipment(shipment: Mapping[str, Any] | None) -> str | None:
     return str(value).strip()
 
 
-def extract_shipment_order_data(
-    payload: Mapping[str, Any],
-    shipment_order_number: object,
-) -> dict[str, Any]:
-    """Extract only the current shipment's response fields from a full order."""
+# Columns whose values from several shipments are joined instead of kept
+# single-valued. Document links are semicolon-joined because the downloader
+# already splits on ";"; the returned-items block is newline-joined so it stays
+# readable. Everything else (customer, address, country, shipped date) belongs
+# to the order rather than the shipment, so the first non-blank value is kept.
+_SEMICOLON_JOINED_COLUMNS = {
+    FULL_ORDER_RESPONSE_COLUMNS["return_proforma_invoice"],
+    FULL_ORDER_RESPONSE_COLUMNS["commercial_invoice"],
+}
+_NEWLINE_JOINED_COLUMNS = {
+    FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"],
+}
 
-    shipment = shipment_block_from_order_payload(payload, shipment_order_number)
-    if shipment is None:
-        return {
-            FULL_ORDER_RESPONSE_COLUMNS["api_error"]: (
-                "Shipment block not found in GET_FULL_ORDER response"
-            )
-        }
+
+def _combine_shipment_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-shipment extraction results into one row-shaped dict."""
+
+    if not results:
+        return {}
+    if len(results) == 1:
+        return results[0]
+
+    combined: dict[str, Any] = {}
+
+    for result in results:
+        for column, value in result.items():
+            if is_blank(value):
+                combined.setdefault(column, None)
+                continue
+
+            if column not in _SEMICOLON_JOINED_COLUMNS | _NEWLINE_JOINED_COLUMNS:
+                if is_blank(combined.get(column)):
+                    combined[column] = value
+                continue
+
+            separator = ";" if column in _SEMICOLON_JOINED_COLUMNS else "\n"
+            existing = combined.get(column)
+            if is_blank(existing):
+                combined[column] = value
+                continue
+
+            values = [
+                part.strip()
+                for part in str(existing).split(separator)
+                if part.strip()
+            ]
+            if str(value).strip() not in values:
+                values.append(str(value).strip())
+            combined[column] = separator.join(values)
+
+    # api_error is informational only: never let one shipment's error mask the
+    # data successfully extracted from the others.
+    error_column = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
+    if any(not is_blank(result.get(error_column)) for result in results) and any(
+        not is_blank(value)
+        for column, value in combined.items()
+        if column != error_column
+    ):
+        combined[error_column] = None
+
+    return combined
+
+
+def _extract_single_shipment_data(
+    payload: Mapping[str, Any],
+    shipment: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Extract one shipment block's response fields from a full order."""
 
     invoice_documents = _invoice_documents_from_shipment(shipment)
     customer = _customer_from_payload_or_shipment(payload, shipment)
@@ -1449,14 +1674,55 @@ def extract_shipment_order_data(
     }
 
 
+def extract_shipment_order_data(
+    payload: Mapping[str, Any],
+    shipment_order_number: object,
+    *,
+    selection_mode: str = SHIPMENT_SELECTION_EXACT,
+    tracking_numbers: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Extract the response fields for the selected shipment(s) of an order.
+
+    With the default ``exact`` mode this behaves exactly as before: only the
+    shipment block matching ``shipment_order_number`` is read. The other modes
+    exist for orders resolved from an order reference rather than from the
+    tracking number -- see shipment_blocks_for_selection().
+    """
+
+    shipments = shipment_blocks_for_selection(
+        payload,
+        shipment_order_number,
+        selection_mode=selection_mode,
+        tracking_numbers=tracking_numbers,
+    )
+
+    if not shipments:
+        return {
+            FULL_ORDER_RESPONSE_COLUMNS["api_error"]: (
+                "Shipment block not found in GET_FULL_ORDER response"
+            )
+        }
+
+    return _combine_shipment_results(
+        [_extract_single_shipment_data(payload, shipment) for shipment in shipments]
+    )
+
+
 def fetch_shipment_order_data(
     shipment_order_number: object,
     *,
     client: GetFullOrderClient | None = None,
+    selection_mode: str = SHIPMENT_SELECTION_EXACT,
+    tracking_numbers: Iterable[str] = (),
 ) -> dict[str, Any]:
     client = client or GetFullOrderClient()
     payload = client.get_order_payload(shipment_order_number)
-    return extract_shipment_order_data(payload, shipment_order_number)
+    return extract_shipment_order_data(
+        payload,
+        shipment_order_number,
+        selection_mode=selection_mode,
+        tracking_numbers=tracking_numbers,
+    )
 
 
 def tracking_number_for_documents(row: Mapping[str, Any]) -> str:
