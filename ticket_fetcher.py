@@ -3869,10 +3869,16 @@ def download_zendesk_attachment(
     if not content_url:
         raise RuntimeError("attachment has no content_url")
 
+    # (connect, read): a dead host fails in 5s instead of 120, and a stalled
+    # transfer gives up after 30s of silence. The old flat 120 applied to BOTH
+    # attempts, so one bad attachment could hold a worker for four minutes --
+    # and a ticket with several of them for much longer. With 8 workers, a
+    # handful of these is enough to make the whole stage look hung.
+    attachment_timeout = (5, 30)
     requester = session or requests
-    response = requester.get(content_url, timeout=120)
+    response = requester.get(content_url, timeout=attachment_timeout)
     if response.status_code in (401, 403):
-        response = requester.get(content_url, auth=auth, timeout=120)
+        response = requester.get(content_url, auth=auth, timeout=attachment_timeout)
     if not response.ok:
         raise RuntimeError(
             f"{response.status_code} downloading {attachment.get('file_name')}"
@@ -4033,6 +4039,12 @@ def _prefetch_pdf_order_references(
         ]
     else:
         results = []
+        # Progress is printed HERE, as workers finish -- not in the replay
+        # loop below. The replay only runs once every future has returned, so
+        # a counter there leaves this stage completely silent for its whole
+        # duration, which is precisely when you need to know it is moving.
+        total_to_scan = len(ticket_ids)
+        progress_step = max(1, total_to_scan // 10)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(
@@ -4045,6 +4057,9 @@ def _prefetch_pdf_order_references(
             ]
             for future in as_completed(futures):
                 results.append(future.result())
+                done = len(results)
+                if done % progress_step == 0 or done == total_to_scan:
+                    print(f"  ...scanned {done}/{total_to_scan} ticket(s).")
 
     # Replay in submission order: as_completed yields whichever worker
     # finished first, which would otherwise scramble the run log.
@@ -4056,8 +4071,6 @@ def _prefetch_pdf_order_references(
         for message in result["messages"]:
             print(message)
         cache[ticket_id] = result["references"]
-        if position % 25 == 0 or position == len(ticket_ids):
-            print(f"  ...scanned {position}/{len(ticket_ids)} ticket(s).")
 
     return cache
 
