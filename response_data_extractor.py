@@ -1006,6 +1006,28 @@ def enrich_dataframe_with_full_order_data(
     return df
 
 
+def document_generation_already_failed(row, data_key: str) -> bool:
+    """True when this row already recorded a failure for this document type.
+
+    generate_documents_for_dataframe() runs once in response_data_extractor
+    and again in response_generator, and the reply builder falls back to
+    generating a missing document a third time. A *successful* document short-
+    circuits all of that, because its path is stored in the row. A failure
+    stored nothing, so every later pass retried it -- three calls to the
+    labels API per request, three identical warnings, and three times the
+    latency, all to reach the same answer.
+
+    The recorded error is that missing memory. It is per run: the next run
+    starts from a fresh row and will try again, which is what you want for a
+    transient API outage.
+    """
+
+    error_value = row.get(DOCUMENT_RESPONSE_COLUMNS["document_error"])
+    if is_blank(error_value):
+        return False
+    return f"{data_key}:" in str(error_value)
+
+
 def _append_document_error(df, index: object, message: str) -> None:
     error_column = DOCUMENT_RESPONSE_COLUMNS["document_error"]
     existing_error = df.at[index, error_column] if error_column in df.columns else None
@@ -1083,7 +1105,9 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                     print(f"WARNING: Could not generate authorization_letter for row {index}: {exc}")
                     _append_document_error(df, index, message)
 
-        if needs_poa:
+        if needs_poa and not (
+            not force and document_generation_already_failed(row, "power_of_attorney")
+        ):
             column = DOCUMENT_RESPONSE_COLUMNS["power_of_attorney"]
             existing_path = row.get(column)
             if force or is_blank(existing_path) or not document_path_exists(existing_path):
@@ -1096,7 +1120,9 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                     print(f"WARNING: Could not generate power_of_attorney for row {index}: {exc}")
                     _append_document_error(df, index, message)
 
-        if needs_shipping_label:
+        if needs_shipping_label and not (
+            not force and document_generation_already_failed(row, "shipping_label")
+        ):
             column = DOCUMENT_RESPONSE_COLUMNS["shipping_label"]
             existing_path = row.get(column)
             if force or is_blank(existing_path) or not document_path_exists(str(existing_path).split(";")[0]):
