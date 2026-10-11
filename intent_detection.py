@@ -18,6 +18,8 @@ Creates:
 import json
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import ceil
 from typing import Dict, List
 
@@ -64,6 +66,21 @@ FALLBACK_MODEL = os.getenv(
 )
 FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS = int(os.getenv("GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS", "3"))
 BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
+LLM_BATCH_WORKERS_ENV = "LLM_BATCH_WORKERS"
+# Conservative: Gemini batches are the one place a 429 costs a retry with a
+# sleep, and the detector already falls back to a lighter model under rate
+# limiting. Set to 1 to restore exactly sequential behaviour.
+DEFAULT_LLM_BATCH_WORKERS = 4
+
+
+def _llm_batch_workers(batch_count):
+    if batch_count <= 1:
+        return 1
+    try:
+        configured = int(os.getenv(LLM_BATCH_WORKERS_ENV, "") or DEFAULT_LLM_BATCH_WORKERS)
+    except ValueError:
+        configured = DEFAULT_LLM_BATCH_WORKERS
+    return max(1, min(configured, 16, batch_count))
 LLM_CONFIDENCE_MIN = float(os.getenv("LLM_CONFIDENCE_MIN", "0.85"))
 
 ALLOWED_REQUESTED_DATA = [
@@ -956,51 +973,72 @@ def main():
         f"{len(llm_results)} tickets sent directly to human review"
     )
 
-    for batch_number in range(total_batches):
+    # Batches are independent: each is one stateless prompt -> JSON response,
+    # and results are matched back by source_id. Running them concurrently
+    # changes nothing about what is asked or how answers are applied; only the
+    # waiting overlaps. Results are reassembled in batch order below, so
+    # llm_results ends up exactly as the sequential version produced it.
+    #
+    # Each worker gets its OWN detector: last_model_used/last_model_attempts
+    # are per-call state read straight after the call, so a shared detector
+    # would attribute the wrong model to a batch under concurrency.
+    batch_workers = _llm_batch_workers(total_batches)
+    detector_local = threading.local()
+
+    def worker_detector():
+        existing = getattr(detector_local, "detector", None)
+        if existing is None:
+            existing = RequestedDataDetector(
+                model=detector.model,
+                fallback_model=detector.fallback_model,
+            )
+            detector_local.detector = existing
+        return existing
+
+    def run_batch(batch_number):
         start_idx = batch_number * BATCH_SIZE
         end_idx = start_idx + BATCH_SIZE
         batch_rows = rows_for_llm[start_idx:end_idx]
+        active_detector = detector if batch_workers <= 1 else worker_detector()
 
-        batch_payload = []
-        lookup = {}
+        batch_payload, lookup = _build_batch_payload(batch_rows)
 
-        for row in batch_rows:
-            source_id = build_source_id(row)
-            lookup[source_id] = row
-
-            batch_payload.append(
-                {
-                    "source_id": source_id,
-                    "subject": str(row.get("subject", "") or ""),
-                    "request_body": source_text_for_llm(row),
-                    "ticket_category": str(row.get("ticket_category", "") or ""),
-                    "regex_candidates": list_or_empty(row.get("regex_requested_data")),
-                    "regex_notes": str(row.get("notes", "") or ""),
-                    "extracted_tracking_number": str(
-                        row.get("extracted_tracking_number", "") or ""
-                    ),
-                    "tracking_not_found_in_shipping_platform_shipments": as_bool(
-                        row.get("tracking_not_found_in_shipping_platform_shipments")
-                    ),
-                }
-            )
-
+        messages = []
         try:
-            batch_results = detector.detect_batch(batch_payload)
+            batch_results = active_detector.detect_batch(batch_payload)
         except Exception as exc:
-            print(f"Batch {batch_number + 1} failed: {exc}")
-
+            messages.append(f"Batch {batch_number + 1} failed: {exc}")
             batch_results = [
                 {
                     "source_id": payload["source_id"],
                     "requested_data": [UNKNOWN_REQUEST],
                     "confidence": 0.0,
                     "notes": f"LLM batch failed: {exc}",
-                    "llm_model_used": detector.last_model_used,
-                    "llm_model_attempts": detector.last_model_attempts,
+                    "llm_model_used": active_detector.last_model_used,
+                    "llm_model_attempts": active_detector.last_model_attempts,
                 }
                 for payload in batch_payload
             ]
+        return batch_number, batch_results, lookup, messages
+
+    if batch_workers <= 1:
+        completed = [run_batch(number) for number in range(total_batches)]
+    else:
+        print(f"Running {total_batches} Gemini batch(es) with {batch_workers} worker(s).")
+        completed = []
+        with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+            futures = [
+                executor.submit(run_batch, number) for number in range(total_batches)
+            ]
+            for future in as_completed(futures):
+                completed.append(future.result())
+                print(f"  ...completed {len(completed)}/{total_batches} batch(es).")
+
+    # Reassemble in batch order so llm_results, and therefore the output file,
+    # is byte-identical to the sequential run.
+    for _, batch_results, lookup, messages in sorted(completed, key=lambda item: item[0]):
+        for message in messages:
+            print(message)
 
         for result in batch_results:
             source_id = result.get("source_id")
@@ -1027,6 +1065,36 @@ def main():
     print(
         f"Saved {len(final_df)} rows to {REQUEST_INTENT_RESULTS_PATH}"
     )
+
+
+def _build_batch_payload(batch_rows):
+    """Build the Gemini payload and the source_id -> row lookup for one batch."""
+
+    batch_payload = []
+    lookup = {}
+
+    for row in batch_rows:
+        source_id = build_source_id(row)
+        lookup[source_id] = row
+
+        batch_payload.append(
+            {
+                "source_id": source_id,
+                "subject": str(row.get("subject", "") or ""),
+                "request_body": source_text_for_llm(row),
+                "ticket_category": str(row.get("ticket_category", "") or ""),
+                "regex_candidates": list_or_empty(row.get("regex_requested_data")),
+                "regex_notes": str(row.get("notes", "") or ""),
+                "extracted_tracking_number": str(
+                    row.get("extracted_tracking_number", "") or ""
+                ),
+                "tracking_not_found_in_shipping_platform_shipments": as_bool(
+                    row.get("tracking_not_found_in_shipping_platform_shipments")
+                ),
+            }
+        )
+
+    return batch_payload, lookup
 
 
 if __name__ == "__main__":
