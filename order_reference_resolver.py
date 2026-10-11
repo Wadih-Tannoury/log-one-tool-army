@@ -426,6 +426,19 @@ def contains_blocked_order_reference(*values: object) -> bool:
 
 PDF_OCR_DPI = int(os.getenv("ORDER_REFERENCE_PDF_OCR_DPI", "300") or "300")
 PDF_OCR_RETRY_DPI = int(os.getenv("ORDER_REFERENCE_PDF_OCR_RETRY_DPI", "400") or "400")
+# Hard ceiling on the rendered size of a single page, in pixels.
+#
+# A4 at 300 dpi is ~8.7M pixels, so this allows roughly A2. Carrier scans
+# occasionally declare an A0-sized page: at 300 dpi that renders to ~150M
+# pixels, which is ~150 MB of grayscale for ONE page, trips Pillow's
+# decompression-bomb warning, and gives Tesseract an image it will chew on for
+# minutes. Above this budget the page is rendered at a proportionally lower
+# zoom instead, which is both faster and no worse for OCR: the text on an
+# oversized page is drawn proportionally larger, so the effective resolution
+# relative to the glyphs is unchanged.
+PDF_OCR_MAX_PIXELS = int(
+    os.getenv("ORDER_REFERENCE_PDF_OCR_MAX_PIXELS", "40000000") or "40000000"
+)
 PDF_OCR_ENABLED = str(
     os.getenv("ORDER_REFERENCE_PDF_OCR_ENABLED", "true")
 ).strip().lower() in {"true", "1", "yes", "y", "on"}
@@ -456,20 +469,35 @@ def _pdf_text(pdf_bytes: bytes, dpi: int) -> tuple[str, str]:
         if not PDF_OCR_ENABLED or pytesseract is None or Image is None:
             return layer, "text-layer"
 
-        zoom = dpi / 72  # PDF user space is 72 dpi
-        matrix = pymupdf.Matrix(zoom, zoom)
+        base_zoom = dpi / 72  # PDF user space is 72 dpi
         chunks = []
+        clamped = False
         for page in document:
+            zoom = base_zoom
+            rect = page.rect
+            projected = (rect.width * zoom) * (rect.height * zoom)
+            if PDF_OCR_MAX_PIXELS > 0 and projected > PDF_OCR_MAX_PIXELS:
+                zoom *= (PDF_OCR_MAX_PIXELS / projected) ** 0.5
+                clamped = True
+            matrix = pymupdf.Matrix(zoom, zoom)
             pixmap = page.get_pixmap(matrix=matrix, colorspace=pymupdf.csGRAY)
             image = Image.open(io.BytesIO(pixmap.tobytes("png")))
             chunks.append(pytesseract.image_to_string(image))
-        return "\n".join(chunks), "ocr"
+        return "\n".join(chunks), "ocr-clamped" if clamped else "ocr"
     finally:
         document.close()
 
 
 def find_order_references_in_pdf_bytes(pdf_bytes: bytes) -> tuple[list[str], str]:
-    """Extract order references from one PDF, retrying OCR at higher resolution."""
+    """Extract order references from one PDF, retrying OCR at higher resolution.
+
+    A render that hit PDF_OCR_MAX_PIXELS is not retried: the clamp binds at the
+    retry DPI too, so the second pass would rasterize the same image and OCR it
+    again for nothing. Before the clamp existed that retry did worse than
+    nothing on these pages -- at 400 dpi an A0 scan exceeds Pillow's
+    decompression-bomb *error* threshold, so the retry raised and the whole
+    attachment was reported unreadable.
+    """
 
     text, method = _pdf_text(pdf_bytes, PDF_OCR_DPI)
     references = find_order_references(text)
