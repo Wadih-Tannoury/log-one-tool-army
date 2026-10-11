@@ -32,6 +32,10 @@ jobs:
       contents: write
 
     env:
+      # Python block-buffers stdout when it is a pipe, which is what the
+      # Actions runner gives it. Without this the progress lines sit in an
+      # 8 KB buffer and the step looks frozen for minutes at a time.
+      PYTHONUNBUFFERED: "1"
       PROJECT_ID: tlg-business-intelligence-prd
       BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
