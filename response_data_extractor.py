@@ -64,6 +64,7 @@ from order_reference_resolver import (
     SHIPMENT_SELECTION_BY_TRACKING,
     SHIPMENT_SELECTION_EXACT,
     contains_blocked_order_reference,
+    is_missing_value,
     is_shipment_shaped_order_reference,
 )
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe, write_dataframe
@@ -653,6 +654,9 @@ def row_has_full_order_attempt(row: Mapping[str, Any]) -> bool:
     return any(not is_blank(row.get(column)) for column in FULL_ORDER_RESPONSE_COLUMNS.values())
 
 
+# Values a NULL/absent order column can stringify into. None of these is a
+# real order number, and each one produced a /brands/NA/orders/<junk> call.
+_NULL_ORDER_SENTINELS = {"NAN", "NONE", "NULL", "NAT", "N/A", "NA"}
 FULL_ORDER_LOOKUP_WORKERS_ENV = "FULL_ORDER_LOOKUP_WORKERS"
 DEFAULT_FULL_ORDER_LOOKUP_WORKERS = 8
 
@@ -689,14 +693,23 @@ def _full_order_lookup_plan(df, index) -> tuple[list[str], str, tuple[str, ...]]
             else ""
         )
     )
+    raw_order = (
+        df.at[index, "shipment_order_number"]
+        if "shipment_order_number" in df.columns
+        else ""
+    )
+    # A NULL column arrives from BigQuery as a float NaN, and NaN is truthy:
+    # str(nan) is "nan". Left unguarded that became the order "NAN", which
+    # brand_from_shipment_order_number() turns into brand "NA" -- producing
+    # GET_FULL_ORDER calls to /brands/NA/orders/NAN that 500 and then report
+    # the row's real data as missing.
+    if is_missing_value(raw_order):
+        return [], selection_mode, row_tracking_numbers
+
     shipment_orders = [
         x.strip()
-        for x in str(
-            df.at[index, "shipment_order_number"]
-            if "shipment_order_number" in df.columns
-            else ""
-        ).split(";")
-        if x.strip()
+        for x in str(raw_order).split(";")
+        if x.strip() and x.strip().upper() not in _NULL_ORDER_SENTINELS
     ]
     return shipment_orders, selection_mode, row_tracking_numbers
 
