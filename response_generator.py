@@ -764,6 +764,40 @@ def is_tracking_lookup_not_found(row):
     )
 
 
+def has_resolved_order(row) -> bool:
+    """True when the request is tied to an order by any resolution route.
+
+    Mirrors intent_detection.has_resolved_order(). The order may come from the
+    tracking number via bi.shipping_platform_shipments, or from an order
+    reference found in the ticket text or inside a PDF attachment. Either way
+    GET_FULL_ORDER can be queried, so the tracking-number guards no longer
+    apply.
+    """
+
+    if not str(row.get("shipment_order_number") or "").strip():
+        return False
+    # On a ticket with several tracking numbers, only some of which resolved,
+    # order_resolution_complete is False and the request must stay in human
+    # review instead of being answered with partial data.
+    flag = row.get("order_resolution_complete")
+    if flag is None or (isinstance(flag, str) and not flag.strip()):
+        return True
+    return as_bool(flag)
+
+
+def tracking_lookup_requires_human(row) -> bool:
+    """The tracking-number escalation, qualified exactly as upstream does.
+
+    regex_engine.py stands its tracking guards down once an order is resolved,
+    and intent_detection.py pairs is_tracking_lookup_not_found() with
+    `not has_resolved_order(row)`. This file used the bare flag, so a request
+    whose order came from a PDF attachment passed both upstream stages and was
+    then escalated here -- never answered despite having everything it needed.
+    """
+
+    return is_tracking_lookup_not_found(row) and not has_resolved_order(row)
+
+
 def row_has_request_type(row, request_type):
     wanted = str(request_type or "").strip()
     if not wanted:
@@ -1767,7 +1801,7 @@ def build_human_intervention_note(row, reason):
             f"Request number: {request_number}"
         )
 
-    draft = llm_human_intervention_draft(row) if is_tracking_lookup_not_found(row) else ""
+    draft = llm_human_intervention_draft(row) if tracking_lookup_requires_human(row) else ""
     reviewer_document_references = format_reviewer_document_references(row)
     reviewer_document_section = (
         f"\n\n{reviewer_document_references}" if reviewer_document_references else ""
@@ -2160,7 +2194,7 @@ def should_force_human_intervention(row, requested_data):
             "Manual verification is required before replying.",
         )
 
-    if is_tracking_lookup_not_found(row):
+    if tracking_lookup_requires_human(row):
         return (
             True,
             "Tracking number extracted from the ticket was not found in "
