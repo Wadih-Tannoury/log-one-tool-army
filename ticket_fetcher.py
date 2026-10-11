@@ -3620,9 +3620,19 @@ def enrich_with_shipment_numbers(
                 -- belonging to a completely unrelated shipment. A NULL key
                 -- joins to nothing, and those rows fall back to the
                 -- tracking-number match below.
+                -- Also NULL for anything that is not shaped like an order
+                -- reference. The table carries UPS reference strings such as
+                -- 'LN_SUP_DTM' and 'LN_SUP_STR1' in this column, and those
+                -- repeat across unrelated shipments. Collapsing character 6
+                -- would make every shipment sharing one of those sentinels a
+                -- join partner of every other, exactly as the blank value did.
                 IF(
                     shipment_order_number IS NULL
-                    OR TRIM(shipment_order_number) = '',
+                    OR TRIM(shipment_order_number) = ''
+                    OR NOT REGEXP_CONTAINS(
+                        TRIM(shipment_order_number),
+                        r'^[A-Za-z]{2}-[A-Za-z]{2}([A-Za-z]|-)[A-Za-z0-9]{4,20}$'
+                    ),
                     NULL,
                     IF(
                         LENGTH(TRIM(shipment_order_number)) >= 7,
