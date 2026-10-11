@@ -263,6 +263,14 @@ ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
 DEFAULT_ZENDESK_MAX_RETRIES = 5
 MAX_TICKETS_PER_RUN_ENV = "MAX_TICKETS_PER_RUN"
 DEFAULT_MAX_TICKETS_PER_RUN = 200
+TICKET_OVERFETCH_MULTIPLIER_ENV = "TICKET_OVERFETCH_MULTIPLIER"
+# Comments are fetched for MAX_TICKETS_PER_RUN * this many tickets. It has to
+# exceed 1: whether a request is already completed is only knowable after its
+# comments are read (the check is per request_id, which needs request_number,
+# which needs the comments). Fetching exactly the cap would let a run whose
+# selection happens to be all-completed do no work at all -- and, because the
+# selection is deterministic, do no work on the next run either.
+DEFAULT_TICKET_OVERFETCH_MULTIPLIER = 3
 ORDER_REFERENCE_PDF_SCAN_WORKERS_ENV = "ORDER_REFERENCE_PDF_SCAN_WORKERS"
 # PDF scanning is download + Tesseract OCR. Both release the GIL (one is a
 # socket wait, the other a subprocess wait), so threads give real parallelism.
@@ -3157,6 +3165,56 @@ def iter_zendesk_search_export_tickets(
             url = None
 
 
+def _ticket_overfetch_multiplier() -> int:
+    return _env_int(
+        TICKET_OVERFETCH_MULTIPLIER_ENV,
+        DEFAULT_TICKET_OVERFETCH_MULTIPLIER,
+        minimum=1,
+        maximum=100,
+    )
+
+
+def _ticket_age_sort_key(ticket: Mapping[str, Any]) -> tuple[int, int, int]:
+    """Sort key putting the oldest ticket first, unknown ages last."""
+
+    created_at = pd.to_datetime(ticket.get("created_at"), utc=True, errors="coerce")
+    ticket_id = _to_int(ticket.get("id")) or 0
+    if pd.isna(created_at):
+        return (1, 0, ticket_id)
+    return (0, int(created_at.value), ticket_id)
+
+
+def limit_tickets_for_comment_fetch(
+    tickets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Trim the ticket list before the expensive per-ticket comment fetch.
+
+    Comments are one rate-limited Zendesk call per ticket and are the reason a
+    run spends minutes sleeping on 429s, so fetching them for tickets that will
+    be discarded by the MAX_TICKETS_PER_RUN cap is pure waste.
+
+    The budget is a multiple of that cap rather than the cap itself, because
+    completed requests can only be recognised after their comments are read.
+    With a multiplier of N, a run still makes progress as long as fewer than
+    (N-1)/N of the oldest selected tickets are already finished.
+    """
+
+    budget = _max_tickets_per_run() * _ticket_overfetch_multiplier()
+    if len(tickets) <= budget:
+        return tickets
+
+    ordered = sorted(tickets, key=_ticket_age_sort_key)
+    kept = ordered[:budget]
+    print(
+        f"Fetching comments for the {len(kept)} oldest of {len(tickets)} "
+        f"matched ticket(s) ({_max_tickets_per_run()} cap x "
+        f"{_ticket_overfetch_multiplier()} over-fetch); the rest wait for the "
+        f"next run. Set {TICKET_OVERFETCH_MULTIPLIER_ENV} to widen the margin "
+        "if too many of these turn out to be already completed."
+    )
+    return kept
+
+
 def fetch_ticket_rows(
     *,
     client,
@@ -3177,6 +3235,10 @@ def fetch_ticket_rows(
 
     rows: list[dict[str, Any]] = []
     seen_ticket_ids: set[int] = set()
+    # Phase A accumulates across every page/query; comments are fetched once,
+    # in phase B, for the subset this run will actually process.
+    all_matching_tickets: list[dict[str, Any]] = []
+    requester_email_by_ticket_id: dict[int, str] = {}
     user_email_cache: dict[int, str] = {}
     skipped_non_carrier = 0
     skipped_unexpected_status = 0
@@ -3288,7 +3350,6 @@ def fetch_ticket_rows(
                 )
 
                 matching_tickets: list[dict[str, Any]] = []
-                requester_email_by_ticket_id: dict[int, str] = {}
 
                 for ticket in candidate_tickets:
                     ticket_id = int(ticket["id"])
@@ -3309,161 +3370,167 @@ def fetch_ticket_rows(
                     "on this page."
                 )
 
-                if not matching_tickets:
+                all_matching_tickets.extend(matching_tickets)
+
+
+    # Phase B: one selection, one comment-fetch pool. Comments are the
+    # rate-limited call, so only the tickets this run can actually process
+    # are fetched -- see limit_tickets_for_comment_fetch() for why the
+    # budget is deliberately larger than MAX_TICKETS_PER_RUN.
+    selected_tickets = limit_tickets_for_comment_fetch(all_matching_tickets)
+
+    ticket_comment_map: dict[int, list[dict[str, Any]]] = {}
+    workers = _zendesk_comment_fetch_workers(len(selected_tickets))
+
+    if workers <= 1:
+        comment_results = [
+            get_comments_for_ticket(
+                ticket,
+                auth=auth,
+                base_url=base_url,
+            )
+            for ticket in selected_tickets
+        ]
+    else:
+        comment_results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    get_comments_for_ticket,
+                    ticket,
+                    auth=auth,
+                    base_url=base_url,
+                )
+                for ticket in selected_tickets
+            ]
+            for future in as_completed(futures):
+                comment_results.append(future.result())
+
+    for result in comment_results:
+        if result.get("error"):
+            comment_error_count += 1
+            print(
+                f"Error fetching comments for ticket "
+                f"{result.get('ticket_id')}: {result.get('error')}"
+            )
+            continue
+        try:
+            result_ticket_id = int(result["ticket_id"])
+        except (TypeError, ValueError):
+            continue
+        ticket_comment_map[result_ticket_id] = result.get("comments", [])
+
+    for ticket in selected_tickets:
+        try:
+            ticket_id = int(ticket["id"])
+            requester_id = ticket.get("requester_id")
+            requester_email = requester_email_by_ticket_id.get(ticket_id, "")
+            configured_category = email_to_category.get(requester_email)
+            carrier = carrier_code_from_email(requester_email)
+            comments = ticket_comment_map.get(ticket_id, [])
+            if not comments:
+                continue
+
+            requester_comment_counter = 0
+            requester_requests = []
+
+            for idx, comment in enumerate(comments):
+                if comment.get("author_id") != requester_id:
                     continue
 
-                ticket_comment_map: dict[int, list[dict[str, Any]]] = {}
-                workers = _zendesk_comment_fetch_workers(len(matching_tickets))
+                requester_comment_counter += 1
+                requester_requests.append(
+                    {
+                        "request_number": requester_comment_counter,
+                        "body": comment.get("body", ""),
+                        "comment_index": idx,
+                        "request_submission_timestamp": comment.get("created_at"),
+                    }
+                )
 
-                if workers <= 1:
-                    comment_results = [
-                        get_comments_for_ticket(
-                            ticket,
-                            auth=auth,
-                            base_url=base_url,
-                        )
-                        for ticket in matching_tickets
-                    ]
+            active_requests = []
+
+            for idx in range(len(comments) - 1, -1, -1):
+                comment = comments[idx]
+
+                # Ignore internal notes.
+                if not comment.get("public", True):
+                    continue
+
+                if comment.get("author_id") == requester_id:
+                    request = next(
+                        (
+                            candidate
+                            for candidate in requester_requests
+                            if candidate["comment_index"] == idx
+                        ),
+                        None,
+                    )
+
+                    if request:
+                        active_requests.append(request)
                 else:
-                    comment_results = []
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = [
-                            executor.submit(
-                                get_comments_for_ticket,
-                                ticket,
-                                auth=auth,
-                                base_url=base_url,
-                            )
-                            for ticket in matching_tickets
-                        ]
-                        for future in as_completed(futures):
-                            comment_results.append(future.result())
+                    # First public reply after the latest requester block.
+                    break
 
-                for result in comment_results:
-                    if result.get("error"):
-                        comment_error_count += 1
-                        print(
-                            f"Error fetching comments for ticket "
-                            f"{result.get('ticket_id')}: {result.get('error')}"
-                        )
-                        continue
-                    try:
-                        result_ticket_id = int(result["ticket_id"])
-                    except (TypeError, ValueError):
-                        continue
-                    ticket_comment_map[result_ticket_id] = result.get("comments", [])
+            active_requests.reverse()
 
-                for ticket in matching_tickets:
-                    try:
-                        ticket_id = int(ticket["id"])
-                        requester_id = ticket.get("requester_id")
-                        requester_email = requester_email_by_ticket_id.get(ticket_id, "")
-                        configured_category = email_to_category.get(requester_email)
-                        carrier = carrier_code_from_email(requester_email)
-                        comments = ticket_comment_map.get(ticket_id, [])
-                        if not comments:
-                            continue
+            if not active_requests:
+                continue
 
-                        requester_comment_counter = 0
-                        requester_requests = []
+            subject = ticket.get("subject", "")
+            description = ticket.get("description", "")
 
-                        for idx, comment in enumerate(comments):
-                            if comment.get("author_id") != requester_id:
-                                continue
+            for request in active_requests:
+                request_body = request["body"]
+                ticket_category = configured_category or classify_ticket_category_from_content(
+                    subject=subject,
+                    request_body=request_body,
+                    requester_email=requester_email,
+                )
+                tracking_number = extract_tracking_number(
+                    subject,
+                    f"{description}\n{request_body}",
+                    carrier,
+                )
+                # Fallback identifier used when the tracking number
+                # is missing or unknown to
+                # bi.shipping_platform_shipments. Collected here
+                # because the ticket description is available only
+                # at fetch time; PDF attachments are scanned later,
+                # and only for the rows that still need an order.
+                order_references = find_order_references(
+                    subject,
+                    description,
+                    request_body,
+                )
 
-                            requester_comment_counter += 1
-                            requester_requests.append(
-                                {
-                                    "request_number": requester_comment_counter,
-                                    "body": comment.get("body", ""),
-                                    "comment_index": idx,
-                                    "request_submission_timestamp": comment.get("created_at"),
-                                }
-                            )
+                rows.append(
+                    {
+                        "ingestion_timestamp": datetime.now(timezone.utc),
+                        "request_id": build_request_id(
+                            ticket_id,
+                            request["request_number"],
+                        ),
+                        "request_submission_timestamp": request.get(
+                            "request_submission_timestamp"
+                        ),
+                        "ticket_submission_timestamp": ticket.get("created_at"),
+                        "zendesk_ticket_id": ticket_id,
+                        "requester_email": requester_email,
+                        "subject": subject,
+                        "request_body": request_body,
+                        "request_number": request["request_number"],
+                        "ticket_category": ticket_category,
+                        "extracted_tracking_number": tracking_number,
+                        "extracted_order_reference": ";".join(
+                            order_references
+                        ),
+                    }
+                )
 
-                        active_requests = []
-
-                        for idx in range(len(comments) - 1, -1, -1):
-                            comment = comments[idx]
-
-                            # Ignore internal notes.
-                            if not comment.get("public", True):
-                                continue
-
-                            if comment.get("author_id") == requester_id:
-                                request = next(
-                                    (
-                                        candidate
-                                        for candidate in requester_requests
-                                        if candidate["comment_index"] == idx
-                                    ),
-                                    None,
-                                )
-
-                                if request:
-                                    active_requests.append(request)
-                            else:
-                                # First public reply after the latest requester block.
-                                break
-
-                        active_requests.reverse()
-
-                        if not active_requests:
-                            continue
-
-                        subject = ticket.get("subject", "")
-                        description = ticket.get("description", "")
-
-                        for request in active_requests:
-                            request_body = request["body"]
-                            ticket_category = configured_category or classify_ticket_category_from_content(
-                                subject=subject,
-                                request_body=request_body,
-                                requester_email=requester_email,
-                            )
-                            tracking_number = extract_tracking_number(
-                                subject,
-                                f"{description}\n{request_body}",
-                                carrier,
-                            )
-                            # Fallback identifier used when the tracking number
-                            # is missing or unknown to
-                            # bi.shipping_platform_shipments. Collected here
-                            # because the ticket description is available only
-                            # at fetch time; PDF attachments are scanned later,
-                            # and only for the rows that still need an order.
-                            order_references = find_order_references(
-                                subject,
-                                description,
-                                request_body,
-                            )
-
-                            rows.append(
-                                {
-                                    "ingestion_timestamp": datetime.now(timezone.utc),
-                                    "request_id": build_request_id(
-                                        ticket_id,
-                                        request["request_number"],
-                                    ),
-                                    "request_submission_timestamp": request.get(
-                                        "request_submission_timestamp"
-                                    ),
-                                    "ticket_submission_timestamp": ticket.get("created_at"),
-                                    "zendesk_ticket_id": ticket_id,
-                                    "requester_email": requester_email,
-                                    "subject": subject,
-                                    "request_body": request_body,
-                                    "request_number": request["request_number"],
-                                    "ticket_category": ticket_category,
-                                    "extracted_tracking_number": tracking_number,
-                                    "extracted_order_reference": ";".join(
-                                        order_references
-                                    ),
-                                }
-                            )
-
-                    except Exception as exc:
-                        print(f"Error processing ticket {ticket.get('id')}: {str(exc)}")
+        except Exception as exc:
+            print(f"Error processing ticket {ticket.get('id')}: {str(exc)}")
 
     print(
         f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
