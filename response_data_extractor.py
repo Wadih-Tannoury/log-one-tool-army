@@ -20,6 +20,8 @@ import binascii
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from html import unescape as html_unescape
@@ -237,8 +239,25 @@ class GetFullOrderClient:
         self.auth_mode = (auth_mode or os.getenv(AUTH_MODE_ENV) or "auto").strip().lower()
         self.token_url = (token_url or os.getenv(TOKEN_URL_ENV) or "").strip()
         self.timeout = timeout if timeout is not None else float(os.getenv(TIMEOUT_ENV, "60"))
-        self.session = session or requests.Session()
+        # An explicitly supplied session is used as-is (tests, single-threaded
+        # callers). Otherwise each thread gets its own: requests.Session is not
+        # thread-safe, and the parallel prefetch below drives several at once.
+        self._shared_session = session
+        self._thread_local = threading.local()
         self._access_token: str | None = None
+        # The OAuth2 token is fetched lazily; without this lock every worker
+        # would race to mint its own on the first call.
+        self._token_lock = threading.Lock()
+
+    @property
+    def session(self) -> requests.Session:
+        if self._shared_session is not None:
+            return self._shared_session
+        existing = getattr(self._thread_local, "session", None)
+        if existing is None:
+            existing = requests.Session()
+            self._thread_local.session = existing
+        return existing
 
     @property
     def is_configured(self) -> bool:
@@ -363,6 +382,12 @@ class GetFullOrderClient:
     def _get_access_token(self) -> str:
         if self._access_token:
             return self._access_token
+        with self._token_lock:
+            if self._access_token:
+                return self._access_token
+            return self._fetch_access_token()
+
+    def _fetch_access_token(self) -> str:
         if not self.token_url:
             raise ValueError(f"{TOKEN_URL_ENV} is required when {AUTH_MODE_ENV}=oauth2")
         if not self.credentials:
@@ -628,6 +653,167 @@ def row_has_full_order_attempt(row: Mapping[str, Any]) -> bool:
     return any(not is_blank(row.get(column)) for column in FULL_ORDER_RESPONSE_COLUMNS.values())
 
 
+FULL_ORDER_LOOKUP_WORKERS_ENV = "FULL_ORDER_LOOKUP_WORKERS"
+DEFAULT_FULL_ORDER_LOOKUP_WORKERS = 8
+
+
+def _full_order_lookup_workers(call_count: int) -> int:
+    if call_count <= 0:
+        return 0
+    try:
+        configured = int(
+            os.getenv(FULL_ORDER_LOOKUP_WORKERS_ENV, "")
+            or DEFAULT_FULL_ORDER_LOOKUP_WORKERS
+        )
+    except ValueError:
+        configured = DEFAULT_FULL_ORDER_LOOKUP_WORKERS
+    return max(1, min(configured, 32, call_count))
+
+
+def _full_order_lookup_plan(df, index) -> tuple[list[str], str, tuple[str, ...]]:
+    """Return (shipment_orders, selection_mode, tracking_numbers) for one row.
+
+    Single definition, used by both the parallel prefetch and the main loop, so
+    the two can never disagree about which GET_FULL_ORDER calls a row needs.
+    """
+
+    selection_mode = str(
+        df.at[index, "shipment_selection_mode"]
+        if "shipment_selection_mode" in df.columns
+        else ""
+    ).strip().lower() or SHIPMENT_SELECTION_EXACT
+    row_tracking_numbers = tuple(
+        split_tracking_numbers(
+            df.at[index, "extracted_tracking_number"]
+            if "extracted_tracking_number" in df.columns
+            else ""
+        )
+    )
+    shipment_orders = [
+        x.strip()
+        for x in str(
+            df.at[index, "shipment_order_number"]
+            if "shipment_order_number" in df.columns
+            else ""
+        ).split(";")
+        if x.strip()
+    ]
+    return shipment_orders, selection_mode, row_tracking_numbers
+
+
+def _full_order_effective_mode(shipment_order_number: str, selection_mode: str) -> str:
+    # A shipment-shaped reference (a letter after the prefix, e.g.
+    # DG-EUA01663254) names one specific shipment, so it is always read on its
+    # own even when the row's mode is "all"/"by_tracking" because of another
+    # reference on the same ticket. An order-shaped reference (DG-EU-01663254)
+    # keeps the row's mode.
+    return (
+        SHIPMENT_SELECTION_EXACT
+        if is_shipment_shaped_order_reference(shipment_order_number)
+        else selection_mode
+    )
+
+
+def _full_order_cache_key(
+    shipment_order_number: str,
+    effective_mode: str,
+    row_tracking_numbers: tuple[str, ...],
+) -> tuple[str, str, tuple[str, ...]]:
+    return (
+        shipment_order_number.upper(),
+        effective_mode,
+        row_tracking_numbers if effective_mode == SHIPMENT_SELECTION_BY_TRACKING else (),
+    )
+
+
+def _prefetch_full_order_payloads(
+    df,
+    lookup_indices: list,
+    *,
+    api_client: GetFullOrderClient,
+) -> dict[tuple[str, str, tuple[str, ...]], dict[str, Any]]:
+    """Fill the GET_FULL_ORDER cache for every call the main loop will make.
+
+    Each distinct (order, mode, tracking) key is one independent HTTP call, so
+    they run concurrently. The main loop then finds every key already present
+    and performs no I/O, leaving its logic and its write order untouched.
+    """
+
+    pending: dict[tuple[str, str, tuple[str, ...]], tuple[str, str, tuple[str, ...]]] = {}
+    for index in lookup_indices:
+        shipment_orders, selection_mode, row_tracking_numbers = _full_order_lookup_plan(
+            df, index
+        )
+        for shipment_order_number in shipment_orders:
+            effective_mode = _full_order_effective_mode(
+                shipment_order_number, selection_mode
+            )
+            cache_key = _full_order_cache_key(
+                shipment_order_number, effective_mode, row_tracking_numbers
+            )
+            pending.setdefault(
+                cache_key,
+                (shipment_order_number, effective_mode, row_tracking_numbers),
+            )
+
+    cache: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+    if not pending:
+        return cache
+
+    ordered_keys = list(pending)
+    workers = _full_order_lookup_workers(len(ordered_keys))
+    print(
+        f"Fetching {len(ordered_keys)} GET_FULL_ORDER payload(s) "
+        f"with {workers} worker(s)."
+    )
+
+    def fetch(cache_key):
+        shipment_order_number, effective_mode, row_tracking_numbers = pending[cache_key]
+        try:
+            return cache_key, fetch_shipment_order_data(
+                shipment_order_number,
+                client=api_client,
+                selection_mode=effective_mode,
+                tracking_numbers=row_tracking_numbers,
+            ), None
+        except Exception as exc:  # noqa: BLE001 - one bad order must not stop the rest
+            return cache_key, {
+                FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)
+            }, (
+                "WARNING: GET_FULL_ORDER lookup failed for "
+                f"shipment_order_number={shipment_order_number}: {exc}"
+            )
+
+    messages: dict[Any, str] = {}
+    progress_step = max(1, len(ordered_keys) // 10)
+    if workers <= 1:
+        results = [fetch(key) for key in ordered_keys]
+    else:
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(fetch, key) for key in ordered_keys]
+            for future in as_completed(futures):
+                results.append(future.result())
+                if len(results) % progress_step == 0 or len(results) == len(ordered_keys):
+                    print(
+                        f"  ...fetched {len(results)}/{len(ordered_keys)} "
+                        "GET_FULL_ORDER payload(s)."
+                    )
+
+    for cache_key, value, message in results:
+        cache[cache_key] = value
+        if message:
+            messages[cache_key] = message
+
+    # Replay warnings in call order, not completion order, so the log stays
+    # deterministic between runs.
+    for cache_key in ordered_keys:
+        if cache_key in messages:
+            print(messages[cache_key])
+
+    return cache
+
+
 def enrich_dataframe_with_full_order_data(
     df,
     *,
@@ -690,7 +876,10 @@ def enrich_dataframe_with_full_order_data(
     # That meant GET_FULL_ORDER data was never fetched once the API client
     # *was* configured -- the root cause of tickets with multiple
     # shipment_order_number values only ever getting one invoice attached.
-    cache: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+    # Every GET_FULL_ORDER call the loop below needs, issued concurrently.
+    # The loop then only reads the cache, so its order of writes into df and
+    # its per-row logic are exactly as before.
+    cache = _prefetch_full_order_payloads(df, lookup_indices, api_client=api_client)
 
     for index in lookup_indices:
 
@@ -698,28 +887,9 @@ def enrich_dataframe_with_full_order_data(
         # resolved from the tracking number keep the historic "exact" mode;
         # rows resolved from an order reference read the tracking-matched block
         # or every shipment. See order_reference_resolver for the modes.
-        selection_mode = str(
-            df.at[index, "shipment_selection_mode"]
-            if "shipment_selection_mode" in df.columns
-            else ""
-        ).strip().lower() or SHIPMENT_SELECTION_EXACT
-        row_tracking_numbers = tuple(
-            split_tracking_numbers(
-                df.at[index, "extracted_tracking_number"]
-                if "extracted_tracking_number" in df.columns
-                else ""
-            )
+        shipment_orders, selection_mode, row_tracking_numbers = _full_order_lookup_plan(
+            df, index
         )
-
-        shipment_orders = [
-            x.strip()
-            for x in str(
-                df.at[index, "shipment_order_number"]
-                if "shipment_order_number" in df.columns
-                else ""
-            ).split(";")
-            if x.strip()
-        ]
 
         if not shipment_orders:
             df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = (
@@ -737,18 +907,16 @@ def enrich_dataframe_with_full_order_data(
             # on its own even when the row's mode is "all"/"by_tracking"
             # because of another reference on the same ticket. An order-shaped
             # reference (DG-EU-01663254) keeps the row's mode.
-            effective_mode = (
-                SHIPMENT_SELECTION_EXACT
-                if is_shipment_shaped_order_reference(shipment_order_number)
-                else selection_mode
+            effective_mode = _full_order_effective_mode(
+                shipment_order_number, selection_mode
             )
 
-            cache_key = (
-                shipment_order_number.upper(),
-                effective_mode,
-                row_tracking_numbers if effective_mode == SHIPMENT_SELECTION_BY_TRACKING else (),
+            cache_key = _full_order_cache_key(
+                shipment_order_number, effective_mode, row_tracking_numbers
             )
 
+            # The prefetch fills every key this loop asks for, so this branch
+            # is a safety net rather than the normal path.
             if cache_key not in cache:
                 try:
                     cache[cache_key] = fetch_shipment_order_data(
