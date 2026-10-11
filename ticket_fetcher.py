@@ -263,6 +263,8 @@ ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
 DEFAULT_ZENDESK_MAX_RETRIES = 5
 MAX_TICKETS_PER_RUN_ENV = "MAX_TICKETS_PER_RUN"
 DEFAULT_MAX_TICKETS_PER_RUN = 200
+SKIP_PDF_SCAN_FOR_NO_REPLY_ENV = "SKIP_PDF_SCAN_FOR_NO_REPLY_REQUESTS"
+DEFAULT_SKIP_PDF_SCAN_FOR_NO_REPLY = True
 TICKET_OVERFETCH_MULTIPLIER_ENV = "TICKET_OVERFETCH_MULTIPLIER"
 # Comments are fetched for MAX_TICKETS_PER_RUN * this many tickets. It has to
 # exceed 1: whether a request is already completed is only knowable after its
@@ -3808,6 +3810,29 @@ def order_references_from_ticket_pdfs(
     return find_order_references_in_pdfs(blobs, log=log)
 
 
+def request_needs_no_reply(row: Mapping[str, Any]) -> bool:
+    """True when regex_engine.py will exclude this request without answering.
+
+    Only the two text-only exclusions are replicated here, both from
+    customs_rules.py so there is a single definition of each:
+
+    * a noreply*/autoreply* sender on request number 1, submitted as solved
+      without analysis;
+    * a carrier status notification carrying no customer request.
+
+    is_acknowledgement_only() is deliberately NOT used: regex_engine applies it
+    only when no real request type also matched, and a message that both thanks
+    and asks is answered normally. Replicating that gate would mean duplicating
+    the whole classifier here, and the two copies would drift.
+    """
+
+    if is_noreply_autoreply_first_request(
+        row.get("requester_email"), row.get("request_number", 1)
+    ):
+        return True
+    return bool(is_no_action_carrier_notification(row.get("request_body")))
+
+
 def _order_reference_pdf_scan_workers(ticket_count: int) -> int:
     if ticket_count <= 0:
         return 0
@@ -3949,10 +3974,22 @@ def apply_order_reference_fallback(
     # order AND the ticket text carried no reference. Both are pure functions
     # of the row, so hoisting the work out of the loop cannot change results.
     pdf_reference_cache: dict[int, list[str]] = {}
+    skip_no_reply = _env_bool(
+        SKIP_PDF_SCAN_FOR_NO_REPLY_ENV,
+        DEFAULT_SKIP_PDF_SCAN_FOR_NO_REPLY,
+    )
+    skipped_no_reply_tickets: set[int] = set()
     if session is not None:
         pending_ticket_ids: list[int] = []
         seen_ticket_ids: set[int] = set()
         for _, row in df.iterrows():
+            # Downloading and OCR-ing attachments to find an order for a
+            # request that will be excluded without a reply is wasted work.
+            if skip_no_reply and request_needs_no_reply(row):
+                skipped_ticket_id = _to_int(row.get("zendesk_ticket_id"))
+                if skipped_ticket_id is not None:
+                    skipped_no_reply_tickets.add(skipped_ticket_id)
+                continue
             # Mirrors the loop exactly, including its rejection of a stored
             # order that is not a real reference: such a row is re-resolved
             # there, so it must be scanned here too.
@@ -3966,6 +4003,19 @@ def apply_order_reference_fallback(
                 continue
             seen_ticket_ids.add(ticket_id)
             pending_ticket_ids.append(ticket_id)
+
+        # A ticket is only really spared if none of its other requests needs a
+        # scan: the scan is per ticket, not per request.
+        spared = skipped_no_reply_tickets - set(pending_ticket_ids)
+        if spared:
+            print(
+                f"Skipping the PDF scan for {len(spared)} ticket(s) whose "
+                "request needs no reply (noreply/autoreply first request, or a "
+                "carrier notification). NOTE: a blocked order prefix inside "
+                "those attachments is therefore not detected, so such a ticket "
+                "is solved rather than left untouched. Set "
+                f"{SKIP_PDF_SCAN_FOR_NO_REPLY_ENV}=false to scan them anyway."
+            )
 
         pdf_reference_cache = _prefetch_pdf_order_references(
             pending_ticket_ids,
@@ -4054,7 +4104,11 @@ def apply_order_reference_fallback(
                 if references:
                     source = ORDER_REFERENCE_SOURCE_TEXT
 
-                if not references and session is not None:
+                if (
+                    not references
+                    and session is not None
+                    and not (skip_no_reply and request_needs_no_reply(row))
+                ):
                     ticket_id = _to_int(row.get("zendesk_ticket_id"))
                     if ticket_id is not None:
                         if ticket_id not in pdf_reference_cache:
