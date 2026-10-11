@@ -424,8 +424,8 @@ def contains_blocked_order_reference(*values: object) -> bool:
 # PDF attachments
 # ---------------------------------------------------------------------------
 
+# 300 dpi, one pass per PDF, matching ticket_order_numbers.py.
 PDF_OCR_DPI = int(os.getenv("ORDER_REFERENCE_PDF_OCR_DPI", "300") or "300")
-PDF_OCR_RETRY_DPI = int(os.getenv("ORDER_REFERENCE_PDF_OCR_RETRY_DPI", "400") or "400")
 # Hard ceiling on the rendered size of a single page, in pixels.
 #
 # A4 at 300 dpi is ~8.7M pixels, so this allows roughly A2. Carrier scans
@@ -489,22 +489,16 @@ def _pdf_text(pdf_bytes: bytes, dpi: int) -> tuple[str, str]:
 
 
 def find_order_references_in_pdf_bytes(pdf_bytes: bytes) -> tuple[list[str], str]:
-    """Extract order references from one PDF, retrying OCR at higher resolution.
+    """Extract order references from one PDF in a single pass.
 
-    A render that hit PDF_OCR_MAX_PIXELS is not retried: the clamp binds at the
-    retry DPI too, so the second pass would rasterize the same image and OCR it
-    again for nothing. Before the clamp existed that retry did worse than
-    nothing on these pages -- at 400 dpi an A0 scan exceeds Pillow's
-    decompression-bomb *error* threshold, so the retry raised and the whole
-    attachment was reported unreadable.
+    Text layer first, else one OCR pass at PDF_OCR_DPI. There is deliberately
+    no higher-resolution retry: it re-rendered and re-OCR'd every page of the
+    document from scratch, so the attachments that found nothing -- the common
+    case -- paid roughly double for it.
     """
 
     text, method = _pdf_text(pdf_bytes, PDF_OCR_DPI)
-    references = find_order_references(text)
-    if not references and method == "ocr":
-        text, _ = _pdf_text(pdf_bytes, PDF_OCR_RETRY_DPI)
-        references = find_order_references(text)
-    return references, method
+    return find_order_references(text), method
 
 
 def find_order_references_in_pdfs(
