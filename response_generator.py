@@ -27,6 +27,7 @@ from response_data_extractor import (
     INVOICE_DOCUMENT_DATA_KEYS,
     GetFullOrderClient,
     document_path_exists,
+    document_generation_already_failed,
     document_value_for_response,
     fetch_shipment_order_data,
     generate_authorization_letter,
@@ -558,6 +559,13 @@ def generated_document_value(row, data_key):
             "WARNING: Stored generated document path is not a local file; "
             f"regenerating {data_key} for request_id={row.get('request_id')}: {text_path}"
         )
+
+    # Both earlier pipeline steps already tried to build this document and
+    # recorded why it failed. Calling the API a third time to get the same
+    # error helps nobody: the row is already headed for human review with that
+    # reason attached.
+    if document_generation_already_failed(row, data_key):
+        return PLACEHOLDER
 
     try:
         if data_key == "authorization_letter":
