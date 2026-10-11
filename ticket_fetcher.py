@@ -3395,6 +3395,13 @@ def fetch_ticket_rows(
         ]
     else:
         comment_results = []
+        # This used to run once per search page, so the per-page "Matched ..."
+        # lines doubled as progress. Fetching every ticket in one pool is one
+        # silent multi-minute block without a counter, and this is the stage
+        # that sleeps on Zendesk rate limits -- exactly when you need to see
+        # that the run is still moving.
+        total_to_fetch = len(selected_tickets)
+        progress_step = max(1, total_to_fetch // 10)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(
@@ -3405,8 +3412,15 @@ def fetch_ticket_rows(
                 )
                 for ticket in selected_tickets
             ]
+            print(
+                f"Fetching comments for {total_to_fetch} ticket(s) "
+                f"with {workers} worker(s)."
+            )
             for future in as_completed(futures):
                 comment_results.append(future.result())
+                done = len(comment_results)
+                if done % progress_step == 0 or done == total_to_fetch:
+                    print(f"  ...fetched comments for {done}/{total_to_fetch} ticket(s).")
 
     for result in comment_results:
         if result.get("error"):
