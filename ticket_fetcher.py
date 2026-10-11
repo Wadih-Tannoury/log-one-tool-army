@@ -262,7 +262,7 @@ DEFAULT_ZENDESK_COMMENT_FETCH_WORKERS = 20
 ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
 DEFAULT_ZENDESK_MAX_RETRIES = 5
 MAX_TICKETS_PER_RUN_ENV = "MAX_TICKETS_PER_RUN"
-DEFAULT_MAX_TICKETS_PER_RUN = 50
+DEFAULT_MAX_TICKETS_PER_RUN = 200
 SKIP_PDF_SCAN_FOR_NO_REPLY_ENV = "SKIP_PDF_SCAN_FOR_NO_REPLY_REQUESTS"
 DEFAULT_SKIP_PDF_SCAN_FOR_NO_REPLY = True
 TICKET_OVERFETCH_MULTIPLIER_ENV = "TICKET_OVERFETCH_MULTIPLIER"
@@ -2281,14 +2281,16 @@ def submit_final_responses(
     for row in raw_rows:
         requester_email = row.get("requester_email")
 
-        # RC-US / RC-EU / LN-EU / LN-US orders are never processed: no reply,
-        # no solve, and no group re-assignment either. The ticket is left
-        # exactly as it is. Checked before every other rule.
+        # RC-US / RC-EU / LN-EU / LN-US orders are never answered and never
+        # solved automatically, but the ticket must not be dropped: like every
+        # other request the workflow cannot serve, it is handed to the
+        # second-level logistics group. Checked before every other rule.
         if _to_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
             row.get("shipment_order_number"),
             row.get("extracted_order_reference"),
         ):
             blocked_rows.append(row)
+            unhandled_rows.append(row)
             continue
 
         # Request number 1 from a noreply*/autoreply* sender: solved with no
@@ -2383,13 +2385,14 @@ def submit_final_responses(
     if outcomes is None:
         outcomes = {}
 
-    for row in blocked_rows:
-        outcomes[_outcome_key(row)] = SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX
-
+    # No outcome is forced for blocked rows any more: they go through the
+    # escalation path below like any other unserved request, which records
+    # SUBMISSION_STATUS_ASSIGNED_TO_GROUP once the group assignment lands.
     if blocked_rows:
         print(
-            f"Left {len(blocked_rows)} request(s) untouched: the order prefix is "
-            f"one of {', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}."
+            f"{len(blocked_rows)} request(s) on a blocked order prefix "
+            f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}): no reply, no "
+            f"solve, assigned to {ZENDESK_ESCALATION_GROUP_NAME!r}."
         )
 
     if not response_rows and not solve_without_response_rows:
@@ -3589,29 +3592,98 @@ def enrich_with_shipment_numbers(
     shipment_map = {}
 
     if tracking_numbers:
+        # shipment_order_number holds two different shapes: the ORDER number
+        # (CV-US-00041347, dash in position 6) and the SHIPMENT number
+        # (CV-USA00041347, a letter there). Looking a tracking number up can
+        # land on either. Joining on the literal value therefore missed every
+        # shipment of the order whenever the matched row carried the order
+        # shape -- the "tracking number not found" case that is really "found,
+        # but its siblings were not".
+        #
+        # Dropping character 6 collapses both shapes to one key, which is the
+        # single-character wildcard in `shipment_order_number LIKE
+        # 'CV-US%00041347'`, so every shipment of the order is returned: A, B,
+        # C and the order row itself. Rows without a tracking number carry no
+        # shipment to report, and deleted rows must never be considered.
         shipment_query = """
-        WITH matched AS (
+        WITH live AS (
 
-            SELECT DISTINCT
+            SELECT
                 shipment_order_number,
-                tracking_number
+                tracking_number,
+                is_return,
+                carrier_code,
+                -- NULL for a blank order number, never '' : the table holds
+                -- rows with no shipment_order_number, and an equality join on
+                -- a blank key matches every one of them to every other. That
+                -- is how a ticket ends up reporting an export tracking number
+                -- belonging to a completely unrelated shipment. A NULL key
+                -- joins to nothing, and those rows fall back to the
+                -- tracking-number match below.
+                IF(
+                    shipment_order_number IS NULL
+                    OR TRIM(shipment_order_number) = '',
+                    NULL,
+                    IF(
+                        LENGTH(TRIM(shipment_order_number)) >= 7,
+                        CONCAT(
+                            SUBSTR(TRIM(shipment_order_number), 1, 5),
+                            SUBSTR(TRIM(shipment_order_number), 7)
+                        ),
+                        TRIM(shipment_order_number)
+                    )
+                ) AS order_key
 
             FROM `tlg-business-intelligence-prd.bi.shipping_platform_shipments`
+
+            WHERE is_deleted = false
+        ),
+
+        matched AS (
+
+            SELECT DISTINCT
+                tracking_number AS source_tracking_number,
+                order_key
+
+            FROM live
 
             WHERE tracking_number IN UNNEST(@tracking_numbers)
         )
 
+        -- Rows whose order number is known: every shipment of that order.
         SELECT
-            matched.tracking_number AS source_tracking_number,
-            matched.shipment_order_number,
+            matched.source_tracking_number,
+            s.shipment_order_number,
             s.tracking_number,
             s.is_return,
             s.carrier_code
 
         FROM matched
 
-        JOIN `tlg-business-intelligence-prd.bi.shipping_platform_shipments` s
-          ON matched.shipment_order_number = s.shipment_order_number
+        JOIN live s
+          ON matched.order_key = s.order_key
+
+        WHERE matched.order_key IS NOT NULL
+          AND s.tracking_number IS NOT NULL
+
+        UNION DISTINCT
+
+        -- Rows with no order number: only the matched row itself. Nothing
+        -- ties it to any other shipment, so nothing else may be reported.
+        SELECT
+            matched.source_tracking_number,
+            s.shipment_order_number,
+            s.tracking_number,
+            s.is_return,
+            s.carrier_code
+
+        FROM matched
+
+        JOIN live s
+          ON matched.source_tracking_number = s.tracking_number
+
+        WHERE matched.order_key IS NULL
+          AND s.tracking_number IS NOT NULL
         """
 
         shipment_df = (
@@ -3630,30 +3702,66 @@ def enrich_with_shipment_numbers(
             .to_dataframe(create_bqstorage_client=BQ_STORAGE)
         )
 
+        def _joined(values: list[Any]) -> str | None:
+            """De-duplicate, preserve order, join the way the pipeline does."""
+
+            seen: list[str] = []
+            for value in values:
+                text = _to_str(value)
+                if text is None:
+                    continue
+                text = text.strip()
+                if text and text not in seen:
+                    seen.append(text)
+            return ";".join(seen) if seen else None
+
         for tracking in shipment_df["source_tracking_number"].unique():
             subset = shipment_df[shipment_df["source_tracking_number"] == tracking]
-            shipment_order_number = subset.iloc[0]["shipment_order_number"]
 
-            shipment_tracking = None
-            return_tracking = None
-            shipment_carrier_code = None
-            return_carrier_code = None
+            # One order can have several shipments (CV-USA…, CV-USB…). All of
+            # them are reported; the previous code kept only whichever row the
+            # scan happened to end on. Shipment-shaped values are preferred
+            # over the order-shaped row, which names no single shipment.
+            order_numbers = [
+                value
+                for value in subset["shipment_order_number"].tolist()
+                if _to_str(value)
+            ]
+            shipment_shaped = [
+                value
+                for value in order_numbers
+                if is_shipment_shaped_order_reference(_to_str(value))
+            ]
+
+            shipment_trackings: list[Any] = []
+            return_trackings: list[Any] = []
+            shipment_carriers: list[Any] = []
+            return_carriers: list[Any] = []
 
             for _, row in subset.iterrows():
-                is_return = bool(row["is_return"])
-                if is_return:
-                    return_tracking = row["tracking_number"]
-                    return_carrier_code = row.get("carrier_code")
+                if bool(row["is_return"]):
+                    return_trackings.append(row["tracking_number"])
+                    return_carriers.append(row.get("carrier_code"))
                 else:
-                    shipment_tracking = row["tracking_number"]
-                    shipment_carrier_code = row.get("carrier_code")
+                    shipment_trackings.append(row["tracking_number"])
+                    shipment_carriers.append(row.get("carrier_code"))
+
+            # A single carrier_code is reported when every row agrees. If the
+            # shipments disagree there is no one answer, and leaving it unset
+            # makes return_export_carriers_match() treat the legs as being on
+            # different carriers, which is the safe reading.
+            def _single(values: list[Any]) -> Any:
+                joined = _joined(values)
+                if joined is None or ";" in joined:
+                    return None
+                return joined
 
             shipment_map[tracking] = {
-                "shipment_order_number": shipment_order_number,
-                "shipment_tracking_number": shipment_tracking,
-                "return_tracking_number": return_tracking,
-                "shipment_carrier_code": shipment_carrier_code,
-                "return_carrier_code": return_carrier_code,
+                "shipment_order_number": _joined(shipment_shaped or order_numbers),
+                "shipment_tracking_number": _joined(shipment_trackings),
+                "return_tracking_number": _joined(return_trackings),
+                "shipment_carrier_code": _single(shipment_carriers),
+                "return_carrier_code": _single(return_carriers),
             }
 
     df = df.copy()
