@@ -664,6 +664,20 @@ def return_export_carriers_are_same(row):
     return export_carrier == return_carrier
 
 
+def return_export_carriers_match(row) -> bool:
+    """Two-state answer to "was the return shipped by the export carrier?".
+
+    An undetermined comparison resolves to False, i.e. assume two different
+    carriers. Undetermined means the order or one of the carrier_code values
+    was not found in shipping_platform_shipments, and in that situation the
+    return was almost always booked with a different provider -- which is the
+    reply the different-carrier builders already produce. Escalating instead
+    left these tickets unanswered for no gain.
+    """
+
+    return return_export_carriers_are_same(row) is True
+
+
 def shipment_order_number_starts_with_sc(row):
     for column in ("shipment_order_number", "shipmentOrderNumber"):
         value = row.get(column)
@@ -820,11 +834,11 @@ def is_blocked_order_prefix_row(row):
 
 
 def build_blocked_order_prefix_note(row):
-    """Internal note explaining why the ticket was deliberately left untouched.
+    """Internal note explaining why no automatic answer was sent.
 
     This is never posted to Zendesk: build_final_response() returns an empty
-    string for these rows and submit_final_responses() performs no ticket
-    update at all -- not a reply, not a solve, not even a group re-assignment.
+    string for these rows. The ticket is still handed to the second-level
+    logistics group, like every other request the workflow cannot serve.
     """
 
     order_number = first_available_value(
@@ -833,11 +847,12 @@ def build_blocked_order_prefix_note(row):
         default="(unknown)",
     )
     return (
-        "NO ACTION TAKEN\n\n"
+        "NOT PROCESSED AUTOMATICALLY\n\n"
         f"Order {order_number} is on a blocked prefix "
         f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}).\n"
-        "By policy these requests are not processed: no reply was sent, the "
-        "ticket was not solved, and it was not re-assigned to another group.\n"
+        "By policy these requests are not answered automatically: no reply "
+        "was sent and the ticket was not solved. It has been assigned to the "
+        "second-level logistics group for manual handling.\n"
         f"Ticket: {row.get('zendesk_ticket_id', '')}\n"
         f"Request number: {row.get('request_number', '')}"
     )
@@ -2001,18 +2016,9 @@ def build_ups_returns_different_carrier_response(row):
 
 
 def build_ups_returns_first_rpi_account_response(row):
-    carrier_match = return_export_carriers_are_same(row)
-
-    if carrier_match is True:
+    if return_export_carriers_match(row):
         return build_ups_returns_same_carrier_response(row)
-
-    if carrier_match is False:
-        return build_ups_returns_different_carrier_response(row)
-
-    return build_human_intervention_note(
-        row,
-        "Carrier-code comparison between export and return shipments could not be determined.",
-    )
+    return build_ups_returns_different_carrier_response(row)
 
 
 def build_fedex_returns_same_carrier_response(row):
@@ -2061,21 +2067,14 @@ def build_fedex_dhl_returns_different_carrier_response(row):
 
 
 def build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="fedex"):
-    carrier_match = return_export_carriers_are_same(row)
     carrier = str(carrier or "fedex").strip().lower()
 
-    if carrier_match is True:
+    if return_export_carriers_match(row):
         if carrier == "dhl":
             return build_dhl_returns_same_carrier_response(row)
         return build_fedex_returns_same_carrier_response(row)
 
-    if carrier_match is False:
-        return build_fedex_dhl_returns_different_carrier_response(row)
-
-    return build_human_intervention_note(
-        row,
-        "Carrier-code comparison between export and return shipments could not be determined.",
-    )
+    return build_fedex_dhl_returns_different_carrier_response(row)
 
 
 def build_dhl_returns_first_rpi_response(row):
@@ -2252,14 +2251,9 @@ def should_force_human_intervention(row, requested_data):
     if first_returns_request and is_dhl_requester_email(row.get("requester_email")):
         returns_reply_needs_carrier_decision = "return_proforma_invoice" in requested_set
 
-    if returns_reply_needs_carrier_decision and return_export_carriers_are_same(row) is None:
-        return (
-            True,
-            "Carrier-code comparison between the export and return rows in "
-            "tlg-business-intelligence-prd.bi.shipping_platform_shipments could "
-            "not be determined. Human intervention is required instead of "
-            "drafting multiple alternatives.",
-        )
+    # An undetermined carrier comparison is no longer an escalation: the
+    # builders assume two different carriers (see return_export_carriers_match)
+    # and answer with the different-carrier reply.
 
     if (
         as_bool(row.get("human_intervention_required"))
