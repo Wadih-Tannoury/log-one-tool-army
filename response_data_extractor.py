@@ -2315,6 +2315,509 @@ def extract_shipment_order_data(
     return combined
 
 
+# ============================================================================
+# GET_FULL_ORDER 404 FALLBACK -- the `tlg-wlfs-prd`.til event tables
+# ============================================================================
+#
+# GET_FULL_ORDER answers 404 for orders it does not carry (archived, or never
+# registered on the return platform), and the ticket then goes to human review
+# as "no invoice found" / "no tracking number" even though both exist.
+#
+# They exist in the TIL event tables, written by NAV as the order moved:
+#
+# 1. **Invoice / RPI -- til.prd_invoiceUpdate, eventType FATV_RESULT.** The
+#    requestPayload carries the very same DocOpen.aspx link GET_FULL_ORDER
+#    would have exposed under erpDocuments.invoiceDocuments:
+#
+#      {"eventType": "FATV_RESULT",
+#       "data": {"fatvResult": {"invoiceNumber": "INV-26115916",
+#                               "shipmentOrderNumber": "HB-EU-00117943",
+#                               "invoiceLink": "http://azureftp...DocOpen.aspx?link=..."}}}
+#
+# 2. **Tracking -- til.prd_shipmentStatus, eventType PACKED / SHIPPED.** Each
+#    data.shippingData[] entry carries a trackingNumber, a carrierCode and a
+#    shipType: SHIPPING is the outbound (export) leg, RETURN is the return leg.
+#
+# Both halves only have to produce values for the existing full_order_*
+# columns; everything downstream is untouched. The invoice link is resolved and
+# downloaded by the same download_invoice_pdf() path as a GET_FULL_ORDER link,
+# and the tracking numbers feed the same rules (UPS account code, LOA/POA,
+# same-carrier vs different-carrier reply) as the ones read out of a shipment
+# block.
+#
+# These tables live in the TIL GCP project, which the BI service account cannot
+# read -- hence the separate TIL_BIGQUERY_CREDS secret, the same one
+# ticket_fetcher.til_bigquery_client() uses for its prd_shipmentStatus order
+# lookup. A missing or unusable secret only disables the fallback: the 404 is
+# then re-raised and the row behaves exactly as it does today.
+
+TIL_PROJECT_ID = os.getenv("TIL_PROJECT_ID", "tlg-wlfs-prd")
+TIL_BIGQUERY_CREDS_ENV = "TIL_BIGQUERY_CREDS"
+INVOICE_UPDATE_TABLE = os.getenv(
+    "TIL_INVOICE_UPDATE_TABLE",
+    "`tlg-wlfs-prd`.til.prd_invoiceUpdate",
+)
+INVOICE_UPDATE_EVENT_TYPE = "FATV_RESULT"
+
+# Internal/audit column: which source produced the invoice link on this row.
+# Never shown to the customer; absent on rows served by GET_FULL_ORDER.
+INVOICE_LINK_SOURCE_COLUMN = "full_order_invoice_link_source"
+INVOICE_LINK_SOURCE_INVOICE_UPDATE = "prd_invoiceUpdate.FATV_RESULT"
+
+SHIPMENT_STATUS_TABLE = os.getenv(
+    "TIL_SHIPMENT_STATUS_TABLE",
+    "`tlg-wlfs-prd`.til.prd_shipmentStatus",
+)
+# The only two event types that carry shippingData, i.e. tracking numbers.
+SHIPMENT_STATUS_EVENT_TYPES = ("PACKED", "SHIPPED")
+EXPORT_TRACKING_SOURCE_SHIPMENT_STATUS = "shipment_status_events"
+
+# Only the FATV_RESULT events of the wanted order, newest first. The envelope's
+# top-level "success" is deliberately not filtered on: it reports the state of
+# the whole NAV event, and a payload carrying a usable invoiceLink is routinely
+# flagged false. SAFE_CAST keeps one malformed eventTimestamp from failing the
+# whole query -- such a row simply sorts last. The shipmentOrderNumber is
+# matched by regex rather than equality so that an order-shaped reference picks
+# up every shipment of the order; see til_event_search_patterns().
+INVOICE_UPDATE_QUERY = f"""
+SELECT
+    UPPER(TRIM(IFNULL(i.shipmentOrderNumber, '')))                  AS shipment_order_number,
+    JSON_VALUE(i.requestPayload, '$.data.fatvResult.invoiceNumber') AS invoice_number,
+    JSON_VALUE(i.requestPayload, '$.data.fatvResult.invoiceLink')   AS invoice_link,
+    JSON_VALUE(i.requestPayload, '$.data.fatvResult.fileName')      AS file_name,
+    SAFE_CAST(
+        JSON_VALUE(i.requestPayload, '$.eventTimestamp') AS TIMESTAMP
+    ) AS event_timestamp
+
+FROM {INVOICE_UPDATE_TABLE} AS i
+
+WHERE i.eventType IN UNNEST(@event_types)
+  AND EXISTS (
+      SELECT 1
+      FROM UNNEST(@shipment_order_patterns) AS pattern
+      WHERE REGEXP_CONTAINS(UPPER(TRIM(IFNULL(i.shipmentOrderNumber, ''))), pattern)
+  )
+  AND TRIM(
+      IFNULL(JSON_VALUE(i.requestPayload, '$.data.fatvResult.invoiceLink'), '')
+  ) != ''
+
+ORDER BY event_timestamp DESC
+"""
+
+# One row per shippingData entry of the order's PACKED/SHIPPED events, newest
+# first. shipType is what separates the two legs: SHIPPING is the outbound
+# (export) label, RETURN is the return label.
+SHIPMENT_STATUS_TRACKING_QUERY = f"""
+SELECT
+    UPPER(TRIM(IFNULL(
+        JSON_VALUE(s.requestPayload, '$.data.shipmentOrderNumber'), ''
+    )))                                                         AS shipment_order_number,
+    UPPER(TRIM(IFNULL(JSON_VALUE(ship, '$.shipType'), '')))     AS ship_type,
+    JSON_VALUE(ship, '$.trackingNumber')                        AS tracking_number,
+    JSON_VALUE(ship, '$.carrierCode')                           AS carrier_code,
+    SAFE_CAST(
+        JSON_VALUE(s.requestPayload, '$.eventTimestamp') AS TIMESTAMP
+    ) AS event_timestamp
+
+FROM {SHIPMENT_STATUS_TABLE} AS s,
+     UNNEST(JSON_EXTRACT_ARRAY(s.requestPayload, '$.data.shippingData')) AS ship
+
+WHERE s.eventType IN UNNEST(@event_types)
+  AND EXISTS (
+      SELECT 1
+      FROM UNNEST(@shipment_order_patterns) AS pattern
+      WHERE REGEXP_CONTAINS(
+          UPPER(TRIM(IFNULL(
+              JSON_VALUE(s.requestPayload, '$.data.shipmentOrderNumber'), ''
+          ))),
+          pattern
+      )
+  )
+  AND TRIM(IFNULL(JSON_VALUE(ship, '$.trackingNumber'), '')) != ''
+
+ORDER BY event_timestamp DESC
+"""
+
+_til_client_lock = threading.Lock()
+_til_client_state: dict[str, Any] = {}
+_invoice_update_lock = threading.Lock()
+_invoice_update_cache: dict[str, dict[str, str]] = {}
+_shipment_status_lock = threading.Lock()
+_shipment_status_cache: dict[str, dict[str, Any]] = {}
+
+
+def _til_bigquery_client():
+    """The tlg-wlfs-prd BigQuery client, built once per process.
+
+    Returns ``(None, None)`` when TIL_BIGQUERY_CREDS is absent or unusable
+    instead of raising: this is a fallback for rows that are already failing,
+    so it must never turn a 404 into a crashed run. The failure is reported
+    once, not once per order, because the prefetch calls this from several
+    threads at a time.
+    """
+
+    with _til_client_lock:
+        if "client" in _til_client_state:
+            return _til_client_state["client"], _til_client_state["bigquery"]
+
+        client = None
+        bigquery_module = None
+        raw = (os.getenv(TIL_BIGQUERY_CREDS_ENV) or "").strip()
+
+        if not raw:
+            print(
+                f"{TIL_BIGQUERY_CREDS_ENV} is not set; the TIL event "
+                "fallback for GET_FULL_ORDER 404s will be skipped."
+            )
+        else:
+            try:
+                from google.cloud import bigquery as bigquery_module
+                from google.oauth2 import service_account
+
+                til_credentials = json.loads(raw)
+                credentials = service_account.Credentials.from_service_account_info(
+                    til_credentials
+                )
+                # project_id comes from the key itself, so a key issued for a
+                # different project keeps working without a code change.
+                client = bigquery_module.Client(
+                    project=til_credentials.get("project_id") or TIL_PROJECT_ID,
+                    credentials=credentials,
+                )
+            except Exception as error:  # noqa: BLE001 - see the docstring
+                print(
+                    f"Could not build the TIL BigQuery client from "
+                    f"{TIL_BIGQUERY_CREDS_ENV}: {error}. The TIL event "
+                    "fallback for GET_FULL_ORDER 404s will be skipped."
+                )
+                client = None
+                bigquery_module = None
+
+        _til_client_state["client"] = client
+        _til_client_state["bigquery"] = bigquery_module
+        return client, bigquery_module
+
+
+def til_event_search_patterns(shipment_order_number: object) -> list[str]:
+    """Anchored BigQuery regexes for the shipmentOrderNumber of the TIL events.
+
+    Two cases, because what the workflow knows about the ticket differs:
+
+    - **A shipment is named** (``HB-EUA00117943``). Only that shipment's events
+      are wanted. Both shapes are matched exactly, because NAV files the event
+      under the order-shaped reference (``HB-EU-00117943``) even though the
+      field is called shipmentOrderNumber, while the ticket may carry the
+      shipment-shaped one.
+    - **Only the order is known** (``HB-EU-00117943``, the order-shaped
+      reference the GET_FULL_ORDER URL uses). The exact shipment is unknown, so
+      *every* shipment of that order is wanted: the 6th character -- the one
+      that distinguishes ``HB-EUA…``, ``HB-EUB…``, ``HB-EU-…`` -- is matched by
+      a single ``.``. This is the same "read all the blocks" rule
+      ``SHIPMENT_SELECTION_ALL`` applies to a GET_FULL_ORDER payload, which the
+      404 denied us.
+    """
+
+    value = _normalize_shipment_order_number(shipment_order_number)
+    if not value:
+        return []
+
+    if is_shipment_shaped_order_reference(value):
+        keys: list[str] = []
+        for candidate in (
+            value,
+            shipment_order_number_for_shipment_block_lookup(value),
+            *order_number_candidates_from_shipment_order_number(value),
+        ):
+            key = str(candidate or "").strip().upper()
+            if key and key not in keys:
+                keys.append(key)
+        return [f"^{re.escape(key)}$" for key in keys]
+
+    order_number = order_number_from_shipment_order_number(value) or value
+    if _looks_like_brand_prefixed_shipment_order(order_number) and len(order_number) >= 6:
+        # XX-EU-01234567 -> ^XX\-EU.01234567$, which also matches XX-EUA…,
+        # XX-EUB…, XX-EUF… -- i.e. every shipment of the order.
+        return [f"^{re.escape(order_number[:5])}.{re.escape(order_number[6:])}$"]
+
+    return [f"^{re.escape(order_number)}$"]
+
+
+def _til_pattern_parameters(bigquery, patterns: list[str], event_types: list[str]):
+    return [
+        bigquery.ArrayQueryParameter("event_types", "STRING", event_types),
+        bigquery.ArrayQueryParameter("shipment_order_patterns", "STRING", patterns),
+    ]
+
+
+def _invoice_data_key_from_fatv_result(
+    invoice_number: object,
+    file_name: object,
+    invoice_link: object,
+) -> str:
+    """Which document the FATV result holds: an RPI or a commercial invoice.
+
+    NAV names both the document and its file after the type -- RPI-26000123 /
+    RPI_HB-EU-00117943_... against INV-26115916 / INV_HB-EU-00117943_... -- so
+    the prefix is what distinguishes them, exactly as documentType does inside
+    a GET_FULL_ORDER invoiceDocuments entry. Anything unrecognized is treated
+    as a commercial invoice, which is what NAV issues by default.
+    """
+
+    for value in (invoice_number, file_name, invoice_link):
+        text = str(value or "").strip().upper()
+        if not text:
+            continue
+        if re.search(r"\b(?:RPI|PRI)[-_]", text):
+            return "return_proforma_invoice"
+        if re.search(r"\bINV[-_]", text):
+            return "commercial_invoice"
+
+    return "commercial_invoice"
+
+
+def _is_downloadable_invoice_link(value: object) -> bool:
+    """Whether a FATV invoiceLink is something the downloader can fetch.
+
+    An order routinely has several FATV_RESULT rows -- retries, reissues, one
+    per shipment -- and only the ones carrying a real URL are usable; anything
+    else (a bare file name, a UNC share path, an empty string) is skipped
+    rather than written into the response as a broken link.
+    """
+
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def invoice_links_from_invoice_update(
+    shipment_order_number: object,
+) -> dict[str, str]:
+    """Map invoice data key -> ";"-joined link(s), from the FATV_RESULT events.
+
+    Returns ``{}`` whenever the fallback cannot answer -- no credentials, no
+    matching event, no usable link, or a failed query -- so the caller can
+    re-raise the original 404.
+
+    Several rows are the normal case. Within one shipment the newest usable
+    row per document type wins, so a reissued invoice answers with the current
+    document. Across shipments (the order-only case) every distinct shipment
+    contributes its own invoice and the links are semicolon-joined, the same
+    separator ``_combine_shipment_results`` and the downloader already use.
+    """
+
+    patterns = til_event_search_patterns(shipment_order_number)
+    if not patterns:
+        return {}
+
+    cache_key = "|".join(patterns)
+    with _invoice_update_lock:
+        if cache_key in _invoice_update_cache:
+            return dict(_invoice_update_cache[cache_key])
+
+    client, bigquery = _til_bigquery_client()
+    if client is None or bigquery is None:
+        return {}
+
+    try:
+        rows = client.query(
+            INVOICE_UPDATE_QUERY,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=_til_pattern_parameters(
+                    bigquery, patterns, [INVOICE_UPDATE_EVENT_TYPE]
+                )
+            ),
+        ).result()
+    except Exception as error:  # noqa: BLE001 - a failed fallback must leave
+        # the original 404 in place rather than break the run.
+        print(f"  prd_invoiceUpdate lookup failed for {shipment_order_number}: {error}")
+        return {}
+
+    # (shipment, document type) -> link. Rows arrive newest first, so the
+    # first usable link seen for a pair is the current one.
+    per_shipment: dict[tuple[str, str], str] = {}
+    for row in rows:
+        link = str(row.get("invoice_link") or "").strip()
+        if not _is_downloadable_invoice_link(link):
+            continue
+        data_key = _invoice_data_key_from_fatv_result(
+            row.get("invoice_number"),
+            row.get("file_name"),
+            link,
+        )
+        shipment = str(row.get("shipment_order_number") or "").strip().upper()
+        per_shipment.setdefault((shipment, data_key), link)
+
+    links: dict[str, list[str]] = {}
+    for (_shipment, data_key), link in per_shipment.items():
+        collected = links.setdefault(data_key, [])
+        if link not in collected:
+            collected.append(link)
+
+    joined = {data_key: ";".join(values) for data_key, values in links.items()}
+
+    with _invoice_update_lock:
+        _invoice_update_cache[cache_key] = dict(joined)
+
+    return joined
+
+
+def tracking_numbers_from_shipment_status(
+    shipment_order_number: object,
+) -> dict[str, Any]:
+    """Export/return tracking numbers and carriers, from the carrier events.
+
+    The PACKED and SHIPPED events are the only ones carrying ``shippingData``,
+    and each entry there is labelled with a ``shipType``: ``SHIPPING`` is the
+    outbound (export) leg, ``RETURN`` is the return leg. That is the same
+    distinction ``_resolve_export_tracking`` reads out of a GET_FULL_ORDER
+    shipment block, so the values land in the same columns and every
+    downstream rule -- the UPS account code, LOA/POA generation, the
+    same-carrier vs different-carrier reply -- keeps working unchanged.
+
+    Returns ``{}`` when nothing usable is found.
+    """
+
+    patterns = til_event_search_patterns(shipment_order_number)
+    if not patterns:
+        return {}
+
+    cache_key = "|".join(patterns)
+    with _shipment_status_lock:
+        if cache_key in _shipment_status_cache:
+            return dict(_shipment_status_cache[cache_key])
+
+    client, bigquery = _til_bigquery_client()
+    if client is None or bigquery is None:
+        return {}
+
+    try:
+        rows = client.query(
+            SHIPMENT_STATUS_TRACKING_QUERY,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=_til_pattern_parameters(
+                    bigquery, patterns, list(SHIPMENT_STATUS_EVENT_TYPES)
+                )
+            ),
+        ).result()
+    except Exception as error:  # noqa: BLE001 - see invoice fallback above.
+        print(
+            f"  prd_shipmentStatus tracking lookup failed for "
+            f"{shipment_order_number}: {error}"
+        )
+        return {}
+
+    export_numbers: list[str] = []
+    return_numbers: list[str] = []
+    export_carriers: list[str] = []
+    return_carriers: list[str] = []
+
+    for row in rows:
+        tracking = str(row.get("tracking_number") or "").strip()
+        if not tracking:
+            continue
+        ship_type = str(row.get("ship_type") or "").strip().upper()
+        carrier = str(row.get("carrier_code") or "").strip()
+
+        if ship_type == "SHIPPING":
+            numbers, carriers = export_numbers, export_carriers
+        elif ship_type == "RETURN":
+            numbers, carriers = return_numbers, return_carriers
+        else:
+            # An unlabelled or unknown shipType is not guessed at: reporting a
+            # return label as the export tracking number would be worse than
+            # reporting nothing.
+            continue
+
+        if tracking not in numbers:
+            numbers.append(tracking)
+        if carrier and carrier not in carriers:
+            carriers.append(carrier)
+
+    if not export_numbers and not return_numbers:
+        result: dict[str, Any] = {}
+    else:
+        result = {
+            FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]: _joined_tracking_numbers(
+                export_numbers
+            ),
+            FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]: _joined_tracking_numbers(
+                return_numbers
+            ),
+            # One value only, exactly as _resolve_export_tracking does:
+            # shipments that disagree leave it unset, which keeps the safe
+            # "assume different carriers" reading.
+            FULL_ORDER_RESPONSE_COLUMNS["export_carrier_code"]: (
+                export_carriers[0] if len(export_carriers) == 1 else None
+            ),
+            FULL_ORDER_RESPONSE_COLUMNS["return_carrier_code"]: (
+                return_carriers[0] if len(return_carriers) == 1 else None
+            ),
+            FULL_ORDER_RESPONSE_COLUMNS["export_tracking_source"]: (
+                EXPORT_TRACKING_SOURCE_SHIPMENT_STATUS if export_numbers else None
+            ),
+        }
+
+    with _shipment_status_lock:
+        _shipment_status_cache[cache_key] = dict(result)
+
+    return result
+
+
+def til_events_fallback_data(shipment_order_number: object) -> dict[str, Any]:
+    """Row-shaped GET_FULL_ORDER substitute built from the TIL event tables.
+
+    Invoice/RPI links from prd_invoiceUpdate, tracking numbers and carriers
+    from prd_shipmentStatus. Empty when neither table has anything, so the
+    caller re-raises the 404.
+
+    The remaining full_order_* fields stay blank on purpose: these events know
+    nothing about the customer, the address or the returned items, and
+    inventing them would be worse than leaving the response builder to report
+    them as missing.
+    """
+
+    result: dict[str, Any] = {}
+
+    links = invoice_links_from_invoice_update(shipment_order_number)
+    for data_key, link in links.items():
+        result[FULL_ORDER_RESPONSE_COLUMNS[data_key]] = link
+    if links:
+        result[INVOICE_LINK_SOURCE_COLUMN] = INVOICE_LINK_SOURCE_INVOICE_UPDATE
+
+    tracking = tracking_numbers_from_shipment_status(shipment_order_number)
+    for column, value in tracking.items():
+        if not is_blank(value):
+            result[column] = value
+
+    return result
+
+
+# Kept for callers (and tests) that only want the invoice half.
+def invoice_update_fallback_data(shipment_order_number: object) -> dict[str, Any]:
+    links = invoice_links_from_invoice_update(shipment_order_number)
+    if not links:
+        return {}
+
+    result: dict[str, Any] = {
+        FULL_ORDER_RESPONSE_COLUMNS[data_key]: link
+        for data_key, link in links.items()
+    }
+    result[INVOICE_LINK_SOURCE_COLUMN] = INVOICE_LINK_SOURCE_INVOICE_UPDATE
+    return result
+
+
+def _describe_til_fallback(fallback: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for data_key in ("commercial_invoice", "return_proforma_invoice"):
+        value = fallback.get(FULL_ORDER_RESPONSE_COLUMNS[data_key])
+        if not is_blank(value):
+            count = len([item for item in str(value).split(";") if item.strip()])
+            parts.append(f"{count} {data_key} link(s)")
+    for data_key in ("export_tracking_number", "return_tracking_number"):
+        value = fallback.get(FULL_ORDER_RESPONSE_COLUMNS[data_key])
+        if not is_blank(value):
+            parts.append(f"{data_key}={value}")
+    return ", ".join(parts) or "nothing"
+
+
 def fetch_shipment_order_data(
     shipment_order_number: object,
     *,
@@ -2323,7 +2826,27 @@ def fetch_shipment_order_data(
     tracking_numbers: Iterable[str] = (),
 ) -> dict[str, Any]:
     client = client or GetFullOrderClient()
-    payload = client.get_order_payload(shipment_order_number)
+
+    try:
+        payload = client.get_order_payload(shipment_order_number)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code != 404:
+            raise
+
+        # The order is unknown to GET_FULL_ORDER; the invoice and the tracking
+        # numbers may still exist in the TIL event tables. See the section
+        # header above.
+        fallback = til_events_fallback_data(shipment_order_number)
+        if not fallback:
+            raise
+
+        print(
+            f"  GET_FULL_ORDER returned 404 for {shipment_order_number}; "
+            f"recovered from the TIL events: {_describe_til_fallback(fallback)}."
+        )
+        return fallback
+
     return extract_shipment_order_data(
         payload,
         shipment_order_number,
