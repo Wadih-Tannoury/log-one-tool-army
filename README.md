@@ -423,6 +423,35 @@ renders them as `1Z…01, 1Z…02`: the `;` the pipeline joins on is an internal
 separator and must never reach the customer, who would read it as part of the
 number (`format_tracking_numbers_for_display()`).
 
+### Order references ending in an underscore
+
+`ORDER_REFERENCE_RE` delimited the reference with `\b`. Python's `\b` counts
+`_` as a word character, and the UPS return label prints the reference with a
+trailing underscore — `Reference No.1: CV-US-00042647_` — so the match failed on
+exactly the line that carries the order number. The tail could not be shortened
+to find a boundary either (the preceding character is still a digit), so the
+whole reference was lost rather than truncated. The boundaries are now explicit
+`(?<![A-Z0-9])` / `(?![A-Z0-9])` assertions: every previously-matching string
+still matches, plus the underscore-delimited ones.
+
+### Re-issued references: the `_NEW` suffix
+
+A reference re-issued after a correction is printed with a `_NEW` suffix
+(`DG-USB11607007_NEW`). The suffix is bookkeeping, not part of the number —
+GET_FULL_ORDER and `bi.shipping_platform_shipments` both know the order only as
+`DG-USB11607007` — so `strip_reissued_reference_suffix()` removes it everywhere
+a reference is normalized: the ticket-text and PDF path
+(`find_order_references()`) and the stored-column / pre-formed path
+(`normalize_order_reference()`, and therefore `order_reference_prefix()`,
+`is_shipment_shaped_order_reference()`, `order_number_from_order_reference()`
+and the blocked-prefix guard).
+
+`-NEW` and ` NEW` are stripped alongside `_NEW`. A separator before `NEW` is
+**required**, so a genuine reference whose tail happens to end in those letters
+is left alone, and a token that is nothing but `NEW` is returned unchanged
+rather than emptied — an unresolvable token has to stay unresolvable so it
+routes to human review instead of becoming a phantom order.
+
 ### The tracking guard stands down once the order is resolved
 
 `intent_detection.build_llm_output_row()` escalated on the bare
