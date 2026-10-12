@@ -89,6 +89,20 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     "shipping_address": "full_order_shipping_address",
     "shipped_at": "full_order_shipped_at",
     "country_code": "full_order_country_code",
+    # Export (outbound) and return tracking numbers read straight out of the
+    # GET_FULL_ORDER shipment block(s). These are the fallback used whenever
+    # bi.shipping_platform_shipments could not resolve the ticket's tracking
+    # number and the order was identified from an order reference found in the
+    # subject/description or in a PDF attachment instead.
+    "export_tracking_number": "full_order_export_tracking_number",
+    "return_tracking_number": "full_order_return_tracking_number",
+    # Carrier codes of the same two shippingLabels[] entries, so the
+    # same-carrier / different-carrier reply can still be chosen correctly.
+    "export_carrier_code": "full_order_export_carrier_code",
+    "return_carrier_code": "full_order_return_carrier_code",
+    # Which rule produced full_order_export_tracking_number. Internal/audit
+    # only; never shown to the customer.
+    "export_tracking_source": "full_order_export_tracking_source",
     "api_error": "full_order_api_error",
     "missing_shipment_orders_by_key": "full_order_missing_shipment_orders_by_key",
 }
@@ -102,7 +116,15 @@ FULL_ORDER_DATA_KEYS = {
     "customer_name",
     "shipping_address",
 }
-FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
+# export_tracking_number is deliberately NOT in FULL_ORDER_DATA_KEYS (it is not
+# rendered through full_order_data_value, and a missing value must not be
+# treated like a missing invoice), but it does require the GET_FULL_ORDER call:
+# when the tracking lookup failed, the shipment block is the only place the
+# export tracking number can come from.
+FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {
+    "authorization_letter",
+    "export_tracking_number",
+}
 DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney", "shipping_label"}
 INVOICE_DOCUMENT_DATA_KEYS = {"return_proforma_invoice", "commercial_invoice"}
 
@@ -1396,21 +1418,43 @@ def split_tracking_numbers(value: object) -> list[str]:
 _TRACKING_KEY_HINTS = ("tracking", "awb", "waybill", "labelnumber", "parcelnumber")
 
 
-def _collect_tracking_values(value: Any, found: set[str]) -> None:
+def _collect_tracking_entries(
+    value: Any,
+    found: list[tuple[str, str, str]],
+    path: tuple[str, ...] = (),
+) -> None:
+    """Deep-walk a shipment block collecting (path, raw value, match key).
+
+    The path is kept because the *name* of the field (and of its parents) is
+    what distinguishes the export/outbound tracking number from the return
+    one, e.g. ``returnLabel.trackingNumber`` vs ``trackingNumber``. The raw
+    value is kept because that is what the customer is shown; the normalized
+    key is used only for matching.
+    """
+
     if isinstance(value, Mapping):
         for key, child in value.items():
             key_name = str(key).lower().replace("_", "")
+            child_path = path + (key_name,)
             if any(hint in key_name for hint in _TRACKING_KEY_HINTS) and isinstance(
                 child, (str, int)
             ):
                 normalized = _normalize_tracking_value(child)
                 if normalized:
-                    found.add(normalized)
+                    found.append(
+                        ("/".join(child_path), str(child).strip(), normalized)
+                    )
             else:
-                _collect_tracking_values(child, found)
+                _collect_tracking_entries(child, found, child_path)
     elif isinstance(value, list):
         for child in value:
-            _collect_tracking_values(child, found)
+            _collect_tracking_entries(child, found, path)
+
+
+def _collect_tracking_values(value: Any, found: set[str]) -> None:
+    entries: list[tuple[str, str, str]] = []
+    _collect_tracking_entries(value, entries)
+    found.update(normalized for _, _, normalized in entries)
 
 
 def tracking_numbers_in_shipment(shipment: Mapping[str, Any] | None) -> set[str]:
@@ -1424,6 +1468,193 @@ def tracking_numbers_in_shipment(shipment: Mapping[str, Any] | None) -> set[str]
     found: set[str] = set()
     _collect_tracking_values(shipment, found)
     return found
+
+
+# GET_FULL_ORDER shipment blocks carry an explicit per-label list:
+#
+#     "shippingLabels": [
+#         {"carrierCode": "UPS", "labelType": "SHPLBL", "trackingNumber": "1ZV8..."},
+#         {"carrierCode": "UPS", "labelType": "RETLBL", "trackingNumber": "1ZY2..."}
+#     ]
+#
+# SHPLBL is the outbound/export leg, RETLBL is the return leg. That label type
+# is authoritative: it is read before any field-name heuristic.
+SHIPPING_LABELS_KEYS = ("shippingLabels", "shipping_labels", "labels")
+EXPORT_LABEL_TYPES = {"SHPLBL", "SHIPPINGLABEL", "SHIPLABEL", "OUTBOUND", "EXPORT"}
+RETURN_LABEL_TYPES = {"RETLBL", "RETURNLABEL", "RETLABEL", "RETURN"}
+
+# Fallback only, for payload shapes with no shippingLabels[] list: field/parent
+# names that mark a tracking number as belonging to the RETURN leg, and names
+# that mark it as belonging to the EXPORT (outbound) leg. Return hints are
+# checked first, so "returnShippingLabel" is a return field even though it also
+# contains "shipping".
+_RETURN_TRACKING_PATH_HINTS = ("return", "reso", "rma", "reverse", "rtn", "retlbl")
+_EXPORT_TRACKING_PATH_HINTS = ("export", "outbound", "forward", "shipping", "delivery", "shplbl")
+
+
+def _shipping_label_blocks(shipment: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    """The shipment's per-label blocks, if the payload provides them."""
+
+    labels = _get_any(shipment, SHIPPING_LABELS_KEYS)
+    if not isinstance(labels, list):
+        return []
+    return [label for label in labels if isinstance(label, Mapping)]
+
+
+def _normalize_label_type(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _label_type_bucket(label: Mapping[str, Any]) -> str:
+    """``export`` / ``return`` / ``unlabeled`` for one shippingLabels[] entry."""
+
+    label_type = _normalize_label_type(
+        _get_any(label, ("labelType", "label_type", "type"))
+    )
+    if label_type in EXPORT_LABEL_TYPES:
+        return "export"
+    if label_type in RETURN_LABEL_TYPES:
+        return "return"
+    return "unlabeled"
+
+
+def _label_tracking_number(label: Mapping[str, Any]) -> str:
+    value = _get_any(
+        label,
+        ("trackingNumber", "tracking_number", "trackingNo", "awb", "waybill"),
+    )
+    return str(value or "").strip()
+
+
+def _classify_tracking_path(path: str) -> str:
+    """``return`` / ``export`` / ``unlabeled`` for one tracking field path."""
+
+    lowered = path.lower()
+    if any(hint in lowered for hint in _RETURN_TRACKING_PATH_HINTS):
+        return "return"
+    if any(hint in lowered for hint in _EXPORT_TRACKING_PATH_HINTS):
+        return "export"
+    return "unlabeled"
+
+
+def _classified_tracking_numbers(
+    shipment: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    """Split a shipment block's tracking numbers into export / return / other.
+
+    The shippingLabels[] list and its labelType decide this whenever the
+    payload has one. Only a payload without that list falls back to the
+    field-name heuristic, which is also why an ``isReturn`` flag is never
+    consulted: its polarity differs between GET_FULL_ORDER and the labels
+    Logic App (see extract_return_label_data).
+    """
+
+    buckets: dict[str, list[str]] = {"export": [], "return": [], "unlabeled": []}
+
+    labels = _shipping_label_blocks(shipment)
+    if labels:
+        for label in labels:
+            tracking_number = _label_tracking_number(label)
+            if not tracking_number:
+                continue
+            bucket = buckets[_label_type_bucket(label)]
+            if tracking_number not in bucket:
+                bucket.append(tracking_number)
+        if buckets["export"] or buckets["return"] or buckets["unlabeled"]:
+            return buckets
+
+    entries: list[tuple[str, str, str]] = []
+    _collect_tracking_entries(shipment, entries)
+
+    for path, raw_value, _ in entries:
+        bucket = buckets[_classify_tracking_path(path)]
+        if raw_value not in bucket:
+            bucket.append(raw_value)
+
+    return buckets
+
+
+def carrier_codes_in_shipment(shipment: Mapping[str, Any] | None) -> dict[str, str]:
+    """The export/return carrier codes of one shipment block, when stated.
+
+    Read from the same shippingLabels[] entries as the tracking numbers, so a
+    request resolved without bi.shipping_platform_shipments can still tell
+    whether the return travelled with the export carrier.
+    """
+
+    carriers: dict[str, str] = {}
+    for label in _shipping_label_blocks(shipment):
+        bucket = _label_type_bucket(label)
+        if bucket == "unlabeled":
+            continue
+        carrier = str(
+            _get_any(label, ("carrierCode", "carrier_code", "carrier")) or ""
+        ).strip()
+        if carrier and bucket not in carriers:
+            carriers[bucket] = carrier
+    return carriers
+
+
+def export_tracking_numbers_in_shipment(
+    shipment: Mapping[str, Any] | None,
+) -> list[str]:
+    """The export (outbound) tracking number(s) of one shipment block.
+
+    A label explicitly typed SHPLBL wins. When the payload types no label as
+    the outbound one, any tracking number that is not a return tracking number
+    is treated as the export one -- a shipment block whose only tracking field
+    is a plain ``trackingNumber`` is the outbound leg.
+    """
+
+    buckets = _classified_tracking_numbers(shipment)
+    if buckets["export"]:
+        return list(buckets["export"])
+
+    return_numbers = {_normalize_tracking_value(number) for number in buckets["return"]}
+    return [
+        number
+        for number in buckets["unlabeled"]
+        if _normalize_tracking_value(number) not in return_numbers
+    ]
+
+
+def return_tracking_numbers_in_shipment(
+    shipment: Mapping[str, Any] | None,
+) -> list[str]:
+    """The return-leg (RETLBL) tracking number(s) of one shipment block."""
+
+    return list(_classified_tracking_numbers(shipment)["return"])
+
+
+# Only these shipment statuses carry data that may be used in a reply. A
+# shipment that was never dispatched (cancelled, on hold, still being picked)
+# has no usable export tracking number, invoice or returned-items list, and
+# reporting one would answer the carrier about a shipment that does not exist.
+ELIGIBLE_SHIPMENT_STATUSES = {"READY", "FULFILLED"}
+
+
+def _shipment_status_value(shipment: Mapping[str, Any] | None) -> str:
+    value = _get_any(
+        shipment,
+        ("status", "shipmentStatus", "shipment_status", "fulfillmentStatus"),
+    )
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def shipment_is_eligible(shipment: Mapping[str, Any] | None) -> bool:
+    """True when a shipment block may be read.
+
+    A block with no status at all is treated as eligible: older payloads and
+    test fixtures omit the field, and excluding them would silently drop data
+    the pipeline used to return.
+    """
+
+    status = _shipment_status_value(shipment)
+    return not status or status in ELIGIBLE_SHIPMENT_STATUSES
+
+
+def eligible_shipments(shipments: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [shipment for shipment in shipments if shipment_is_eligible(shipment)]
 
 
 def shipment_blocks_for_selection(
@@ -1443,13 +1674,22 @@ def shipment_blocks_for_selection(
       when no block matches, every shipment is read.
     * ``all``         - no usable tracking number, so every shipment of the
       order is read.
+
+    Whenever the selection is "every shipment of the order" rather than one
+    named block, only shipments whose status is READY or FULFILLED are read
+    (see shipment_is_eligible). A shipment the order never dispatched would
+    otherwise contribute a tracking number or invoice for something that was
+    never shipped. A block named explicitly -- by the shipment-shaped
+    reference in ``exact`` mode, or by carrying the ticket's own tracking
+    number in ``by_tracking`` mode -- is read whatever its status, because
+    that is the shipment the ticket is about.
     """
 
     mode = str(selection_mode or SHIPMENT_SELECTION_EXACT).strip().lower()
     shipments = _shipments_from_payload(payload)
 
     if mode == SHIPMENT_SELECTION_ALL:
-        return shipments
+        return eligible_shipments(shipments)
 
     if mode == SHIPMENT_SELECTION_BY_TRACKING:
         wanted = {
@@ -1466,8 +1706,8 @@ def shipment_blocks_for_selection(
             if matched:
                 return matched
         # The ticket's tracking number is in none of the shipment blocks:
-        # fall back to extracting the data from all of them.
-        return shipments
+        # fall back to extracting the data from all the usable ones.
+        return eligible_shipments(shipments)
 
     block = shipment_block_from_order_payload(payload, shipment_order_number)
     return [block] if block is not None else []
@@ -1792,6 +2032,25 @@ _SEMICOLON_JOINED_COLUMNS = {
 _NEWLINE_JOINED_COLUMNS = {
     FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"],
 }
+# When several shipments are read (an order-shaped reference, so the exact
+# shipment is unknown), every shipment's export/return tracking number is
+# reported rather than only the first one.
+_SEMICOLON_JOINED_COLUMNS |= {
+    FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"],
+    FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"],
+}
+# Carrier codes are deliberately NOT joined: response_generator only compares
+# them when a single unambiguous value exists on each leg, exactly as
+# enrich_with_shipment_numbers() does for the shipments-table columns.
+
+
+def _joined_tracking_numbers(numbers: Iterable[str]) -> str | None:
+    values: list[str] = []
+    for number in numbers:
+        text = str(number or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return ";".join(values) if values else None
 
 
 def _combine_shipment_results(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1877,7 +2136,123 @@ def _extract_single_shipment_data(
         FULL_ORDER_RESPONSE_COLUMNS["shipping_address"]: _format_shipping_address(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]: _shipped_at_from_shipment(shipment),
         FULL_ORDER_RESPONSE_COLUMNS["country_code"]: _format_country_code(shipping_address),
+        FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]: _joined_tracking_numbers(
+            export_tracking_numbers_in_shipment(shipment)
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]: _joined_tracking_numbers(
+            return_tracking_numbers_in_shipment(shipment)
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["export_carrier_code"]: (
+            carrier_codes_in_shipment(shipment).get("export") or None
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["return_carrier_code"]: (
+            carrier_codes_in_shipment(shipment).get("return") or None
+        ),
         FULL_ORDER_RESPONSE_COLUMNS["api_error"]: None,
+    }
+
+
+EXPORT_TRACKING_SOURCE_TICKET_TRACKING = "ticket_tracking_shipment_block"
+EXPORT_TRACKING_SOURCE_SELECTED_SHIPMENT = "selected_shipment_block"
+EXPORT_TRACKING_SOURCE_ALL_SHIPMENTS = "all_shipment_blocks"
+
+
+def _resolve_export_tracking(
+    payload: Mapping[str, Any],
+    selected_shipments: list[Mapping[str, Any]],
+    *,
+    tracking_numbers: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Export/return tracking numbers, read from the right shipment block(s).
+
+    This is what makes a request answerable when the ticket's tracking number
+    was not found in ``bi.shipping_platform_shipments`` and the order was
+    identified from an order reference in the subject/description or in a PDF
+    attachment instead. Three rules, in order:
+
+    1. **The ticket carried a tracking number.** Whichever shipment block of
+       the order carries that number -- on its shipping label or on its return
+       label -- is the ticket's shipment, so the export tracking number is read
+       from that same block. This holds regardless of the shape of the order
+       reference, because the tracking number identifies the shipment more
+       precisely than an order-level reference does.
+    2. **No tracking number, shipment-shaped reference** (e.g.
+       ``DG-EUA01663254``). The reference already names one shipment, so the
+       export tracking number is read from that block only. This is the
+       ``exact`` selection the caller has already applied.
+    3. **No tracking number, order-shaped reference** (e.g.
+       ``DG-EU-01663254``). The exact shipment is unknown, so every shipment
+       block of the order is read and the export tracking numbers are
+       semicolon-joined.
+
+    Rules 2 and 3 are simply "read the blocks the caller selected"; rule 1
+    re-selects the block by tracking number first.
+    """
+
+    wanted = {
+        _normalize_tracking_value(number)
+        for number in tracking_numbers
+        if _normalize_tracking_value(number)
+    }
+
+    all_shipments = _shipments_from_payload(payload)
+    blocks = list(selected_shipments)
+    source = (
+        EXPORT_TRACKING_SOURCE_ALL_SHIPMENTS
+        if len(blocks) > 1
+        else EXPORT_TRACKING_SOURCE_SELECTED_SHIPMENT
+    )
+
+    if wanted:
+        # No status filter here: a block carrying the ticket's own tracking
+        # number IS the shipment the ticket is about, whatever its status.
+        matched = [
+            shipment
+            for shipment in all_shipments
+            if tracking_numbers_in_shipment(shipment) & wanted
+        ]
+        # Only follow the tracking match when that block actually carries an
+        # export tracking number; otherwise keep the caller's selection.
+        if matched and any(export_tracking_numbers_in_shipment(b) for b in matched):
+            blocks = matched
+            source = EXPORT_TRACKING_SOURCE_TICKET_TRACKING
+
+    export_numbers: list[str] = []
+    return_numbers: list[str] = []
+    export_carriers: list[str] = []
+    return_carriers: list[str] = []
+    for shipment in blocks:
+        for number in export_tracking_numbers_in_shipment(shipment):
+            if number not in export_numbers:
+                export_numbers.append(number)
+        for number in return_tracking_numbers_in_shipment(shipment):
+            if number not in return_numbers:
+                return_numbers.append(number)
+        carriers = carrier_codes_in_shipment(shipment)
+        for bucket, collected in (("export", export_carriers), ("return", return_carriers)):
+            carrier = carriers.get(bucket)
+            if carrier and carrier not in collected:
+                collected.append(carrier)
+
+    def _single_carrier(values: list[str]) -> str | None:
+        # One value only. Shipments that disagree have no single answer, and
+        # leaving it unset makes response_generator treat the legs as being on
+        # different carriers -- the safe reading, matching what
+        # enrich_with_shipment_numbers() does for the shipments-table columns.
+        return values[0] if len(values) == 1 else None
+
+    return {
+        FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]: _joined_tracking_numbers(
+            export_numbers
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]: _joined_tracking_numbers(
+            return_numbers
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["export_carrier_code"]: _single_carrier(export_carriers),
+        FULL_ORDER_RESPONSE_COLUMNS["return_carrier_code"]: _single_carrier(return_carriers),
+        FULL_ORDER_RESPONSE_COLUMNS["export_tracking_source"]: (
+            source if export_numbers else None
+        ),
     }
 
 
@@ -1904,15 +2279,40 @@ def extract_shipment_order_data(
     )
 
     if not shipments:
+        # Distinguish "the order has no such shipment" from "every shipment of
+        # the order was filtered out by status", because the second is not a
+        # lookup failure and a reviewer needs to see which statuses were there.
+        all_shipments = _shipments_from_payload(payload)
+        if all_shipments and not eligible_shipments(all_shipments):
+            statuses = sorted(
+                {
+                    _shipment_status_value(shipment) or "(no status)"
+                    for shipment in all_shipments
+                }
+            )
+            return {
+                FULL_ORDER_RESPONSE_COLUMNS["api_error"]: (
+                    "No shipment of this order is READY or FULFILLED "
+                    f"(statuses found: {', '.join(statuses)})"
+                )
+            }
         return {
             FULL_ORDER_RESPONSE_COLUMNS["api_error"]: (
                 "Shipment block not found in GET_FULL_ORDER response"
             )
         }
 
-    return _combine_shipment_results(
+    combined = _combine_shipment_results(
         [_extract_single_shipment_data(payload, shipment) for shipment in shipments]
     )
+    combined.update(
+        _resolve_export_tracking(
+            payload,
+            shipments,
+            tracking_numbers=tracking_numbers,
+        )
+    )
+    return combined
 
 
 def fetch_shipment_order_data(
@@ -1932,20 +2332,34 @@ def fetch_shipment_order_data(
     )
 
 
+def _document_tracking_candidates(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Tracking values usable for LOA/POA generation, best first.
+
+    The two full_order_* values are the fallback for requests whose tracking
+    number was not in bi.shipping_platform_shipments: they are read from the
+    GET_FULL_ORDER shipment block the order reference resolved to.
+    """
+
+    return (
+        row.get("shipment_tracking_number"),
+        row.get(FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]),
+        row.get("extracted_tracking_number"),
+        row.get("return_tracking_number"),
+        row.get(FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]),
+    )
+
+
 def tracking_number_for_documents(row: Mapping[str, Any]) -> str:
     return first_available_value(
         row.get("extracted_tracking_number"),
         row.get("shipment_tracking_number"),
+        row.get(FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]),
         default="",
     )
 
 
 def ups_account_number_for_documents(row: Mapping[str, Any]) -> str:
-    ups_code = extract_ups_code(
-        row.get("shipment_tracking_number"),
-        row.get("extracted_tracking_number"),
-        row.get("return_tracking_number"),
-    )
+    ups_code = extract_ups_code(*_document_tracking_candidates(row))
     if ups_code:
         return ups_code
 
@@ -1954,11 +2368,7 @@ def ups_account_number_for_documents(row: Mapping[str, Any]) -> str:
     # is still the 6 characters immediately after the leading 1Z. This fallback is
     # limited to LOA generation and does not alter the existing response logic for
     # ups_account_number.
-    for value in (
-        row.get("shipment_tracking_number"),
-        row.get("extracted_tracking_number"),
-        row.get("return_tracking_number"),
-    ):
+    for value in _document_tracking_candidates(row):
         text = str(value or "").strip().upper()
         match = re.search(r"1Z([0-9A-Z]{6})", text)
         if match:
