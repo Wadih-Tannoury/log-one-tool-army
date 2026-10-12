@@ -337,6 +337,98 @@ shipping address, country, shipped date) keep the first non-blank value, so
 `full_order_country_code` stays usable for the per-brand "Country `<BRAND>`"
 ticket field.
 
+### Export tracking number when the tracking lookup failed
+
+The export tracking number used to come from `bi.shipping_platform_shipments`
+only (the `shipment_tracking_number` column, i.e. the `is_return = false` row).
+A request whose tracking number that table did not know therefore had no export
+tracking number even when the order had been resolved from a reference in the
+subject/description or in a PDF attachment: the generic reply printed
+`[TO BE RETRIEVED]`, and the UPS/FedEx/DHL returns templates fell through to
+"non disponibile, avvenuto con altro vettore" — telling the carrier the number
+did not exist while it sat in the GET_FULL_ORDER payload.
+
+It is now read out of the GET_FULL_ORDER shipment block as a fallback. Each
+shipment block states its labels explicitly:
+
+```json
+"shippingLabels": [
+  {"carrierCode": "UPS", "labelType": "SHPLBL", "trackingNumber": "1ZV8K2420402911398"},
+  {"carrierCode": "UPS", "labelType": "RETLBL", "trackingNumber": "1ZY24G219036376287"}
+]
+```
+
+`SHPLBL` is the export (outbound) leg and `RETLBL` is the return leg. That
+`labelType` is authoritative — field-name heuristics are only a fallback for
+payload shapes without a `shippingLabels[]` list, and the `isReturn` flag is
+never consulted here because its polarity is inverted in the labels Logic App
+(see `extract_return_label_data`).
+
+**Which block is read** (`_resolve_export_tracking()` in
+`response_data_extractor.py`), first match wins:
+
+| Case | Block read | `full_order_export_tracking_source` |
+| --- | --- | --- |
+| The ticket carried a tracking number | the block whose `SHPLBL` **or** `RETLBL` carries it — searched across every shipment of the order, whatever the shape of the reference | `ticket_tracking_shipment_block` |
+| No tracking number, shipment-shaped reference (`DG-EUA01663254`) | that shipment block only | `selected_shipment_block` |
+| No tracking number, order-shaped reference (`DG-EU-01663254`) | every shipment block; the values are semicolon-joined, since the exact shipment is unknown | `all_shipment_blocks` |
+
+A tracking number present in none of the blocks, or in a block with no
+`SHPLBL`, falls back to the caller's normal shipment selection rather than
+reporting nothing.
+
+**Only READY and FULFILLED shipments are read when the selection is "every
+shipment".** A shipment the order never dispatched (cancelled, on hold, still
+being picked) has no usable export tracking number, invoice or returned-items
+list, and reporting one would answer the carrier about a shipment that does not
+exist. So `shipment_blocks_for_selection()` filters the order-level selection —
+`all` mode, and the `by_tracking` fallback when the ticket's tracking number
+matched no block — through `shipment_is_eligible()`.
+
+A block named **explicitly** is read whatever its status, because that is the
+shipment the ticket is about: the shipment-shaped reference in `exact` mode, and
+the block carrying the ticket's own tracking number in `by_tracking` mode. A
+block with no `status` field at all counts as eligible, so older payloads and
+fixtures keep returning the data they always did.
+
+When an order has shipments but none of them is READY or FULFILLED, the row gets
+an explicit `full_order_api_error` naming the statuses that were found (rather
+than the generic "shipment block not found"), so the reply is blocked and the
+reviewer can see why.
+
+The same `shippingLabels[]` entries also supply `carrierCode` per leg, so
+`return_export_carriers_are_same()` can still choose between the same-carrier
+and different-carrier reply when the shipments table resolved neither. A single
+unambiguous value per leg is required; shipments that disagree leave it unset,
+which keeps the existing "assume different carriers" reading. The export
+tracking number is likewise the fallback source for the UPS account code
+(`1ZV8K242…` -> `V8K242`) and for LOA/POA generation, so those are no longer
+blocked either.
+
+New columns: `full_order_export_tracking_number`,
+`full_order_return_tracking_number`, `full_order_export_carrier_code`,
+`full_order_return_carrier_code` and the internal-only
+`full_order_export_tracking_source`. `full_order_export_tracking_number` is also
+appended to the BigQuery history table through the existing
+`_ADDITIVE_HISTORY_COLUMNS` migration, so the number actually sent is auditable.
+`export_tracking_number` is in `FULL_ORDER_LOOKUP_KEYS` (it now triggers the
+GET_FULL_ORDER call) but deliberately **not** in `FULL_ORDER_DATA_KEYS`, so a
+missing value is not treated like a missing invoice.
+
+The shipments-table value still takes precedence everywhere: when the tracking
+lookup succeeds, nothing about the existing behavior changes.
+
+### No reply may contain `[TO BE RETRIEVED]`
+
+As a backstop, `enforce_reply_consistency()` now routes any row whose
+`final_response` still contains the `[TO BE RETRIEVED]` placeholder to human
+intervention and blanks the public reply. A placeholder is a value the pipeline
+failed to resolve; sending it tells the carrier nothing while looking like an
+answer. This covers every template at once, so a data key that slips past the
+per-key checks in `missing_required_full_order_values()` still cannot reach
+Zendesk. The different-carrier wording ("non disponibile, avvenuto con altro
+vettore") contains no placeholder and is unaffected.
+
 ### Blocked order prefixes
 
 Orders starting with `RC-US`, `RC-EU`, `LN-EU` or `LN-US` are never processed.
@@ -419,8 +511,8 @@ untouched.
 
 `extracted_order_reference`, `order_reference_source` (`tracking_lookup` /
 `subject_or_description` / `pdf_attachment`, or `tracking_lookup+subject_or_description`
-when the two were merged), `shipment_selection_mode`, `order_processing_blocked`
-and `order_resolution_complete` are added to the active-ticket table and to the
+when the two were merged), `shipment_selection_mode`, `order_processing_blocked`,
+`order_resolution_complete` and `full_order_export_tracking_number` are added to the active-ticket table and to the
 history table. The history table is migrated additively at runtime through the
 existing `_ADDITIVE_HISTORY_COLUMNS` mechanism, so no manual DDL is needed.
 
