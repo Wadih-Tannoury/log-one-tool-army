@@ -108,6 +108,7 @@ ORDER_REFERENCE_PREFIXES: tuple[str, ...] = (
     "FU-EU",
     "FU-MT",
     "FU-ZL",
+    "HB-EU",
     "HE-EU",
     "HE-FF",
     "HE-JP",
@@ -219,6 +220,10 @@ SHIPMENT_SELECTION_MODES = (
 ORDER_REFERENCE_SOURCE_TRACKING = "tracking_lookup"
 ORDER_REFERENCE_SOURCE_TEXT = "subject_or_description"
 ORDER_REFERENCE_SOURCE_PDF = "pdf_attachment"
+# Last resort: the tracking number was not in bi.shipping_platform_shipments
+# and the ticket carried no reference, so the shipment order number came from
+# the carrier events in til.prd_shipmentStatus.
+ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS = "shipment_status_events"
 
 
 # ---------------------------------------------------------------------------
