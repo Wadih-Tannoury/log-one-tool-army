@@ -478,6 +478,104 @@ caught and logged rather than raised. The resolved rows carry
 particular value, since every guard tests whether `shipment_order_number` is
 present rather than where it came from.
 
+### GET_FULL_ORDER 404 fallback: the `til` event tables
+
+GET_FULL_ORDER answers `404 Client Error: Not Found` for orders it does not
+carry (archived, or never registered on the return platform). Until now the
+ticket went to human review as "no invoice found" / "no tracking number" even
+when both existed.
+
+They exist in the TIL event tables, written by NAV as the order moved, and
+`fetch_shipment_order_data()` reads them whenever — and only whenever — the API
+returns a 404. Both halves produce values for the **existing** `full_order_*`
+columns, so nothing downstream changes: the invoice link is resolved and
+downloaded by the same `download_invoice_pdf()` path (including the
+`DocOpen.aspx?link=` indirection), and the tracking numbers feed the same
+rules as numbers read out of a shipment block — the UPS account code, LOA/POA
+generation, the same-carrier vs different-carrier reply.
+
+#### Invoice / RPI — `prd_invoiceUpdate`, `eventType = 'FATV_RESULT'`
+
+```json
+{
+  "eventType": "FATV_RESULT",
+  "data": {
+    "fatvResult": {
+      "invoiceNumber": "INV-26115916",
+      "shipmentOrderNumber": "HB-EU-00117943",
+      "invoiceLink": "http://azureftp.thelevelgroup.com:9038/DocOpen.aspx?link=INV_HB-EU-00117943_INV-26115916_M_1CBBA7BBE8A94FDEB59DAFCCEEE153D3.pdf"
+    }
+  }
+}
+```
+
+- **Several rows is the normal case** (retries, reissues, one per shipment).
+  Only rows whose `invoiceLink` is a real URL (`http://`, `https://`) are
+  usable; a bare file name or a share path is skipped rather than written into
+  the reply as a broken link. Within one shipment the newest usable row per
+  document type wins, so a reissued invoice answers with the current document.
+- **RPI vs invoice** comes from the `RPI-…` / `INV-…` prefix on
+  `invoiceNumber` / `fileName` / the link, which is what `documentType` does on
+  the GET_FULL_ORDER side. Anything unrecognized is treated as a commercial
+  invoice.
+- **The envelope's top-level `success` is not filtered on.** It reports the
+  whole NAV event and is routinely `false` on payloads carrying a perfectly
+  usable `invoiceLink` — the example above is one.
+
+#### Tracking — `prd_shipmentStatus`, `eventType IN ('PACKED','SHIPPED')`
+
+Those are the only two event types carrying `data.shippingData`. Each entry
+there is labelled with a `shipType`:
+
+- `SHIPPING` -> `full_order_export_tracking_number` (the outbound leg);
+- `RETURN` -> `full_order_return_tracking_number`.
+
+`carrierCode` fills `full_order_export_carrier_code` /
+`full_order_return_carrier_code`, and only when a single unambiguous value
+exists per leg — exactly what `_resolve_export_tracking()` does, so shipments
+that disagree keep the safe "assume different carriers" reading. An entry with
+an unknown or missing `shipType` is skipped rather than guessed at: reporting a
+return label as the export tracking number would be worse than reporting
+nothing. Rows served this way carry
+`full_order_export_tracking_source = shipment_status_events`.
+
+#### Order known, shipment not
+
+Both lookups match `shipmentOrderNumber` with a regex rather than equality
+(`til_event_search_patterns()`), because what the workflow knows about the
+ticket differs:
+
+- **A shipment is named** (`HB-EUA00117943`): only that shipment's events are
+  read. Both shapes are matched exactly, since NAV files the event under the
+  order-shaped reference (`HB-EU-00117943`) even though the field is called
+  `shipmentOrderNumber`, while the ticket may carry the shipment-shaped one.
+- **Only the order is known** (`HB-EU-00117943`): the exact shipment is
+  unknown, so **every** shipment of that order is read — the 6th character,
+  the one that distinguishes `HB-EUA…` / `HB-EUB…` / `HB-EU-…`, is matched by a
+  single `.`. Each distinct shipment contributes its own invoice/RPI and the
+  links are `;`-joined, the same separator `_combine_shipment_results()` and
+  the downloader already use. This is the "read all the blocks" rule
+  `SHIPMENT_SELECTION_ALL` applies to a GET_FULL_ORDER payload, which the 404
+  denied us.
+
+#### Credentials and failure mode
+
+Both tables are in `tlg-wlfs-prd`, so they use the same optional
+`TIL_BIGQUERY_CREDS` secret as `ticket_fetcher.til_bigquery_client()` (already
+exposed to the job in `agent_triggerer.yml`). The client is built once per
+process and cached behind a lock, since the GET_FULL_ORDER prefetch runs
+several threads; query results are cached per search pattern for the same
+reason.
+
+A missing secret, an unusable key or a failed query logs one line and returns
+nothing, and the original 404 is then re-raised — the row behaves exactly as it
+did before. **A non-404 error is never swallowed.** No other `full_order_*`
+field is filled: these events know nothing about the customer, the address or
+the returned items, so the response builder reports those as missing as usual.
+Rows carrying a recovered invoice also carry the internal-only
+`full_order_invoice_link_source = prd_invoiceUpdate.FATV_RESULT`.
+
+
 ### `HB-EU`
 
 `HB-EU` is in `ORDER_REFERENCE_PREFIXES` (114 prefixes, 29 brand codes). It
