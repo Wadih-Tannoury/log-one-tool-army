@@ -1058,6 +1058,93 @@ def _append_document_error(df, index: object, message: str) -> None:
     df.at[index, error_column] = message
 
 
+def _backfill_invoice_links_from_events(
+    df,
+    index: object,
+    invoice_keys: Iterable[str],
+) -> None:
+    """Fill a requested-but-missing invoice/RPI link from the FATV events.
+
+    Like the export date, an invoice goes missing in two ways: the order 404s,
+    or GET_FULL_ORDER answers with a payload whose invoiceDocuments simply has
+    no entry of the wanted documentType. Only the first case was covered, yet
+    both end the same way -- "GET_FULL_ORDER API data is missing for:
+    return_proforma_invoice" -- so prd_invoiceUpdate is consulted here too.
+
+    **Either FATV link satisfies either request.** The PDF behind a FATV
+    invoiceLink carries both the commercial invoice and the RPI, so the
+    INV/RPI prefix only says which document NAV named the event after, not
+    which documents the file contains. Whichever link exists is therefore the
+    right answer to both requests, and the substitution runs in both
+    directions; the matching prefix is still preferred when both exist.
+    """
+
+    raw_orders = (
+        df.at[index, "shipment_order_number"]
+        if "shipment_order_number" in df.columns
+        else None
+    )
+    shipment_orders = [part.strip() for part in str(raw_orders or "").split(";") if part.strip()]
+    if not shipment_orders:
+        return
+
+    wanted = [
+        invoice_key
+        for invoice_key in invoice_keys
+        if invoice_key in INVOICE_DOCUMENT_DATA_KEYS
+        and is_blank(df.at[index, FULL_ORDER_RESPONSE_COLUMNS[invoice_key]])
+    ]
+    if not wanted:
+        return
+
+    links_by_key: dict[str, list[str]] = {}
+    substituted: set[str] = set()
+
+    for shipment_order_number in shipment_orders:
+        try:
+            event_links = invoice_links_from_invoice_update(shipment_order_number)
+        except Exception as exc:  # noqa: BLE001 - the reply stays blocked, as before
+            print(
+                "  prd_invoiceUpdate invoice lookup failed for "
+                f"{shipment_order_number}: {exc}"
+            )
+            return
+
+        for invoice_key in wanted:
+            link = event_links.get(invoice_key)
+            if not link:
+                other_key = (
+                    "commercial_invoice"
+                    if invoice_key == "return_proforma_invoice"
+                    else "return_proforma_invoice"
+                )
+                link = event_links.get(other_key)
+                if link:
+                    substituted.add(invoice_key)
+            if not link:
+                continue
+            collected = links_by_key.setdefault(invoice_key, [])
+            for part in str(link).split(";"):
+                part = part.strip()
+                if part and part not in collected:
+                    collected.append(part)
+
+    for invoice_key, links in links_by_key.items():
+        df.at[index, FULL_ORDER_RESPONSE_COLUMNS[invoice_key]] = ";".join(links)
+        if INVOICE_LINK_SOURCE_COLUMN not in df.columns:
+            df[INVOICE_LINK_SOURCE_COLUMN] = None
+        df.at[index, INVOICE_LINK_SOURCE_COLUMN] = INVOICE_LINK_SOURCE_INVOICE_UPDATE
+        detail = (
+            " (the other document type's link used; the PDF carries both)"
+            if invoice_key in substituted
+            else ""
+        )
+        print(
+            f"  {invoice_key} for row {index} taken from the prd_invoiceUpdate "
+            f"events{detail}: {len(links)} link(s)."
+        )
+
+
 def _backfill_shipped_at_from_events(df, index: object) -> None:
     """Fill a blank full_order_shipped_at from the PACKED/SHIPPED events.
 
@@ -1126,7 +1213,14 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
         needs_poa = "power_of_attorney" in requested_data
         needs_shipping_label = "export_tracking_number" in requested_data
 
-        for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
+        requested_invoice_keys = sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS)
+        if requested_invoice_keys:
+            # A requested invoice/RPI the GET_FULL_ORDER payload did not carry
+            # may still exist as a FATV_RESULT event. See the helper.
+            _backfill_invoice_links_from_events(df, index, requested_invoice_keys)
+            row = df.loc[index]
+
+        for invoice_key in requested_invoice_keys:
             column = DOCUMENT_RESPONSE_COLUMNS[invoice_key]
             existing_path = row.get(column)
             if not force and not is_blank(existing_path) and document_path_exists(existing_path):
