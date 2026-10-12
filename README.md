@@ -536,8 +536,47 @@ exists per leg — exactly what `_resolve_export_tracking()` does, so shipments
 that disagree keep the safe "assume different carriers" reading. An entry with
 an unknown or missing `shipType` is skipped rather than guessed at: reporting a
 return label as the export tracking number would be worse than reporting
-nothing. Rows served this way carry
+nothing. An entry whose `trackingNumber` is empty — the `RETURN` leg routinely
+is — is skipped. Rows served this way carry
 `full_order_export_tracking_source = shipment_status_events`.
+
+#### Returned items — the same events' `products[]`
+
+A ticket asking for both the tracking number and the returned-items
+confirmation was still held for a human, because only the tracking half had a
+fallback. The same PACKED/SHIPPED payload carries the shipment's contents at
+the top level, beside `data{}`:
+
+```json
+{"products": [{"productId": "408052381130892", "quantity": 1,
+               "data": {"cartonId": "…", "productLineId": "…"}}, …]}
+```
+
+There is no SKU, product name or image in the event, so **only the `productId`
+values are read** and `full_order_returned_items` is rendered as
+`  - Product ID: <id>` lines — the same shape `format_returned_items()`
+produces, but labelled honestly: the event gives an internal identifier, and
+calling it a SKU in a customer-facing reply would be wrong. Duplicates are
+collapsed, payload order is kept, and when several shipments match, the newest
+event per shipment wins and the lists are merged.
+
+The `shippingData` UNNEST is a `LEFT JOIN` for this reason: an event with no
+usable shipping entry must still contribute its products.
+
+#### Export date for the LOA — the event's own `eventTimestamp`
+
+`full_order_shipped_at` is what the authorization letter prints as the export
+date, and a blank one blocks the LOA through
+`authorization_letter_export_date`. GET_FULL_ORDER would have supplied
+`shipment.shippedAt`; on a 404 the event timestamp takes its place:
+
+- the latest `SHIPPED` event's `eventTimestamp`;
+- failing that — an order that never produced a `SHIPPED` — the latest
+  `PACKED` one.
+
+The value is stored as the ISO string the event carries, so
+`format_api_datetime()` renders it for the LOA exactly as it renders a
+`shippedAt`.
 
 #### Order known, shipment not
 
@@ -570,10 +609,25 @@ reason.
 A missing secret, an unusable key or a failed query logs one line and returns
 nothing, and the original 404 is then re-raised — the row behaves exactly as it
 did before. **A non-404 error is never swallowed.** No other `full_order_*`
-field is filled: these events know nothing about the customer, the address or
-the returned items, so the response builder reports those as missing as usual.
-Rows carrying a recovered invoice also carry the internal-only
+field is filled: these events know nothing about the customer or the address,
+so the response builder reports those as missing as usual. Rows carrying a
+recovered invoice also carry the internal-only
 `full_order_invoice_link_source = prd_invoiceUpdate.FATV_RESULT`.
+
+#### Why a failed shipping label is not the reason in the note
+
+A label the labels API cannot return has never blocked the reply: the customer
+still gets the tracking number, `missing_required_full_order_values()`
+deliberately leaves `shipping_label` out, and `build_generic_response()` drops
+just that line.
+
+The human-intervention note said otherwise, though. `generated_document_error`
+accumulates one `<data_key>: <message>` entry per failed document, and the
+whole column was appended as `Document detail:` next to whatever actually
+blocked the ticket — so a note held for a missing RPI read as though the label
+had caused it. `_document_error_detail_for()` now quotes only the entries
+naming something in the missing list, which for a label-only failure is
+nothing at all.
 
 
 ### `HB-EU`
