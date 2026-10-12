@@ -56,6 +56,7 @@ from customs_rules import (
 from order_reference_resolver import (
     BLOCKED_ORDER_REFERENCE_PREFIXES,
     ORDER_REFERENCE_SOURCE_PDF,
+    ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS,
     ORDER_REFERENCE_SOURCE_TEXT,
     ORDER_REFERENCE_SOURCE_TRACKING,
     SHIPMENT_SELECTION_ALL,
@@ -74,6 +75,11 @@ from order_reference_resolver import (
 # ============================================================================
 
 PROJECT_ID = os.getenv("PROJECT_ID", "tlg-business-intelligence-prd")
+
+# til.prd_shipmentStatus is in its own GCP project with its own service
+# account; see til_bigquery_client().
+TIL_PROJECT_ID = os.getenv("TIL_PROJECT_ID", "tlg-wlfs-prd")
+TIL_BIGQUERY_CREDS_ENV = "TIL_BIGQUERY_CREDS"
 
 CONFIG_TABLE = os.getenv(
     "LOG_CONFIG_TABLE",
@@ -305,6 +311,46 @@ def bigquery_client():
 
     client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
     return client, bigquery
+
+
+def til_bigquery_client():
+    """Create a BigQuery client for the TIL project from TIL_BIGQUERY_CREDS.
+
+    til.prd_shipmentStatus lives in a different GCP project
+    (tlg-wlfs-prd) that the BI service account cannot read, so the
+    shipment-status lookup needs its own credentials. Returns ``None`` when
+    the secret is absent or unusable instead of raising: that lookup is the
+    last resort for rows already heading to human review, so the run must
+    continue without it rather than fail outright.
+    """
+
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
+    raw = os.environ.get(TIL_BIGQUERY_CREDS_ENV)
+    if not raw or not raw.strip():
+        print(
+            f"{TIL_BIGQUERY_CREDS_ENV} is not set; the prd_shipmentStatus "
+            "lookup will be skipped."
+        )
+        return None
+
+    try:
+        til_credentials = json.loads(raw)
+        credentials = service_account.Credentials.from_service_account_info(
+            til_credentials
+        )
+        # project_id comes from the key itself, so a key issued for a
+        # different project keeps working without a code change.
+        project = til_credentials.get("project_id") or TIL_PROJECT_ID
+        return bigquery.Client(project=project, credentials=credentials)
+    except Exception as error:  # noqa: BLE001 - see the docstring
+        print(
+            f"Could not build the TIL BigQuery client from "
+            f"{TIL_BIGQUERY_CREDS_ENV}: {error}. The prd_shipmentStatus "
+            "lookup will be skipped."
+        )
+        return None
 
 
 def zendesk_auth() -> HTTPBasicAuth:
@@ -3571,6 +3617,7 @@ def enrich_with_shipment_numbers(
     *,
     auth=None,
     base_url: str | None = None,
+    til_client=None,
 ) -> pd.DataFrame:
     """Resolve each request to a shipment/order.
 
@@ -3579,6 +3626,10 @@ def enrich_with_shipment_numbers(
     apply_order_reference_fallback(), which looks for an order reference in the
     subject/description and, failing that, inside the ticket's PDF attachments.
     ``auth``/``base_url`` are required only for that PDF step.
+
+    ``til_client`` is the separate BigQuery client for the TIL project (see
+    til_bigquery_client()); without it the final prd_shipmentStatus lookup is
+    skipped and those rows go to human review exactly as they did before.
     """
 
     tracking_numbers = []
@@ -3831,6 +3882,242 @@ def enrich_with_shipment_numbers(
     )
 
     df = apply_order_reference_fallback(df, auth=auth, base_url=base_url)
+    df = apply_shipment_status_order_lookup(df, til_client, bigquery)
+
+    return df
+
+
+# ============================================================================
+# SHIPMENT-STATUS ORDER LOOKUP (last resort)
+# ============================================================================
+
+
+SHIPMENT_STATUS_TABLE = "`tlg-wlfs-prd`.til.prd_shipmentStatus"
+
+# The carrier events carry the shipment order number next to the tracking
+# number, so a tracking number bi.shipping_platform_shipments never received
+# can still be tied to an order. PACKED and SHIPPED are the only event types
+# that carry shippingData.
+SHIPMENT_STATUS_QUERY = f"""
+WITH shipments AS (
+
+    SELECT
+        JSON_VALUE(ship, '$.trackingNumber')                        AS tracking_number,
+        JSON_VALUE(ship, '$.carrierCode')                           AS carrier_code,
+        JSON_VALUE(s.requestPayload, '$.data.shipmentOrderNumber')  AS shipment_order_number,
+        JSON_VALUE(s.requestPayload, '$.data.logisticOrderNumber')  AS logistic_order_number,
+        TIMESTAMP(JSON_VALUE(s.requestPayload, '$.eventTimestamp')) AS event_timestamp
+
+    FROM {SHIPMENT_STATUS_TABLE} AS s,
+         UNNEST(JSON_EXTRACT_ARRAY(s.requestPayload, '$.data.shippingData')) AS ship
+
+    WHERE s.eventType IN ('PACKED', 'SHIPPED')
+      AND JSON_VALUE(ship, '$.trackingNumber') IN UNNEST(@tracking_numbers)
+)
+
+-- One row per (tracking number, order). A tracking number normally produces
+-- several events -- PACKED then SHIPPED -- all naming the same order, and
+-- those collapse here. A tracking number that genuinely names two different
+-- orders survives as two rows, and the caller refuses to guess between them
+-- rather than reporting an arbitrary one.
+SELECT
+    tracking_number,
+    shipment_order_number,
+    ANY_VALUE(logistic_order_number) AS logistic_order_number,
+    ANY_VALUE(carrier_code)          AS carrier_code,
+    MAX(event_timestamp)             AS last_event_at
+
+FROM shipments
+
+WHERE tracking_number IS NOT NULL
+  AND shipment_order_number IS NOT NULL
+  AND TRIM(shipment_order_number) != ''
+
+GROUP BY tracking_number, shipment_order_number
+"""
+
+
+def _row_tracking_numbers(value: object) -> list[str]:
+    """The usable tracking numbers of one row, in order."""
+
+    numbers: list[str] = []
+    for tracking in re.split(r"[;,]", _to_str(value) or ""):
+        tracking = tracking.strip()
+        if tracking and tracking.upper() != "N/A" and tracking not in numbers:
+            numbers.append(tracking)
+    return numbers
+
+
+def shipment_status_orders_for_trackings(
+    tracking_numbers: list[str],
+    client,
+    bigquery,
+) -> dict[str, str]:
+    """Map tracking number -> shipment order number, from the carrier events.
+
+    A tracking number that names more than one order is left out: there is no
+    way to tell which one the ticket means, and answering with the wrong
+    order is worse than routing the request to a human.
+    """
+
+    if not tracking_numbers:
+        return {}
+
+    status_df = client.query(
+        SHIPMENT_STATUS_QUERY,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter(
+                    "tracking_numbers",
+                    "STRING",
+                    tracking_numbers,
+                )
+            ]
+        ),
+    ).to_dataframe(create_bqstorage_client=BQ_STORAGE)
+
+    candidates: dict[str, list[str]] = {}
+    for _, row in status_df.iterrows():
+        tracking = (_to_str(row.get("tracking_number")) or "").strip()
+        order = (_to_str(row.get("shipment_order_number")) or "").strip()
+        if not tracking or not order:
+            continue
+        # Validated exactly like every other order the pipeline accepts, so a
+        # payload carrying something that is not a reference cannot become a
+        # phantom order.
+        references = split_order_references(order)
+        if not references:
+            continue
+        for reference in references:
+            if reference not in candidates.setdefault(tracking, []):
+                candidates[tracking].append(reference)
+
+    resolved: dict[str, str] = {}
+    for tracking, references in candidates.items():
+        if len(references) == 1:
+            resolved[tracking] = references[0]
+        else:
+            print(
+                f"  Tracking {tracking} maps to {len(references)} different "
+                f"orders in prd_shipmentStatus ({', '.join(references)}); "
+                "not resolving it automatically."
+            )
+    return resolved
+
+
+def apply_shipment_status_order_lookup(
+    df: pd.DataFrame,
+    client,
+    bigquery,
+) -> pd.DataFrame:
+    """Fourth and last resolution step, after the order-reference fallback.
+
+    ``client`` is the TIL-project BigQuery client, NOT the BI one: the table
+    lives in another project. ``None`` skips the step.
+
+    Applies only to rows that reached the end of
+    apply_order_reference_fallback() with a tracking number, no order at all,
+    and the tracking number missing from bi.shipping_platform_shipments --
+    i.e. exactly the rows that would otherwise go to human review with "no
+    order reference found". Rows that already have an order are untouched:
+    a reference the ticket itself carried is better evidence of what the
+    sender is asking about than a carrier event.
+    """
+
+    if df.empty or "extracted_tracking_number" not in df.columns:
+        return df
+
+    if client is None:
+        # No TIL credentials: the rows this step would have rescued simply
+        # stay unresolved, which is the pre-existing behavior.
+        return df
+
+    df = df.copy()
+
+    def _needs_lookup(row: Mapping[str, Any]) -> bool:
+        if not _to_bool(row.get("tracking_not_found_in_shipping_platform_shipments")):
+            return False
+        if split_order_references(row.get("shipment_order_number")):
+            return False
+        return bool(_row_tracking_numbers(row.get("extracted_tracking_number")))
+
+    pending = [row for _, row in df.iterrows() if _needs_lookup(row)]
+    if not pending:
+        return df
+
+    tracking_numbers: list[str] = []
+    for row in pending:
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            if tracking not in tracking_numbers:
+                tracking_numbers.append(tracking)
+
+    print(
+        f"Shipment-status lookup: {len(pending)} request(s) still without an "
+        f"order; querying prd_shipmentStatus for {len(tracking_numbers)} "
+        "tracking number(s)."
+    )
+
+    try:
+        resolved_map = shipment_status_orders_for_trackings(
+            tracking_numbers, client, bigquery
+        )
+    except Exception as error:  # noqa: BLE001 - a failed last resort must not
+        # break the run: these rows were already heading for human review.
+        print(f"  prd_shipmentStatus lookup failed: {error}")
+        return df
+
+    if not resolved_map:
+        print("  No order found in prd_shipmentStatus for any of them.")
+        return df
+
+    resolved_count = 0
+
+    for index, row in df.iterrows():
+        if not _needs_lookup(row):
+            continue
+
+        references: list[str] = []
+        covered = 0
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            reference = resolved_map.get(tracking)
+            if not reference:
+                continue
+            covered += 1
+            if reference not in references:
+                references.append(reference)
+
+        if not references:
+            continue
+
+        resolved_order = ";".join(references)
+        df.at[index, "shipment_order_number"] = resolved_order
+        df.at[index, "extracted_order_reference"] = resolved_order
+        df.at[index, "order_reference_source"] = ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS
+        # The event payload names one specific shipment, so only that block of
+        # the GET_FULL_ORDER payload is read -- the same rule the fallback
+        # applies to a shipment-shaped reference found in the ticket.
+        df.at[index, "shipment_selection_mode"] = (
+            SHIPMENT_SELECTION_EXACT
+            if all(
+                is_shipment_shaped_order_reference(reference)
+                for reference in references
+            )
+            else SHIPMENT_SELECTION_BY_TRACKING
+        )
+        # Complete only when every tracking number of the row found an order;
+        # a partially resolved row must still go to a human, as before.
+        df.at[index, "order_resolution_complete"] = covered == len(
+            _row_tracking_numbers(row.get("extracted_tracking_number"))
+        )
+        df.at[index, "order_processing_blocked"] = contains_blocked_order_reference(
+            resolved_order
+        )
+        resolved_count += 1
+
+    print(
+        f"  Resolved {resolved_count} request(s) from prd_shipmentStatus "
+        "carrier events."
+    )
 
     return df
 
@@ -4481,6 +4768,9 @@ def fetch_tickets_to_active_table() -> int:
         bigquery,
         auth=zendesk_auth(),
         base_url=zendesk_base_url(),
+        # Separate project, separate service account. None when the secret is
+        # missing, which only skips the last-resort lookup.
+        til_client=til_bigquery_client(),
     )
 
     print(f"Replacing active ticket table with {len(df)} new requests...")
