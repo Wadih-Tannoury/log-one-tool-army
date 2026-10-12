@@ -578,6 +578,17 @@ The value is stored as the ISO string the event carries, so
 `format_api_datetime()` renders it for the LOA exactly as it renders a
 `shippedAt`.
 
+This one is **not** limited to the 404 path. GET_FULL_ORDER leaves the export
+date missing in two different ways — the order 404s, or the call succeeds but
+the shipment block simply carries no `shippedAt` — and the LOA fails
+identically in both, with `Cannot generate LOA without full_order_shipped_at`.
+So `_backfill_shipped_at_from_events()` runs in
+`generate_documents_for_dataframe()` immediately before every LOA whose date
+is still blank, and writes the value into the dataframe so the
+`authorization_letter_export_date` check sees it too. The event lookup is
+cached per order, so a row whose date already came from the 404 fallback costs
+nothing and a row with a usable `shippedAt` never queries at all.
+
 #### Order known, shipment not
 
 Both lookups match `shipmentOrderNumber` with a regex rather than equality
