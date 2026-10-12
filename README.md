@@ -418,6 +418,32 @@ missing value is not treated like a missing invoice.
 The shipments-table value still takes precedence everywhere: when the tracking
 lookup succeeds, nothing about the existing behavior changes.
 
+When several shipments contribute an export tracking number, the public reply
+renders them as `1Z…01, 1Z…02`: the `;` the pipeline joins on is an internal
+separator and must never reach the customer, who would read it as part of the
+number (`format_tracking_numbers_for_display()`).
+
+### The tracking guard stands down once the order is resolved
+
+`intent_detection.build_llm_output_row()` escalated on the bare
+`is_tracking_lookup_not_found()` flag, unlike the two other places that apply
+the same rule (`main()`'s dispatch and
+`response_generator.tracking_lookup_requires_human()`), which both pair it with
+`not has_resolved_order(row)`. A request whose order **was** resolved — from the
+subject/description or from a PDF attachment — still reached the LLM through the
+final `else` branch of the dispatch (request number 2+, or no other guard
+matching) and was then escalated here no matter what the LLM understood, with
+`HUMAN INTERVENTION REQUIRED` and the note "Tracking number extracted from the
+ticket was not found ... Regex processing was skipped". The ticket was handed to
+`LOG II lvl` even though `shipment_order_number`, `order_reference_source` and
+`order_resolution_complete` on the same row all showed the order was known and
+GET_FULL_ORDER was queryable.
+
+The branch is now qualified the same way as the other two. The guard still fires
+when nothing identifies the order, and still fires on partial resolution
+(`order_resolution_complete = False`), so a multi-tracking ticket is never
+answered with partial data.
+
 ### No reply may contain `[TO BE RETRIEVED]`
 
 As a backstop, `enforce_reply_consistency()` now routes any row whose
