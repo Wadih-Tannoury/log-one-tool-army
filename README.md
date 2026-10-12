@@ -522,6 +522,29 @@ generation, the same-carrier vs different-carrier reply.
   whole NAV event and is routinely `false` on payloads carrying a perfectly
   usable `invoiceLink` — the example above is one.
 
+#### The invoice lookup is not limited to the 404 path
+
+Most tickets held for `GET_FULL_ORDER API data is missing for:
+return_proforma_invoice` carry **no** `API detail:` line, which means the call
+succeeded — the payload's `invoiceDocuments` simply had no entry of the wanted
+`documentType`. That is the second way an invoice goes missing, and the 404
+fallback never saw it.
+
+So `_backfill_invoice_links_from_events()` runs in
+`generate_documents_for_dataframe()` before the download loop, for any
+requested invoice/RPI whose `full_order_*` column is still blank, whatever
+left it blank. It writes the link into that column, and the existing loop
+downloads it as usual.
+
+**Either FATV link satisfies either request.** The PDF behind a FATV
+`invoiceLink` carries both the commercial invoice and the RPI, so the
+`INV-`/`RPI-` prefix only says which document NAV named the event after — not
+which documents the file contains. Whichever link exists is therefore the
+right answer to both `commercial_invoice` and `return_proforma_invoice`, and
+the substitution runs in both directions; when both links exist the matching
+prefix is still preferred. A substituted link is logged as such and the row
+carries `full_order_invoice_link_source = prd_invoiceUpdate.FATV_RESULT`.
+
 #### Tracking — `prd_shipmentStatus`, `eventType IN ('PACKED','SHIPPED')`
 
 Those are the only two event types carrying `data.shippingData`. Each entry
