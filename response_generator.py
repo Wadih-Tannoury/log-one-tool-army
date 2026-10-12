@@ -651,11 +651,27 @@ def export_tracking_value(row):
     shipment block of the order (see _resolve_export_tracking).
     """
 
-    return first_available_value(
+    value = first_available_value(
         row.get("shipment_tracking_number"),
         row.get(FULL_ORDER_EXPORT_TRACKING_COLUMN),
         default=PLACEHOLDER,
     )
+    return format_tracking_numbers_for_display(value)
+
+
+def format_tracking_numbers_for_display(value):
+    """Render a stored ``a;b`` tracking column as ``a, b``.
+
+    The semicolon is the pipeline's internal join character (the invoice
+    downloader splits on it); it must not reach the customer, who would read
+    it as part of the number.
+    """
+
+    if is_blank(value) or value == PLACEHOLDER:
+        return value
+
+    numbers = [part.strip() for part in re.split(r"[;,]", str(value)) if part.strip()]
+    return ", ".join(numbers) if numbers else value
 
 
 def export_tracking_or_unavailable(row, unavailable_text):
