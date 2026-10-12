@@ -1058,6 +1058,56 @@ def _append_document_error(df, index: object, message: str) -> None:
     df.at[index, error_column] = message
 
 
+def _backfill_shipped_at_from_events(df, index: object) -> None:
+    """Fill a blank full_order_shipped_at from the PACKED/SHIPPED events.
+
+    GET_FULL_ORDER leaves the export date missing in two different ways: the
+    order 404s (and the 404 fallback has already supplied the date), or the
+    call succeeds but the shipment block carries no shippedAt at all. Only the
+    first case is covered by fetch_shipment_order_data, yet the LOA fails
+    identically in both -- "Cannot generate LOA without full_order_shipped_at".
+
+    The carrier events know when the parcel left either way, so they are read
+    here as well. The lookup is cached per order, so a row whose date already
+    came from the 404 fallback costs nothing, and a row with a usable
+    shippedAt never queries at all.
+    """
+
+    column = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
+    if column in df.columns and not is_blank(df.at[index, column]):
+        return
+
+    raw_orders = (
+        df.at[index, "shipment_order_number"]
+        if "shipment_order_number" in df.columns
+        else None
+    )
+    shipment_orders = [part.strip() for part in str(raw_orders or "").split(";") if part.strip()]
+
+    for shipment_order_number in shipment_orders:
+        try:
+            events = tracking_numbers_from_shipment_status(shipment_order_number)
+        except Exception as exc:  # noqa: BLE001 - the LOA simply stays blocked
+            print(
+                "  prd_shipmentStatus export-date lookup failed for "
+                f"{shipment_order_number}: {exc}"
+            )
+            return
+
+        value = events.get(column)
+        if is_blank(value):
+            continue
+
+        if column not in df.columns:
+            df[column] = None
+        df.at[index, column] = value
+        print(
+            f"  Export date for row {index} taken from the prd_shipmentStatus "
+            f"events ({shipment_order_number}): {value}."
+        )
+        return
+
+
 def generate_documents_for_dataframe(df, *, force: bool = False):
     if df.empty:
         return df
@@ -1118,6 +1168,15 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
             column = DOCUMENT_RESPONSE_COLUMNS["authorization_letter"]
             existing_path = row.get(column)
             if force or is_blank(existing_path) or not document_path_exists(existing_path):
+                # The export date is the one LOA field GET_FULL_ORDER often
+                # cannot supply -- either because the order 404'd or because
+                # the shipment block simply carries no shippedAt -- and
+                # without it the letter cannot be generated at all. The
+                # carrier events know when the parcel left, so fill the column
+                # from them before giving up. Written back into df so the
+                # response builder's authorization_letter_export_date check
+                # sees it too.
+                _backfill_shipped_at_from_events(df, index)
                 try:
                     row_data = df.loc[index].to_dict()
                     df.at[index, column] = generate_authorization_letter(row_data)
