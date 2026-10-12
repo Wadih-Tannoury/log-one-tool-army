@@ -100,6 +100,10 @@ DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
 SUPPRESSED_RESPONSE_DATA_KEYS = {"previously_requested_documentation"}
 
 FULL_ORDER_SHIPPED_AT_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
+FULL_ORDER_EXPORT_TRACKING_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]
+FULL_ORDER_RETURN_TRACKING_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]
+FULL_ORDER_EXPORT_CARRIER_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["export_carrier_code"]
+FULL_ORDER_RETURN_CARRIER_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["return_carrier_code"]
 FULL_ORDER_API_ERROR_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
 DOCUMENT_GENERATION_ERROR_COLUMN = DOCUMENT_RESPONSE_COLUMNS["document_error"]
 
@@ -590,16 +594,19 @@ def generated_document_value(row, data_key):
 
 def data_value(row, data_key):
     if data_key == "export_tracking_number":
-        return first_available_value(
-            row.get("shipment_tracking_number"),
-            default=PLACEHOLDER,
-        )
+        return export_tracking_value(row)
 
     if data_key == "ups_account_number":
         ups_code = extract_ups_code(
             row.get("shipment_tracking_number"),
+            # Same fallback as export_tracking_value(): when the shipments
+            # table could not resolve the ticket's tracking number, the UPS
+            # account code is still derivable from the export tracking number
+            # read out of the GET_FULL_ORDER shipment block.
+            row.get(FULL_ORDER_EXPORT_TRACKING_COLUMN),
             row.get("extracted_tracking_number"),
             row.get("return_tracking_number"),
+            row.get(FULL_ORDER_RETURN_TRACKING_COLUMN),
         )
         return ups_code or PLACEHOLDER
 
@@ -634,9 +641,19 @@ def data_value(row, data_key):
 
 
 def export_tracking_value(row):
-    """Return the non-return/export tracking number from shipment enrichment."""
+    """Return the non-return/export tracking number.
+
+    The shipments-table value comes first, unchanged. The GET_FULL_ORDER
+    fallback is what answers a request whose tracking number was never found
+    in bi.shipping_platform_shipments: the order was resolved from a reference
+    in the subject/description or in a PDF attachment, and
+    response_data_extractor read the export tracking number out of the right
+    shipment block of the order (see _resolve_export_tracking).
+    """
+
     return first_available_value(
         row.get("shipment_tracking_number"),
+        row.get(FULL_ORDER_EXPORT_TRACKING_COLUMN),
         default=PLACEHOLDER,
     )
 
@@ -665,6 +682,20 @@ def return_export_carriers_are_same(row):
 
     export_carrier = normalize_carrier_code_value(row.get("shipment_carrier_code"))
     return_carrier = normalize_carrier_code_value(row.get("return_carrier_code"))
+
+    # Fallback for requests the shipments table could not resolve: the
+    # GET_FULL_ORDER shipment block states the carrier of each label
+    # (shippingLabels[].carrierCode) next to its tracking number, so the
+    # comparison is still answerable rather than defaulting to "different
+    # carriers" and telling the carrier the export tracking is unavailable.
+    if not export_carrier:
+        export_carrier = normalize_carrier_code_value(
+            row.get(FULL_ORDER_EXPORT_CARRIER_COLUMN)
+        )
+    if not return_carrier:
+        return_carrier = normalize_carrier_code_value(
+            row.get(FULL_ORDER_RETURN_CARRIER_COLUMN)
+        )
 
     if not export_carrier or not return_carrier:
         return None
@@ -2743,6 +2774,30 @@ def enforce_reply_consistency(row):
         return row
     if is_excluded_from_processing(row):
         return row
+
+    # A public reply must never contain the "[TO BE RETRIEVED]" placeholder:
+    # that is a value the pipeline failed to resolve, and sending it tells the
+    # carrier nothing while looking like an answer. Route to human review
+    # instead. This is a backstop for every template at once, so a data key
+    # that slips past the per-key checks in
+    # missing_required_full_order_values() still cannot reach Zendesk.
+    final_response = row.get("final_response")
+    if not is_blank(final_response) and PLACEHOLDER in str(final_response):
+        row = dict(row)
+        row["human_intervention_required"] = True
+        row["draft_response"] = (
+            "HUMAN INTERVENTION REQUIRED\n\n"
+            f"Reason: the response still contains the {PLACEHOLDER} placeholder, "
+            "so at least one requested value could not be resolved. No automatic "
+            "reply was sent.\n"
+            f"Ticket: {row.get('zendesk_ticket_id', '')}\n"
+            f"Request number: {row.get('request_number', '')}\n\n"
+            "Draft for human review:\n\n"
+            f"{row.get('draft_response', '')}"
+        )
+        row["final_response"] = ""
+        return row
+
     if not is_blank(row.get("final_response")):
         return row
 
