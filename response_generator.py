@@ -2140,6 +2140,36 @@ def _sorted_data_keys_for_reason(data_keys):
     return ", ".join(sorted(str(data_key) for data_key in data_keys if data_key))
 
 
+def _document_error_detail_for(row, missing_values):
+    """The part of generated_document_error that explains THIS block.
+
+    The column accumulates one "<data_key>: <message>" entry per failed
+    document, joined by "; ", and several of those are not blockers at all --
+    a shipping label the labels API could not return never withholds the
+    reply, because the customer still gets the tracking number. Quoting it
+    next to an unrelated missing value made the note read as though the label
+    were the reason the ticket was held, so only entries naming something in
+    `missing_values` are reported here.
+    """
+
+    value = row.get(DOCUMENT_GENERATION_ERROR_COLUMN)
+    if is_blank(value):
+        return ""
+
+    blocking = set(missing_values or [])
+    relevant = []
+    for entry in str(value).split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        data_key = entry.split(":", 1)[0].strip()
+        # missing_required_full_order_values() names a failed LOA/POA as
+        # "<key>_pdf"; the error entry names the key itself.
+        if data_key in blocking or f"{data_key}_pdf" in blocking:
+            relevant.append(entry)
+    return "; ".join(relevant)
+
+
 def human_intervention_data_policy_reason(row, requested_data):
     first_request = normalize_request_number(row.get("request_number", 1)) == 1
     raw_requested_set = set(all_requested_data_sources(row))
@@ -2278,8 +2308,7 @@ def should_force_human_intervention(row, requested_data):
         )
         if api_error:
             reason += f" API detail: {api_error}"
-        document_error_value = row.get(DOCUMENT_GENERATION_ERROR_COLUMN)
-        document_error = "" if is_blank(document_error_value) else str(document_error_value).strip()
+        document_error = _document_error_detail_for(row, missing_full_order_values)
         if document_error:
             reason += f" Document detail: {document_error}"
         return True, reason
