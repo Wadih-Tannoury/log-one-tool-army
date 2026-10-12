@@ -265,10 +265,18 @@ _PREFIX_ALTERNATION = "|".join(
     for prefix in sorted(ORDER_REFERENCE_PREFIXES, key=len, reverse=True)
 )
 
+# The boundaries are explicit "not an alphanumeric" assertions rather than \b.
+# \b treats "_" as a word character, and the UPS return label prints the
+# reference with a trailing underscore -- "Reference No.1: CV-US-00042647_" --
+# so \b forced the match to fail on exactly the line that carries the order
+# number. (The tail cannot be shortened to find a boundary either, because the
+# next character is still a digit, so the whole match was lost rather than
+# truncated.) These assertions keep every previous match and add the
+# underscore-delimited ones.
 ORDER_REFERENCE_RE = re.compile(
-    rf"\b(?P<prefix>{_PREFIX_ALTERNATION})"
+    rf"(?<![A-Z0-9])(?P<prefix>{_PREFIX_ALTERNATION})"
     rf"(?P<marker>[A-Z]|{_SEPARATOR})"
-    r"(?P<tail>[A-Z0-9]{4,20})\b",
+    r"(?P<tail>[A-Z0-9]{4,20})(?![A-Z0-9])",
     re.IGNORECASE,
 )
 
@@ -318,15 +326,41 @@ def find_order_references(*texts: object) -> list[str]:
                 continue
             marker = match.group("marker")
             marker = marker.upper() if marker.isalpha() else "-"
-            reference = f"{prefix}{marker}{_normalize_tail(match.group('tail'))}"
+            reference = strip_reissued_reference_suffix(
+                f"{prefix}{marker}{_normalize_tail(match.group('tail'))}"
+            )
             if reference not in found:
                 found.append(reference)
     return found
 
 
+# A reference re-issued after a correction is printed with a "_NEW" suffix
+# (e.g. "DG-USB11607007_NEW"). The suffix is bookkeeping, not part of the
+# number: GET_FULL_ORDER and bi.shipping_platform_shipments both know the
+# order only as "DG-USB11607007", so it is stripped everywhere a reference is
+# normalized. Trailing separators left behind by the suffix go with it.
+# The separator before NEW is required: stripping a bare trailing "NEW" would
+# mangle any genuine reference whose tail happens to end in those letters.
+_REISSUED_REFERENCE_SUFFIX_RE = re.compile(
+    r"[\-_\s]+NEW[\-_\s]*$",
+    re.IGNORECASE,
+)
+
+
+def strip_reissued_reference_suffix(value: str) -> str:
+    """Drop a trailing "_NEW" marker from an already-normalized reference."""
+
+    stripped = _REISSUED_REFERENCE_SUFFIX_RE.sub("", value)
+    # Never strip the reference away entirely: a token that is nothing but
+    # "NEW" is not a reference, and returning "" here would hide that from
+    # the caller's own validation.
+    return stripped or value
+
+
 def normalize_order_reference(value: object) -> str:
     value = _normalize_dashes(value).strip().upper()
-    return re.sub(r"\s+", "", value)
+    value = re.sub(r"\s+", "", value)
+    return strip_reissued_reference_suffix(value)
 
 
 def order_reference_prefix(value: object) -> str:
