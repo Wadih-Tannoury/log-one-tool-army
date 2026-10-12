@@ -2407,6 +2407,13 @@ ORDER BY event_timestamp DESC
 # One row per shippingData entry of the order's PACKED/SHIPPED events, newest
 # first. shipType is what separates the two legs: SHIPPING is the outbound
 # (export) label, RETURN is the return label.
+#
+# The UNNEST is a LEFT JOIN, and empty tracking numbers are filtered in Python
+# rather than here, so that an event still contributes its products[] list even
+# when it carries no usable shippingData entry at all -- the returned-items
+# fallback must not depend on the tracking fallback having found something.
+# products[] sits at the top level of the payload, beside data{}, and is
+# repeated on every row of the same event; only its productId values are read.
 SHIPMENT_STATUS_TRACKING_QUERY = f"""
 SELECT
     UPPER(TRIM(IFNULL(
@@ -2415,12 +2422,17 @@ SELECT
     UPPER(TRIM(IFNULL(JSON_VALUE(ship, '$.shipType'), '')))     AS ship_type,
     JSON_VALUE(ship, '$.trackingNumber')                        AS tracking_number,
     JSON_VALUE(ship, '$.carrierCode')                           AS carrier_code,
+    JSON_QUERY(s.requestPayload, '$.products')                  AS products_json,
+    UPPER(TRIM(IFNULL(s.eventType, '')))                        AS event_type,
+    JSON_VALUE(s.requestPayload, '$.eventTimestamp')            AS event_timestamp_raw,
     SAFE_CAST(
         JSON_VALUE(s.requestPayload, '$.eventTimestamp') AS TIMESTAMP
     ) AS event_timestamp
 
-FROM {SHIPMENT_STATUS_TABLE} AS s,
-     UNNEST(JSON_EXTRACT_ARRAY(s.requestPayload, '$.data.shippingData')) AS ship
+FROM {SHIPMENT_STATUS_TABLE} AS s
+LEFT JOIN UNNEST(
+    JSON_EXTRACT_ARRAY(s.requestPayload, '$.data.shippingData')
+) AS ship
 
 WHERE s.eventType IN UNNEST(@event_types)
   AND EXISTS (
@@ -2433,7 +2445,6 @@ WHERE s.eventType IN UNNEST(@event_types)
           pattern
       )
   )
-  AND TRIM(IFNULL(JSON_VALUE(ship, '$.trackingNumber'), '')) != ''
 
 ORDER BY event_timestamp DESC
 """
@@ -2575,6 +2586,59 @@ def _invoice_data_key_from_fatv_result(
     return "commercial_invoice"
 
 
+def _product_ids_from_payload_products(products_json: object) -> list[str]:
+    """The productId values of a prd_shipmentStatus payload's products[] list.
+
+    The event carries no SKU, product name or image -- only identifiers:
+
+        {"products": [{"productId": "408052381130892", "quantity": 1,
+                       "data": {"cartonId": "...", "productLineId": "..."}}, ...]}
+
+    so the product ids are all the returned-items confirmation can be built
+    from when GET_FULL_ORDER is unavailable. Duplicates are collapsed and the
+    payload order is kept.
+    """
+
+    raw = products_json
+    if isinstance(raw, (str, bytes, bytearray)):
+        text = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        text = text.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError):
+            return []
+
+    if not isinstance(raw, list):
+        return []
+
+    product_ids: list[str] = []
+    for product in raw:
+        if not isinstance(product, Mapping):
+            continue
+        product_id = str(product.get("productId") or "").strip()
+        if product_id and product_id not in product_ids:
+            product_ids.append(product_id)
+    return product_ids
+
+
+def format_product_ids(product_ids: Iterable[str]) -> str | None:
+    """Render product ids in the shape format_returned_items() produces.
+
+    They are labelled "Product ID" rather than "SKU": the event gives an
+    internal identifier, and calling it a SKU in a customer-facing reply would
+    be wrong.
+    """
+
+    lines = [
+        f"  - Product ID: {str(product_id).strip()}"
+        for product_id in product_ids
+        if str(product_id or "").strip()
+    ]
+    return "\n".join(lines) if lines else None
+
+
 def _is_downloadable_invoice_link(value: object) -> bool:
     """Whether a FATV invoiceLink is something the downloader can fetch.
 
@@ -2662,7 +2726,7 @@ def invoice_links_from_invoice_update(
 def tracking_numbers_from_shipment_status(
     shipment_order_number: object,
 ) -> dict[str, Any]:
-    """Export/return tracking numbers and carriers, from the carrier events.
+    """Export/return tracking, carriers and returned items, from the events.
 
     The PACKED and SHIPPED events are the only ones carrying ``shippingData``,
     and each entry there is labelled with a ``shipType``: ``SHIPPING`` is the
@@ -2670,7 +2734,21 @@ def tracking_numbers_from_shipment_status(
     distinction ``_resolve_export_tracking`` reads out of a GET_FULL_ORDER
     shipment block, so the values land in the same columns and every
     downstream rule -- the UPS account code, LOA/POA generation, the
-    same-carrier vs different-carrier reply -- keeps working unchanged.
+    same-carrier vs different-carrier reply -- keeps working unchanged. An
+    entry whose trackingNumber is empty (the RETURN leg routinely is) is
+    simply skipped.
+
+    The same events also carry the shipment's contents under a top-level
+    ``products[]``, from which only the ``productId`` values are read: that is
+    the returned-items confirmation when GET_FULL_ORDER cannot supply one, and
+    without it a ticket asking for both tracking and returned items would
+    still be held for a human.
+
+    The event's own ``eventTimestamp`` stands in for the shipment's
+    ``shippedAt``, which is the export date the LOA prints: the latest SHIPPED
+    event, or the latest PACKED one for an order that never produced a
+    SHIPPED. Without it, authorization_letter_export_date would block every
+    LOA on a 404'd order.
 
     Returns ``{}`` when nothing usable is found.
     """
@@ -2708,8 +2786,29 @@ def tracking_numbers_from_shipment_status(
     return_numbers: list[str] = []
     export_carriers: list[str] = []
     return_carriers: list[str] = []
+    # Products per shipment, newest event first: an event that re-states the
+    # shipment's contents supersedes the older one rather than adding to it.
+    products_by_shipment: dict[str, list[str]] = {}
+    # The export date the LOA prints. GET_FULL_ORDER would have given
+    # shipment.shippedAt; here the event's own eventTimestamp is that date.
+    # SHIPPED is the real one, PACKED only the stand-in for an order that
+    # never produced a SHIPPED event.
+    shipped_at_by_event_type: dict[str, str] = {}
 
     for row in rows:
+        event_timestamp = str(row.get("event_timestamp_raw") or "").strip()
+        event_type = str(row.get("event_type") or "").strip().upper()
+        # Rows arrive newest first, so the first timestamp seen per event type
+        # is the latest one.
+        if event_timestamp and event_type not in shipped_at_by_event_type:
+            shipped_at_by_event_type[event_type] = event_timestamp
+
+        shipment = str(row.get("shipment_order_number") or "").strip().upper()
+        if shipment not in products_by_shipment:
+            product_ids = _product_ids_from_payload_products(row.get("products_json"))
+            if product_ids:
+                products_by_shipment[shipment] = product_ids
+
         tracking = str(row.get("tracking_number") or "").strip()
         if not tracking:
             continue
@@ -2731,7 +2830,19 @@ def tracking_numbers_from_shipment_status(
         if carrier and carrier not in carriers:
             carriers.append(carrier)
 
-    if not export_numbers and not return_numbers:
+    all_product_ids: list[str] = []
+    for product_ids in products_by_shipment.values():
+        for product_id in product_ids:
+            if product_id not in all_product_ids:
+                all_product_ids.append(product_id)
+
+    shipped_at = (
+        shipped_at_by_event_type.get("SHIPPED")
+        or shipped_at_by_event_type.get("PACKED")
+        or None
+    )
+
+    if not export_numbers and not return_numbers and not all_product_ids and not shipped_at:
         result: dict[str, Any] = {}
     else:
         result = {
@@ -2753,6 +2864,10 @@ def tracking_numbers_from_shipment_status(
             FULL_ORDER_RESPONSE_COLUMNS["export_tracking_source"]: (
                 EXPORT_TRACKING_SOURCE_SHIPMENT_STATUS if export_numbers else None
             ),
+            FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"]: (
+                format_product_ids(all_product_ids)
+            ),
+            FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]: shipped_at,
         }
 
     with _shipment_status_lock:
@@ -2764,14 +2879,13 @@ def tracking_numbers_from_shipment_status(
 def til_events_fallback_data(shipment_order_number: object) -> dict[str, Any]:
     """Row-shaped GET_FULL_ORDER substitute built from the TIL event tables.
 
-    Invoice/RPI links from prd_invoiceUpdate, tracking numbers and carriers
-    from prd_shipmentStatus. Empty when neither table has anything, so the
-    caller re-raises the 404.
+    Invoice/RPI links from prd_invoiceUpdate; tracking numbers, carriers and
+    the returned-items confirmation from prd_shipmentStatus. Empty when
+    neither table has anything, so the caller re-raises the 404.
 
     The remaining full_order_* fields stay blank on purpose: these events know
-    nothing about the customer, the address or the returned items, and
-    inventing them would be worse than leaving the response builder to report
-    them as missing.
+    nothing about the customer or the address, and inventing them would be
+    worse than leaving the response builder to report them as missing.
     """
 
     result: dict[str, Any] = {}
@@ -2815,6 +2929,15 @@ def _describe_til_fallback(fallback: Mapping[str, Any]) -> str:
         value = fallback.get(FULL_ORDER_RESPONSE_COLUMNS[data_key])
         if not is_blank(value):
             parts.append(f"{data_key}={value}")
+    returned_items = fallback.get(
+        FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"]
+    )
+    if not is_blank(returned_items):
+        count = len([line for line in str(returned_items).split("\n") if line.strip()])
+        parts.append(f"{count} product id(s)")
+    shipped_at = fallback.get(FULL_ORDER_RESPONSE_COLUMNS["shipped_at"])
+    if not is_blank(shipped_at):
+        parts.append(f"shipped_at={shipped_at}")
     return ", ".join(parts) or "nothing"
 
 
