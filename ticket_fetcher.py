@@ -145,6 +145,7 @@ HISTORY_COLUMNS = [
     "shipment_order_number",
     "shipment_tracking_number",
     "return_tracking_number",
+    "full_order_export_tracking_number",
     "extracted_order_reference",
     "order_reference_source",
     "shipment_selection_mode",
@@ -743,6 +744,7 @@ _ADDITIVE_HISTORY_COLUMNS = (
     ("shipment_selection_mode", "STRING"),
     ("order_processing_blocked", "BOOL"),
     ("order_resolution_complete", "BOOL"),
+    ("full_order_export_tracking_number", "STRING"),
 )
 _HISTORY_SCHEMA_ENSURED = False
 
