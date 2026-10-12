@@ -38,6 +38,10 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PROJECT_ID: tlg-business-intelligence-prd
       BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
+      # Separate service account for tlg-wlfs-prd, read by
+      # til_bigquery_client() for the prd_shipmentStatus lookup. Optional: a
+      # missing secret only skips that last-resort step.
+      TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
