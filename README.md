@@ -423,6 +423,77 @@ renders them as `1Z…01, 1Z…02`: the `;` the pipeline joins on is an internal
 separator and must never reach the customer, who would read it as part of the
 number (`format_tracking_numbers_for_display()`).
 
+### Fourth resolution step: `til.prd_shipmentStatus`
+
+Order of resolution is now:
+
+1. tracking number -> `bi.shipping_platform_shipments`;
+2. order reference in the subject / description / request body;
+3. order reference inside a PDF attached to the ticket;
+4. **tracking number -> the carrier events in `tlg-wlfs-prd.til.prd_shipmentStatus`.**
+
+Step 4 runs in `apply_shipment_status_order_lookup()`, straight after the
+order-reference fallback, and only for rows that came out of it with a tracking
+number, no order at all, and the tracking number missing from
+`bi.shipping_platform_shipments` — exactly the rows that would otherwise reach
+human review as "no order reference found". The `PACKED` and `SHIPPED` events
+carry `data.shipmentOrderNumber` next to `shippingData[].trackingNumber`, so a
+tracking number the shipments table never received can still be tied to an
+order, which then goes to GET_FULL_ORDER like any other.
+
+Rows that already have an order are left untouched: a reference the ticket
+itself carried is better evidence of what the sender is asking about than a
+carrier event.
+
+Three guards on what the events are allowed to produce:
+
+- **Ambiguity is not resolved.** The events are grouped by
+  (tracking number, order), so the usual PACKED-then-SHIPPED pair for one order
+  collapses to a single row. A tracking number that genuinely names two
+  different orders survives as two rows and is then skipped with a log line,
+  rather than reporting whichever one `ANY_VALUE` happened to pick.
+- **The value is validated.** Each `shipmentOrderNumber` goes through
+  `split_order_references()`, the same check every other order passes, so a
+  payload carrying something like `LN_SUP_DTM` cannot become a phantom order.
+  A `_NEW` suffix in the payload is stripped by the same rule as everywhere
+  else.
+- **Partial resolution stays incomplete.** On a row with several tracking
+  numbers, `order_resolution_complete` is set only when every one of them found
+  an order, so a partly-resolved request still goes to a human.
+
+**Separate credentials.** `til.prd_shipmentStatus` lives in the `tlg-wlfs-prd`
+GCP project, which the BI service account cannot read, so the step uses its own
+client built by `til_bigquery_client()` from the `TIL_BIGQUERY_CREDS` secret
+(service-account JSON, same shape as `BI_BIGQUERY_CREDS`; exposed to the job in
+`.github/workflows/agent_triggerer.yml`). The client's project comes from the
+key's own `project_id`, so a key re-issued for another project needs no code
+change; `TIL_PROJECT_ID` is only the fallback.
+
+The secret is **optional by design**. A missing, blank or malformed value logs
+one line and returns `None`, which skips the lookup — it is the last resort for
+rows already heading to human review, so the whole run must not fail over it.
+The same applies to the query: a failure, including a permissions error, is
+caught and logged rather than raised. The resolved rows carry
+`order_reference_source = shipment_status_events`; nothing keys off the
+particular value, since every guard tests whether `shipment_order_number` is
+present rather than where it came from.
+
+### `HB-EU`
+
+`HB-EU` is in `ORDER_REFERENCE_PREFIXES` (114 prefixes, 29 brand codes). It
+resolves through every entry point: ticket text, PDF/OCR, the stored
+`shipment_order_number` column and the prd_shipmentStatus events; both shapes
+work (`HB-EU-01234567` order, `HB-EUA01234567` shipment, the latter mapping to
+`HB-EU-01234567` for GET_FULL_ORDER); it is not on a blocked prefix.
+
+Note that the `HB` brand has **no** entry in `_COUNTRY_TICKET_FIELD_IDS`
+(`customs_rules.py`). That is not an error — the pipeline checks for the field
+and skips the country tag when a brand has none — but if Zendesk does define a
+"Country HB" field, it must be added there or the solve transition will be
+rejected with "Country HB: is required when solving a ticket". The field ID can
+also be supplied at runtime through `ZENDESK_COUNTRY_FIELD_IDS_JSON` without a
+code change.
+
 ### Order references ending in an underscore
 
 `ORDER_REFERENCE_RE` delimited the reference with `\b`. Python's `\b` counts
