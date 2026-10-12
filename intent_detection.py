@@ -738,7 +738,16 @@ def build_llm_output_row(source_row, result):
             f"is required. LLM notes: {notes}"
         )
 
-    elif is_tracking_lookup_not_found(source_row):
+    elif is_tracking_lookup_not_found(source_row) and not has_resolved_order(source_row):
+        # Qualified exactly as the dispatch in main() and as
+        # response_generator.tracking_lookup_requires_human() already do. An
+        # unknown tracking number only blocks the reply when nothing else
+        # identifies the order; once an order reference has been resolved from
+        # the subject/description or from a PDF attachment, GET_FULL_ORDER can
+        # be queried and the request is answerable. Without this qualifier a
+        # request whose order WAS resolved still reached the LLM through the
+        # final else-branch in main() (request number 2+, or no other guard)
+        # and was then escalated here regardless of what the LLM understood.
         engine = "llm_tracking_lookup_not_found_guard"
         request_types = ["tracking_lookup_not_found_guard"]
         understood_requested_data = [
