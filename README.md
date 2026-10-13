@@ -96,6 +96,27 @@ human to close by hand. That branch sits ahead of the request-number guard in
 `build_llm_output_row()` for exactly this reason. Anything else goes to
 `LOG II lvl` with no reply.
 
+**A follow-up's subject is not its request.** The subject line never changes
+down an email thread, so a second message whose body is only `Thank you.`
+still arrives under `Needing Commercial Invoice - Tracking# ...`. The LLM read
+the stale subject as a fresh request, returned `commercial_invoice` at 0.95
+with the note "Body is an acknowledgement", and the invoice was sent to
+someone who had just confirmed receiving it. Three things prevent that now:
+
+- the batch payload carries `request_number` and `is_follow_up`, so the model
+  can tell a first message from a fifth at all;
+- the prompt tells it to decide from `request_body` alone on a follow-up, and
+  to treat the subject only as background about which shipment the thread
+  concerns;
+- `build_llm_output_row()` overrides the model outright when the body of a
+  request 2+ message is a bare acknowledgement
+  (`customs_rules.is_acknowledgement_only`, a full-string match). The ticket
+  is then solved with no reply, `engine=acknowledgement_only_follow_up_guard`.
+
+The override is deliberately narrow: "thanks, but the invoice is unreadable"
+is not an acknowledgement-only body and is classified normally, so a real
+request hidden behind a thank-you is never suppressed.
+
 The `noreply*` / `autoreply*` senders that are solved without analysis are
 unaffected; `submit_final_responses()` routes them before any of this.
 
