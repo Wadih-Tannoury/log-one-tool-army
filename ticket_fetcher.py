@@ -1428,7 +1428,24 @@ def zendesk_public_comment_exists(
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
-    """Return True when the same public comment body is already on the ticket."""
+    """Return True when this exact reply is still the last word on the ticket.
+
+    The guard exists for one case: a reply that was posted but whose run did
+    not record it (status update rejected, history write lost, dry run turned
+    off mid-flight), which would otherwise be posted a second time.
+
+    It used to scan the whole comment history, which made it fire on a
+    perfectly legitimate second request. A customer who writes back after
+    being answered -- "the invoice is unreadable", "please resend" -- gets a
+    new request_number, is analyzed normally, and can quite reasonably need
+    the same documents again; refusing to post because that text appears
+    somewhere above in the thread leaves the ticket open with the customer's
+    question unanswered, which is what happened to ticket 5004054.
+
+    So only the *last* public comment is compared. If anyone has spoken since
+    our reply -- the requester above all -- this is a new exchange and the
+    answer is posted again.
+    """
 
     auth = auth or zendesk_auth()
     base_url = (base_url or zendesk_base_url()).rstrip("/")
@@ -1436,13 +1453,18 @@ def zendesk_public_comment_exists(
     if not wanted_body:
         return False
 
+    last_public_comment = None
     for comment in get_ticket_comments(ticket_id, auth=auth, base_url=base_url):
-        if not comment.get("public", True):
-            continue
-        for body_key in ("body", "plain_body"):
-            if _normalize_comment_body(comment.get(body_key)) == wanted_body:
-                return True
-    return False
+        if comment.get("public", True):
+            last_public_comment = comment
+
+    if last_public_comment is None:
+        return False
+
+    return any(
+        _normalize_comment_body(last_public_comment.get(body_key)) == wanted_body
+        for body_key in ("body", "plain_body")
+    )
 
 
 
