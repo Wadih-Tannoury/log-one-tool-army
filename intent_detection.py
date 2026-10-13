@@ -49,11 +49,13 @@ from customs_rules import (
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
     detect_language_with_dictionary,
+    is_acknowledgement_only,
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
     is_request_number_2_or_higher,
     is_request_number_3_or_higher,
+    normalize_request_number,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
 )
@@ -708,7 +710,33 @@ def build_llm_output_row(source_row, result):
     llm_model_used = str(result.get("llm_model_used", "") or "").strip()
     llm_model_attempts = str(result.get("llm_model_attempts", "") or "").strip()
 
-    if requested_data == [PURELY_INFORMATIVE_SOLVED]:
+    if is_request_number_2_or_higher(
+        source_row.get("request_number", 1)
+    ) and is_acknowledgement_only(source_text_for_llm(source_row)):
+        # Backstop for the stale-subject trap. The subject never changes down
+        # an email thread, so a follow-up whose body is only "Thank you."
+        # still arrives under "Needing Commercial Invoice - Tracking# ...",
+        # and the model answered the subject: it returned commercial_invoice
+        # at 0.95 with the note "Body is an acknowledgement", and the invoice
+        # was sent to someone who had just confirmed receiving it.
+        #
+        # The LLM is still called and still consulted -- this only overrides
+        # it when the body, on its own, is nothing but an acknowledgement
+        # (is_acknowledgement_only requires a full match, so "thanks, but the
+        # invoice is unreadable" is not caught here and is classified
+        # normally).
+        engine = "acknowledgement_only_follow_up_guard"
+        request_types = [PURELY_INFORMATIVE_SOLVED]
+        requested_data = [PURELY_INFORMATIVE_SOLVED]
+        human_intervention_required = False
+        notes = (
+            "Follow-up message whose body is a bare acknowledgement, with no "
+            "new request. Solved without a response; the ticket subject still "
+            "names the original request and is not treated as a new one. "
+            f"LLM notes: {notes}"
+        )
+
+    elif requested_data == [PURELY_INFORMATIVE_SOLVED]:
         # Deliberately ahead of the request-number guard below: a message that
         # asks for nothing -- "thanks, received", an acknowledgement of the
         # previous reply -- is solved with no public comment at ANY request
@@ -1126,6 +1154,14 @@ def _build_batch_payload(batch_rows):
             {
                 "source_id": source_id,
                 "subject": str(row.get("subject", "") or ""),
+                # The subject never changes down an email thread, so on a
+                # follow-up it still advertises the ORIGINAL request ("Needing
+                # Commercial Invoice - Tracking# ...") even when the new
+                # message says only "Thank you.". Without these two fields the
+                # model cannot tell the first message from the fifth, and it
+                # read the stale subject as a fresh request.
+                "request_number": normalize_request_number(row.get("request_number")),
+                "is_follow_up": is_request_number_2_or_higher(row.get("request_number")),
                 "request_body": source_text_for_llm(row),
                 "ticket_category": str(row.get("ticket_category", "") or ""),
                 "regex_candidates": list_or_empty(row.get("regex_requested_data")),
