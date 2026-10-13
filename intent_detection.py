@@ -52,6 +52,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
+    is_request_number_2,
     is_request_number_2_or_higher,
     is_request_number_3_or_higher,
     normalize_requested_data,
@@ -708,8 +709,25 @@ def build_llm_output_row(source_row, result):
     llm_model_used = str(result.get("llm_model_used", "") or "").strip()
     llm_model_attempts = str(result.get("llm_model_attempts", "") or "").strip()
 
-    if requested_data == [PURELY_INFORMATIVE_SOLVED]:
-        # Regardless of request number, tracking-number-in-ticket status, or
+    if is_request_number_3_or_higher(source_row.get("request_number", 1)):
+        # Request number 3 or higher gets no automatic outcome at all -- not
+        # an answer, not a solve. main() now stops these rows before the LLM
+        # is ever called, so this is a backstop for rows that reach the LLM
+        # by some other route; it deliberately runs before the
+        # purely-informative branch, which used to be able to solve a 3+
+        # ticket on its own.
+        engine = "llm_request_number_3_or_higher_guard"
+        request_types = ["request_number_3_or_higher_guard"]
+        requested_data = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            "Request number is 3 or higher. No automatic answer and no "
+            "automatic solve is allowed from the third exchange on; the "
+            f"ticket is handed to a human. LLM notes: {notes}"
+        )
+
+    elif requested_data == [PURELY_INFORMATIVE_SOLVED]:
+        # Regardless of tracking-number-in-ticket status or
         # tracking-number-in-shipment status: the LLM decided the message is
         # purely informative, with no data or action requested. Submit the
         # ticket as solved without a public response.
@@ -720,22 +738,6 @@ def build_llm_output_row(source_row, result):
             "LLM classified this request as purely informative, with no "
             "data or action requested. Submitted as solved without a "
             f"response. LLM notes: {notes}"
-        )
-
-    elif is_request_number_3_or_higher(source_row.get("request_number", 1)):
-        # Request number 3 or higher never receives an automatic answer to
-        # an actual data/action request, no matter how confident the LLM is
-        # or whether regex and LLM agree. The only automatic outcome allowed
-        # for request number 3+ is the purely-informative branch above.
-        engine = "llm_request_number_3_or_higher_guard"
-        request_types = ["request_number_3_or_higher_guard"]
-        requested_data = [HUMAN_INTERVENTION_REQUIRED]
-        human_intervention_required = True
-        notes = (
-            "Request number is 3 or higher. The message was evaluated by "
-            "the LLM but is not purely informative, so an automatic answer "
-            "is never sent regardless of LLM confidence; human intervention "
-            f"is required. LLM notes: {notes}"
         )
 
     elif is_tracking_lookup_not_found(source_row) and not has_resolved_order(source_row):
@@ -923,6 +925,36 @@ def main():
             # RC-US / RC-EU / LN-EU / LN-US: never analyzed, never answered,
             # and the ticket is left exactly as it is.
             llm_results.append(build_blocked_order_output_row(row))
+        elif is_request_number_3_or_higher(row.get("request_number", 1)):
+            # Policy: from the third exchange on, the thread has already gone
+            # back and forth twice without being settled, so nothing about it
+            # is decided automatically. No LLM call, no regex guard, no
+            # purely-informative solve -- the ticket goes straight to the
+            # second-level logistics group.
+            #
+            # The LLM used to be called anyway and could still solve the
+            # ticket through the purely-informative branch. That branch now
+            # cannot be reached at request number 3+, and the guard in
+            # build_llm_output_row() is kept only for rows that reach the LLM
+            # by some other route.
+            llm_results.append(
+                build_human_output_row(
+                    row,
+                    "Request number is 3 or higher. The request was not "
+                    "analyzed: from the third exchange on, the ticket is "
+                    "always handed to the second-level logistics group.",
+                    engine="request_number_3_or_higher_guard",
+                )
+            )
+        elif is_request_number_2(row.get("request_number")):
+            # The second exchange is decided by the LLM and nothing else: no
+            # carrier-notification exclusion, no missing-tracking guard, no
+            # regex safety guard short-circuits it. Only then is it known
+            # whether the sender is acknowledging the first reply (purely
+            # informative -> solved with no comment) or asking for something
+            # further (answered if the data is there, handed to the
+            # second-level group if it is not).
+            rows_for_llm.append(row)
         elif is_missing_extracted_tracking_number(
             row.get("extracted_tracking_number")
         ) and not has_resolved_order(row) and not is_request_number_2_or_higher(
