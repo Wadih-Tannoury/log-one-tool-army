@@ -56,6 +56,50 @@ Carrier-domain notification emails that historically did not need a customer-fac
 
 **Request number 1 from `noreply*` / `autoreply*` senders — solved without analysis:** when the requester email (local part, case-insensitive, `Name <...>` wrapping tolerated) starts with `noreply` or `autoreply` **and** `request_number` is 1, the request is not analyzed at all. `customs_rules.is_noreply_autoreply_first_request()` is checked first in `regex_engine.detect()`, before every other rule, and returns `requested_data=["noreply_autoreply_first_request_solved"]` so no regex, guardrail, or LLM runs. No GET_FULL_ORDER lookup or document generation is done. `draft_response`/`final_response` are both set to a note explaining the outcome (never posted publicly), and `ticket_fetcher.submit_final_responses()` solves the ticket with the status-only `submit_ticket_solved_without_response()` update. Request number 2+ from these senders keeps the existing behavior described below.
 
+**What happens on each exchange.** The request number decides how much
+autonomy the workflow has, and the rule gets stricter as a thread drags on:
+
+| `request_number` | Who decides | Possible outcomes |
+|---|---|---|
+| 1 | regex first, LLM when regex does not match | answered, solved without reply, or handed to the group |
+| 2 | **the LLM**, past the regex safety guard | answered, solved without reply, or handed to the group |
+| 3+ | **the LLM, for one question only**: is anything being asked? | solved without reply if not, otherwise handed to the group |
+
+Two things are settled before the LLM is reached at all, at every request
+number:
+
+- **A pure carrier status notification** (`is_no_action_carrier_notification`)
+  is solved with no public comment and no LLM call. From the second exchange
+  on this is checked ahead of the tracking-number guards, which would
+  otherwise divert the row to the LLM first — a follow-up notification never
+  costs a model call.
+- **RC-US / RC-EU / LN-EU / LN-US orders** are left exactly as they are.
+
+**Request number 2 — the LLM, not the regex guard.** `regex_engine` already
+refuses to auto-answer from the second exchange on, and
+`intent_detection.main()` now routes these rows to the LLM ahead of the regex
+safety guard, which would otherwise hand a follow-up to a human without anyone
+reading it. Then:
+
+- the sender is only acknowledging the previous reply
+  (`purely_informative_solved`) -> solved with **no public comment**;
+- the sender wants more data or a clarification -> answered if the data is in
+  the system, handed to the second-level logistics group if it is not
+  (including when LLM confidence is below `LLM_CONFIDENCE_MIN`).
+
+**Request number 3 or higher — a thank-you closes, everything else escalates.**
+The thread has already gone back and forth twice without being settled, so no
+data request is ever answered automatically, however confident the LLM is.
+The one automatic outcome still allowed is the purely-informative solve: a
+message asking for nothing is closed with no comment rather than queued for a
+human to close by hand. That branch sits ahead of the request-number guard in
+`build_llm_output_row()` for exactly this reason. Anything else goes to
+`LOG II lvl` with no reply.
+
+The `noreply*` / `autoreply*` senders that are solved without analysis are
+unaffected; `submit_final_responses()` routes them before any of this.
+
+
 Requester emails whose address starts with `noreply` are never answered automatically. They still get a `draft_response` that summarizes the detected request, `human_intervention_required=true`, an empty `final_response`, and no GET_FULL_ORDER/document-generation work. This keeps the request visible to a human without creating a Zendesk public reply to an automated mailbox.
 
 **Exception — `noreply@fedex.com`:** every request from this exact address is submitted as `solved` with no Zendesk comment at all, instead of being left for human review. `customs_rules.is_noreply_fedex_requester_email()` matches only the exact address `noreply@fedex.com` (tolerating `Name <noreply@fedex.com>` wrapping and case), not every `noreply*` sender. For these rows:
@@ -663,6 +707,29 @@ had caused it. `_document_error_detail_for()` now quotes only the entries
 naming something in the missing list, which for a label-only failure is
 nothing at all.
 
+
+### The duplicate-reply guard only looks at the last comment
+
+`ZENDESK_SKIP_DUPLICATE_FINAL_RESPONSE` (on by default) exists for one case: a
+reply that was posted but whose run did not record it — the status update was
+rejected, the history write was lost, submission was toggled mid-flight —
+which would otherwise be posted twice.
+
+`zendesk_public_comment_exists()` used to scan the whole comment history for
+an identical body, which made it fire on a perfectly legitimate *second*
+request. A customer who writes back after being answered ("the invoice is
+unreadable", "please resend") gets a new `request_number`, is analyzed
+normally, and can quite reasonably need the same documents again — but the
+reply was skipped because that text appeared somewhere above in the thread,
+leaving the ticket open with the question unanswered.
+
+Only the **last public comment** is compared now. If anyone has spoken since
+our reply — the requester above all — it is a new exchange and the answer is
+posted again. Internal notes are still ignored, so an agent's private note
+does not cause a re-post.
+
+Note that `already_present` is a terminal submission status: a request skipped
+by this guard before the fix will not be retried on its own.
 
 ### `HB-EU`
 
