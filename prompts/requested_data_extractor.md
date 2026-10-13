@@ -46,6 +46,25 @@ Some messages contain no data or action request at all: pure acknowledgements, F
 
 This is different from `unknown_request`: use `unknown_request` when the sender IS asking for something but you cannot tell precisely what; use `purely_informative_solved` only when you are confident the sender is not asking for anything at all. Rows classified this way are submitted as solved without a public response, so only use `purely_informative_solved` when you are confident there is truly no data or action being requested.
 
+## Follow-up Messages: the Subject Is Not the Request
+
+Each input carries `request_number` and `is_follow_up`. When `is_follow_up` is true, the message is a later reply in an email thread that TLG has already answered at least once.
+
+**The subject line never changes down a thread.** On a follow-up it still advertises the ORIGINAL request, which TLG has already fulfilled. Decide what is being asked from `request_body` alone, and treat the subject only as background about which shipment the thread concerns.
+
+A follow-up whose body is an acknowledgement — "Thank you.", "Received, thanks", "Noted" — is asking for nothing, however explicit the subject is. Return:
+
+```json
+{
+  "requested_data": ["purely_informative_solved"],
+  "confidence": 0.95,
+  "notes": "Follow-up body is an acknowledgement; subject names the original, already-answered request",
+  "human_intervention_draft_response": ""
+}
+```
+
+Getting this wrong sends the customer a document they have just confirmed receiving. A follow-up that thanks TLG **and then asks for something** ("Thanks, but the invoice is missing the total value") is a real request: classify it from what the body asks for.
+
 
 ## Important Logic
 
