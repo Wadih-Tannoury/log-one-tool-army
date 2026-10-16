@@ -2351,25 +2351,32 @@ def submit_final_responses(
     for row in raw_rows:
         requester_email = row.get("requester_email")
 
+        # Request number 1 from a noreply*/autoreply* sender: solved with no
+        # public comment and no analysis. Checked before every other rule,
+        # including the blocked order prefix below, for the same reason
+        # response_generator._build_response_body() checks it first: the
+        # request was never analyzed, so nothing about the order it happens
+        # to reference changes the outcome. An automated FedEx delivery
+        # notification whose order sits on LN-EU/RC-EU used to be caught by
+        # the blocked-prefix branch and handed to the logistics group, even
+        # though its own draft already said the ticket had been solved
+        # without a response.
+        if is_noreply_autoreply_first_request(requester_email, row.get("request_number", 1)):
+            ticket_id = _to_int(row.get("zendesk_ticket_id"))
+            if ticket_id is not None:
+                solve_without_response_rows.append((ticket_id, row))
+            continue
+
         # RC-US / RC-EU / LN-EU / LN-US orders are never answered and never
         # solved automatically, but the ticket must not be dropped: like every
         # other request the workflow cannot serve, it is handed to the
-        # second-level logistics group. Checked before every other rule.
+        # second-level logistics group.
         if _to_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
             row.get("shipment_order_number"),
             row.get("extracted_order_reference"),
         ):
             blocked_rows.append(row)
             unhandled_rows.append(row)
-            continue
-
-        # Request number 1 from a noreply*/autoreply* sender: solved with no
-        # public comment and no analysis. Must be checked before the general
-        # is_noreply_requester_email() / human-intervention skips below.
-        if is_noreply_autoreply_first_request(requester_email, row.get("request_number", 1)):
-            ticket_id = _to_int(row.get("zendesk_ticket_id"))
-            if ticket_id is not None:
-                solve_without_response_rows.append((ticket_id, row))
             continue
 
         # noreply@fedex.com is a special case: FedEx's automated mailbox
