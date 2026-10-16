@@ -172,9 +172,9 @@ If a UPS Returns Customs Clearance request asks for the UPS account and the retu
 
 If a DHL Returns Customs Clearance request asks for documentation for reintroduzione in franchigia, return `return_proforma_invoice`.
 
-For any request number, if the request asks for `dichiarazione d'intento`, `dichiarazione di intento`, declaration-of-intent wording, or `dichiarazione_di_libera_esportazione`, classify only that declaration wording as `dichiarazione_di_libera_esportazione`. Do not convert it to `commercial_invoice`; downstream response generation will omit it when other request types are present and will send no public reply when it is the only detected request.
+For any request number, if the request asks for `dichiarazione d'intento`, `dichiarazione di intento`, declaration-of-intent wording, or `dichiarazione_di_libera_esportazione`, classify that declaration wording as `dichiarazione_di_libera_esportazione`. Do not convert it to `commercial_invoice`, and do not let it absorb anything else that is requested in the same sentence. `fattura e dichiarazione di libera esportazione`, `priva di fattura accompagnatoria e dichiarazione di libera esportazione` and similar wordings are **two** requests: return `commercial_invoice` (or `return_proforma_invoice` when the tracking role says so) **and** `dichiarazione_di_libera_esportazione`. Downstream response generation attaches the invoice and answers the declaration with the standard "already filed in your systems" sentence; it sends no public reply only when the declaration is the single detected request.
 
-For request number `1`, ignore `eori_number` checklist wording. For later request numbers, return `eori_number` when it is explicitly requested so the response generator can route it to human intervention.
+For any request number, return `eori_number` when the EORI number is requested. The EORI is a field printed on the invoice, so response generation answers it by attaching the invoice and stating that the number is on it; it is never escalated to a human for that reason alone. Do not return `eori_number` for EORI wording that is only part of a boilerplate checklist with nothing actually being asked.
 
 For request number `1`, if the request asks for generic shipment/clearance instructions, return `ups_account_number` and `export_tracking_number`. For later request numbers, return `shipment_instructions` so the response generator can route it to human intervention.
 
@@ -343,6 +343,7 @@ Examples:
 - codice abbonamento UPS = ups_account_number
 - dichiarazione di libera esportazione = dichiarazione_di_libera_esportazione
 - dichiarazione di intento / dichiarazione d'intento = dichiarazione_di_libera_esportazione
+- fattura / fattura accompagnatoria / fattura commerciale = commercial_invoice, including when requested in the same sentence as the dichiarazione di libera esportazione
 - descrizione merce / tipo di merce / voce doganale = return_proforma_invoice
 - importer details / dati importatore / ragione sociale / residenza e recapiti = return_proforma_invoice
 - numero di telefono = customer_phone unless it is part of an RPI package in a first Returns Customs Clearance request
