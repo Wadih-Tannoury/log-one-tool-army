@@ -49,9 +49,14 @@ The LLM must classify what it understood in `requested_data` and produce `llm_hu
 
 When `request_number` is `1`, and upstream regex/LLM classification contains `invoice_correction`, `corrected_invoice`, or `value_confirmation`, treat those values as part of the `return_proforma_invoice` package for response data. Do not list corrected invoice or value confirmation as separate customer-facing lines in the draft. For later request numbers, require human intervention for those keys.
 
-For every request number, do not treat `dichiarazione_di_libera_esportazione` / declaration-of-intent wording as `commercial_invoice`. Omit this declaration when other request types are present, and do not produce a public reply when it is the only detected request.
+For every request number, do not treat `dichiarazione_di_libera_esportazione` / declaration-of-intent wording as `commercial_invoice`: the declaration is never generated as a document. Do not produce a public reply when it is the only detected request. When it is requested **together with an invoice** (`commercial_invoice` or `return_proforma_invoice`), answer both: attach the invoice and state that the declaration is already filed with the carrier (see "Invoice plus declaration of free export" below). When it is requested together with other, non-invoice request types, omit the declaration and answer only those.
 
-When `request_number` is `1`, ignore `eori_number`. For later request numbers, require human intervention.
+For every request number, treat `eori_number` as a field embedded in the invoice. Collapse it into the invoice document request (`commercial_invoice`, or `return_proforma_invoice` when the tracking role says so), attach that invoice, and add one line saying where the number is:
+
+- Italian: `Il numero EORI è riportato all'interno della fattura allegata.`
+- English: `The EORI number is stated in the attached invoice.`
+
+This holds when the EORI is the only thing requested: the reply is the invoice plus that line. Never list the EORI as its own data line, and never route a request to human intervention only because the EORI was asked for.
 
 When `request_number` is `1`, treat `shipment_instructions` as covered by `ups_account_number` plus `export_tracking_number`. For later request numbers, require human intervention.
 
@@ -348,6 +353,34 @@ Route these cases to human intervention rather than sending a partial automatic 
 - ATR-certificate mandate/form requests such as `mandato per l'emissione dei certificati ATR`; these are not `power_of_attorney`/POA automation cases.
 
 When `regex_request_types` includes `dichiarazione_di_libera_esportazione` together with other request types, omit the declaration and answer only the other request types. When it is the only regex-detected type, do not produce a public reply.
+
+### Invoice plus declaration of free export
+
+Italian carrier customs desks routinely ask for both in one sentence, e.g. `la dogana necessita per la spedizione in oggetto di fattura e dichiarazione di libera esportazione` (FedEx) or `e' priva di fattura accompagnatoria e dichiarazione di libera esportazione` (DHL). Both wordings are invoice requests: classify the `fattura` part as `commercial_invoice` (or `return_proforma_invoice` when the tracking role says so) and do not let the declaration suppress it.
+
+The declaration itself is not produced: it is already on file in the carrier's own systems. So the reply attaches the invoice and says exactly that. Italian:
+
+```
+Buongiorno,
+
+In allegato quanto richiesto.
+La dichiarazione di libera esportazione e' gia' depositata presso i vostri sistemi.
+
+Cordiali saluti
+```
+
+English:
+
+```
+Hello,
+
+Please find attached the requested document.
+The free export declaration is already filed in your systems.
+
+Best regards
+```
+
+Use this wording instead of the generic document-list reply whenever the only response data is the invoice/RPI and the message also asked for the declaration. Do not list the declaration as an attached document, and do not list it as a separate line.
 
 When a regex-detected invoice type conflicts with the role of `extracted_tracking_number`, use the tracking role: a return tracking number requires `return_proforma_invoice`, while a shipment/export tracking number requires `commercial_invoice`.
 
