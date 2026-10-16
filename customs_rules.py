@@ -824,9 +824,15 @@ DELIVERY_ADDRESS_PHONE_UNREACHABLE_RE = re.compile(
 
 MISSING_INVOICE_REQUEST_RE = re.compile(
     r"(?:"
-    r"(?:priva|privo)\s+della\s+fattura|"
-    r"giunta\s+priva\s+della\s+fattura|"
-    r"fattura\s+(?:mancante|non\s+presente)|"
+    # "e' priva della fattura", but also the DHL giacenza wording
+    # "e' priva di fattura accompagnatoria e dichiarazione di libera
+    # esportazione", which the "della"-only form never matched.
+    r"(?:priva|privo|prive|privi)\s+(?:di|del|della|dei|delle)\s+"
+    r"(?:copia\s+(?:della\s+)?)?fattura|"
+    r"giunta\s+priva\s+(?:di|della)\s+fattura|"
+    r"fattura\s+(?:mancante|non\s+presente|assente)|"
+    r"manca(?:no)?\s+(?:la\s+|le\s+)?fattur[ae]|"
+    r"senza\s+fattura(?:\s+accompagnatoria)?|"
     r"(?:fornire|inviare|trasmettere)\s+copia\s+della\s+documentazione[\s\S]{0,120}fattura|"
     r"shipment[\s\S]{0,120}(?:missing|without)\s+(?:the\s+)?invoice"
     r")",
@@ -1097,6 +1103,10 @@ DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "tax_information",
     "country_of_origin",
     "product_description",
+    # The EORI number is printed on the invoice itself, so a request for it
+    # is answered by sending the invoice and saying where the number is.
+    # It used to be dropped on request 1 and escalated from request 2 on.
+    "eori_number",
 }
 
 # These are no longer standalone requested_data values. If they still appear
@@ -1495,12 +1505,44 @@ def is_missing_invoice_request(text: object) -> bool:
 EXPLICIT_INVOICE_REQUEST_RE = re.compile(
     r"(?:"
     r"\bfatture\b|"                                              # Italian plural (fattura = invoice)
-    r"\bfattura\s+commerciale\b|"                               # explicit Italian qualified form
-    r"(?:provide|send|invia[rt]e?|fornire|fornite)"
-    r"[^.!?\n]{0,60}\bfattura\b"                               # explicit send/provide + fattura
+    r"\bfattura\s+(?:commerciale|accompagnatoria|proforma|pro\s*forma)\b|"
+    # Explicit request verbs + fattura.  "necessita / occorre / serve /
+    # richiede" is how FedEx and DHL customs desks phrase it ("la dogana
+    # necessita ... di fattura e dichiarazione di libera esportazione"), and
+    # the provide/send-only list never matched those.
+    # "non necessita" / "non serve" must not count as a request, hence the
+    # negative lookbehind.
+    r"(?<!non )(?:provide|send|require[sd]?|need(?:s|ed)?|request(?:s|ed|ing)?|"
+    r"invia[rt]e?|inviarci|fornire|fornirci|fornite|trasmettere|allegare|"
+    r"necessita(?:no)?|abbiamo\s+bisogno|"
+    r"occorre(?:no)?|serve|servono|richiede(?:te|iamo|re)?)"
+    r"[^.!?\n]{0,80}\bfattura\b|"
+    # "di fattura e dichiarazione di libera esportazione" / "fattura e DLE":
+    # the invoice is being asked for alongside the declaration.
+    r"\bfattura\b[^.!?\n]{0,40}\bdichiarazione\s+di\s+(?:libera\s+esportazione|intento)\b|"
+    r"\bdichiarazione\s+di\s+(?:libera\s+esportazione|intento)\b[^.!?\n]{0,40}\bfattura\b"
     r")",
     re.IGNORECASE,
 )
+
+# Declaration-of-intent / libera-esportazione wording in the message body.
+# Used to recognize the "invoice + declaration" combination even when the
+# declaration has already been filtered out of requested_data.
+LIBERA_ESPORTAZIONE_REQUEST_RE = re.compile(
+    r"(?:"
+    r"dichiarazione\s+di\s+libera\s+esportazione|"
+    r"dichiarazione\s+(?:di|d')\s*intento|"
+    r"libera\s+esportazione|"
+    r"declaration\s+of\s+(?:intent|free\s+export)|"
+    r"free\s+export\s+declaration"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def requests_libera_esportazione_declaration(text: object) -> bool:
+    """True when the message asks for a dichiarazione di libera esportazione."""
+    return bool(LIBERA_ESPORTAZIONE_REQUEST_RE.search(normalize_whitespace(text)))
 
 
 def is_explicit_invoice_request(text: object) -> bool:
@@ -1696,7 +1738,8 @@ def collapse_document_embedded_requested_data(
 
     On request number 1, invoice correction and value confirmation are also
     considered part of the return proforma invoice package for response data.
-    On request number 1, EORI is ignored, and shipment instructions are
+    EORI is answered with the invoice that carries it, and on request
+    number 1 shipment instructions are
     fulfilled by export tracking plus UPS account data. Declaration-of-intent
     / libera-esportazione wording is not converted to commercial invoice.
     """
@@ -1720,8 +1763,6 @@ def collapse_document_embedded_requested_data(
             continue
         if first_request and value in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             first_request_rpi_response_fields_found = True
-            continue
-        if first_request and value == "eori_number":
             continue
         if first_request and value == "shipment_instructions":
             first_request_shipment_instructions_found = True
@@ -2269,6 +2310,38 @@ def filter_libera_esportazione_response_data(
         if value not in LIBERA_ESPORTAZIONE_REQUEST_TYPES
         and (value != "commercial_invoice" or keep_commercial_invoice)
     ]
+
+
+def is_invoice_with_libera_esportazione_request(
+    requested_data: object,
+    request_types: object = None,
+    request_text: object = None,
+) -> bool:
+    """True when the sender asks for the invoice *and* the free-export declaration.
+
+    The declaration itself is always stripped from the response data (we never
+    generate one), so by the time a response is built only the invoice is left
+    and the row looks like any other invoice request.  The carrier still asked
+    two questions, though, and the second one has a standard answer: the
+    declaration is already filed with them.  This flags that case so the
+    dedicated reply can be used instead of the generic document list.
+    """
+
+    response_values = _normalized_requested_type_set(requested_data)
+    invoice_requested = bool(
+        response_values & (COMMERCIAL_INVOICE_REQUEST_TYPES | RETURN_PROFORMA_REQUEST_TYPES)
+    )
+    if not invoice_requested:
+        return False
+
+    declaration_requested = bool(
+        _normalized_requested_type_set(request_types) & LIBERA_ESPORTAZIONE_REQUEST_TYPES
+    ) or bool(response_values & LIBERA_ESPORTAZIONE_REQUEST_TYPES)
+
+    if not declaration_requested and request_text is not None:
+        declaration_requested = requests_libera_esportazione_declaration(request_text)
+
+    return declaration_requested
 
 
 def normalize_tracking_for_comparison(value: object) -> str:
