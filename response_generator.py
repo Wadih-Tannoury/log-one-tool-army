@@ -20,6 +20,7 @@ import pandas as pd
 
 from response_data_extractor import (
     DOCUMENT_RESPONSE_COLUMNS,
+    normalize_requested_data_with_aliases,
     DocumentGenerationError,
     FULL_ORDER_DATA_KEYS,
     FULL_ORDER_LOOKUP_KEYS,
@@ -57,12 +58,21 @@ from ticket_fetcher import (
 )
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, build_request_id, read_dataframe
 from customs_rules import (
-    FEDEX_BROKERAGE_EMAIL,
+    DOCUMENT_EMBEDDED_REQUESTED_DATA,
+    is_dhl_requester_email,
+    is_fedex_requester_email,
+    is_first_returns_customs_request,
+    is_request_number_3_or_higher,
+    is_ups_requester_email,
+    FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA,
+    PLATFORM_HANDOFF_RE,
+    RETURN_PROFORMA_CONTEXT_RE,
+    RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA,
+    RPI_EMBEDDED_CONTACT_REQUESTED_DATA,
     HUMAN_INTERVENTION_REQUIRED,
     PLACEHOLDER,
     PURELY_INFORMATIVE_SOLVED,
     UNKNOWN_REQUEST,
-    UPS_BROKERAGE_EMAIL,
     align_invoice_requested_data_with_tracking_context,
     detect_language_with_dictionary,
     contains_correction_or_discrepancy,
@@ -97,7 +107,6 @@ INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
 NOREPLY_REQUEST_EXCERPT_MAX_CHARS = int(os.getenv("NOREPLY_REQUEST_EXCERPT_MAX_CHARS", "1200"))
 
-DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
 SUPPRESSED_RESPONSE_DATA_KEYS = {"previously_requested_documentation"}
 
 FULL_ORDER_SHIPPED_AT_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
@@ -108,49 +117,17 @@ FULL_ORDER_RETURN_CARRIER_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["return_carrier_c
 FULL_ORDER_API_ERROR_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
 DOCUMENT_GENERATION_ERROR_COLUMN = DOCUMENT_RESPONSE_COLUMNS["document_error"]
 
-# Keep this local to response generation so the generator remains safe even if
-# upstream regex/LLM output still contains older aliases.
-REQUESTED_DATA_ALIASES = {
-    "ups_account": "ups_account_number",
-    "ups_account_code": "ups_account_number",
-    "ups_code": "ups_account_number",
-    "tracking_number": "export_tracking_number",
-    "export_tracking": "export_tracking_number",
-    "returned_items": "returned_items_confirmation",
-    "rpi": "return_proforma_invoice",
-    "pri": "return_proforma_invoice",
-    "invoice": "commercial_invoice",
-    "commercial_invoice_required": "commercial_invoice",
-    "invoice_correction": "corrected_invoice",
-    "declaration_of_intent": "dichiarazione_di_libera_esportazione",
-}
-
-DOCUMENT_EMBEDDED_REQUESTED_DATA = {
-    "tax_information",
-    "country_of_origin",
-    "product_description",
-    # The EORI number is a field printed on the invoice: the request is
-    # answered by attaching the invoice and pointing at the number in it
-    # (see eori_in_invoice_note).
-    "eori_number",
-}
-
-RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA = {
-    "customs_description",
-    "importer_details",
-}
-
-FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA = {
-    "corrected_invoice",
-    "invoice_correction",
-    "value_confirmation",
-}
-
-RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
-    "shipping_address",
-    "customer_email",
-    "customer_phone",
-}
+# These were duplicated here verbatim, which is how the EORI change had to be
+# made twice. They are now imported from the module that owns them, so the
+# regex/LLM stage and the response stage can no longer disagree about which
+# fields live inside a document.
+#   REQUESTED_DATA_ALIASES                        <- response_data_extractor
+#   DOCUMENT_EMBEDDED_REQUESTED_DATA              <- customs_rules
+#   RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA          <- customs_rules
+#   RPI_EMBEDDED_CONTACT_REQUESTED_DATA           <- customs_rules
+#   FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA <- customs_rules
+#   RETURN_PROFORMA_CONTEXT_RE, PLATFORM_HANDOFF_RE, UNPAID_EXTRA_CHARGES_RE
+# See the import blocks at the top of this file.
 
 FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA = set()
 
@@ -180,26 +157,6 @@ DOCUMENT_ATTACHMENT_DATA_KEYS = set(INVOICE_DOCUMENT_DATA_KEYS) | {
     "power_of_attorney",
     "shipping_label",
 }
-
-RETURN_PROFORMA_CONTEXT_RE = re.compile(
-    r"\b(?:rpi|pri|return\s+proforma|return\s+invoice|fattura\s+(?:di\s+)?reso|"
-    r"proforma\s+(?:di\s+)?reso|reintroduzione\s+in\s+franchigia|reso|rientr)\b",
-    re.IGNORECASE,
-)
-
-PLATFORM_HANDOFF_RE = re.compile(
-    r"(?:"
-    r"(?:siete\s+pregati|vi\s+preghiamo|la\s+preghiamo|please|kindly)"
-    r"[\s\S]{0,160}"
-    r"(?:inviar(?:ci|e)|fornir(?:ci|e)|inserire|caricare|upload|send|provide)"
-    r"[\s\S]{0,160}"
-    r"(?:informazioni|istruzioni|information|instructions)"
-    r"[\s\S]{0,160}"
-    r"(?:portale\s+)?fedex\s+support\s+hub|"
-    r"(?:portale\s+)?fedex\s+support\s+hub"
-    r")",
-    re.IGNORECASE,
-)
 
 UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"(?:"
@@ -1236,20 +1193,6 @@ def add_llm_model_note_to_draft(row, draft_response):
     return model_note
 
 
-def normalize_data_key(value):
-    value = str(value or "").strip()
-    return REQUESTED_DATA_ALIASES.get(value, value)
-
-
-def normalize_requested_data_with_aliases(value):
-    cleaned = []
-    for item in normalize_requested_data(value):
-        item = normalize_data_key(item)
-        if item and item not in cleaned:
-            cleaned.append(item)
-    return cleaned
-
-
 def row_request_text(row):
     return normalize_text(
         "\n".join(
@@ -1290,39 +1233,6 @@ def is_unpaid_extra_charges_request(text):
         rules_is_unpaid_extra_charges_request(text)
         or bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_text(text)))
     )
-
-
-def email_domain(email):
-    normalized = normalize_email(email)
-    if "@" not in normalized:
-        return ""
-    return normalized.rsplit("@", 1)[-1]
-
-
-def is_ups_requester_email(email):
-    normalized = normalize_email(email)
-    domain = email_domain(email)
-    return normalized == UPS_BROKERAGE_EMAIL or domain == "ups.com" or domain.endswith(".ups.com")
-
-
-def is_fedex_requester_email(email):
-    normalized = normalize_email(email)
-    domain = email_domain(email)
-    return normalized == FEDEX_BROKERAGE_EMAIL or "fedex" in domain
-
-
-def is_dhl_requester_email(email):
-    normalized = normalize_email(email)
-    domain = email_domain(email)
-    return normalized == DHL_BROKERAGE_EMAIL or domain == "dhl.com" or domain.endswith(".dhl.com")
-
-
-def is_request_number_3_or_higher(request_number):
-    return normalize_request_number(request_number) >= 3
-
-
-def is_first_returns_customs_request(ticket_category, request_number):
-    return is_returns_customs_clearance(ticket_category) and normalize_request_number(request_number) == 1
 
 
 def has_return_proforma_context(text):
@@ -1391,7 +1301,6 @@ def collapse_embedded_document_fields(row, requested_data):
         row.get("request_number", 1),
     )
     first_request = normalize_request_number(row.get("request_number", 1)) == 1
-    requester_email = row.get("requester_email")
 
     result = []
     embedded_document_fields_found = False
@@ -1523,7 +1432,19 @@ def requested_data_for_response(row):
     return requested_data
 
 
-def row_needs_full_order_lookup(row, requested_data=None):
+def response_row_needs_full_order_lookup(row, requested_data=None):
+    """GET_FULL_ORDER lookup rule for the *response* stage.
+
+    Deliberately NOT the same rule as
+    response_data_extractor.row_needs_full_order_lookup(): this one also
+    looks the order up for any answerable row that merely has a
+    shipment_order_number, so the per-brand "Country <BRAND>" ticket field
+    can be filled. Replaying the September-October history shows the two
+    disagree on 702 of 4000 rows, which is the intended behaviour -- they
+    shared a name only by accident, and that name made the divergence look
+    like duplication.
+    """
+
     if is_noreply_requester_email(row.get("requester_email")):
         return False
     if is_noreply_autoreply_first_request_row(row):
@@ -1580,7 +1501,7 @@ def enrich_with_full_order_data(df):
     lookup_indices = [
         index
         for index, row in df.iterrows()
-        if row_needs_full_order_lookup(row, requested_data_by_index[index])
+        if response_row_needs_full_order_lookup(row, requested_data_by_index[index])
         and not row_has_full_order_attempt(row)
     ]
 
@@ -2419,27 +2340,12 @@ def should_force_human_intervention(row, requested_data):
             reason += f" Document detail: {document_error}"
         return True, reason
 
-    first_returns_request = is_first_returns_customs_request(
-        row.get("ticket_category"),
-        row.get("request_number", 1),
-    )
-    requested_set = set(requested_data)
-    returns_reply_needs_carrier_decision = False
-
-    if first_returns_request and is_ups_requester_email(row.get("requester_email")):
-        returns_reply_needs_carrier_decision = {
-            "ups_account_number",
-            "return_proforma_invoice",
-        }.issubset(requested_set)
-
-    if first_returns_request and is_fedex_requester_email(row.get("requester_email")):
-        returns_reply_needs_carrier_decision = (
-            "return_proforma_invoice" in requested_set
-            and has_embedded_rpi_contact_fields(row)
-        )
-
-    if first_returns_request and is_dhl_requester_email(row.get("requester_email")):
-        returns_reply_needs_carrier_decision = "return_proforma_invoice" in requested_set
+    # The per-carrier "does this first-returns reply need the carrier
+    # comparison?" flag used to be computed here across three branches, from
+    # a ticket-category check and a requested-data set built only for it, and
+    # was never read: an undetermined comparison stopped being an escalation
+    # when the builders started assuming two different carriers. Removed as a
+    # dead store; the rule that replaced it is the comment below.
 
     # An undetermined carrier comparison is no longer an escalation: the
     # builders assume two different carriers (see return_export_carriers_match)
@@ -2819,16 +2725,18 @@ def _remove_document_values_from_response(response_text, document_values):
 
 
 def build_final_response(row):
+    if is_noreply_autoreply_first_request_row(row):
+        # Checked before the blocked prefix, like everywhere else: an
+        # unanalyzed request 1 from an automated mailbox is solved whatever
+        # order it references. The text is deliberately non-blank, same
+        # treatment as noreply@fedex.com below: never posted as a comment;
+        # ticket_fetcher solves with a status-only update.
+        return build_noreply_autoreply_first_request_solved_note(row)
+
     if is_blocked_order_prefix_row(row):
         # Blocked order prefix: nothing is ever posted and the ticket is not
         # touched at all.
         return ""
-
-    if is_noreply_autoreply_first_request_row(row):
-        # Deliberately non-blank, same treatment as noreply@fedex.com below:
-        # never posted as a comment; ticket_fetcher solves with a status-only
-        # update.
-        return build_noreply_autoreply_first_request_solved_note(row)
 
     if is_noreply_fedex_requester_email(row.get("requester_email")):
         # Deliberately non-blank: this is the one case where final_response
@@ -2989,10 +2897,14 @@ def enforce_reply_consistency(row):
 def pre_submission_status(row):
     """History status before Zendesk submission (submission may override it)."""
 
+    if _is_solve_without_response_row(row):
+        # Ahead of the blocked-prefix status: ticket_fetcher solves these
+        # with a status-only update, so blocked_order_prefix (a terminal
+        # status meaning "left untouched") would misreport the outcome and
+        # stop the request being retried if the solve failed.
+        return SUBMISSION_STATUS_PENDING
     if is_blocked_order_prefix_row(row):
         return SUBMISSION_STATUS_BLOCKED_ORDER_PREFIX
-    if _is_solve_without_response_row(row):
-        return SUBMISSION_STATUS_PENDING
     if is_noreply_requester_email(row.get("requester_email")):
         return SUBMISSION_STATUS_NOREPLY
     if as_bool(row.get("human_intervention_required")):
