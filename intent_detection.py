@@ -24,6 +24,7 @@ from math import ceil
 from typing import Dict, List
 
 import pandas as pd
+import requests
 from google import genai
 
 try:  # google-genai >= 0.3 ships the types module; guard older/partial installs
@@ -66,7 +67,58 @@ FALLBACK_MODEL = os.getenv(
     "GEMINI_RATE_LIMIT_FALLBACK_MODEL",
     os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
 )
+# Every Gemini model that may answer, in order, after the primary one. The
+# first entry keeps the historical GEMINI_RATE_LIMIT_FALLBACK_MODEL behaviour;
+# the rest exist so a provider-wide 503 on one model does not end the run.
+DEFAULT_GEMINI_FALLBACK_CHAIN = [
+    FALLBACK_MODEL,
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+]
 FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS = int(os.getenv("GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS", "3"))
+# Attempts against the primary model before moving down the chain. 503s are
+# usually seconds long, so one quick retry is worth more than an immediate
+# model switch.
+PRIMARY_MODEL_ATTEMPTS = int(os.getenv("GEMINI_PRIMARY_ATTEMPTS", "2"))
+TRANSIENT_RETRY_BASE_SECONDS = float(os.getenv("LLM_TRANSIENT_RETRY_SECONDS", "5"))
+RATE_LIMIT_RETRY_BASE_SECONDS = float(os.getenv("LLM_RATE_LIMIT_RETRY_SECONDS", "30"))
+
+CLAUDE_FALLBACK_ENABLED = str(
+    os.getenv("LLM_CLAUDE_FALLBACK_ENABLED", "true")
+).strip().lower() not in {"false", "0", "no"}
+CLAUDE_FALLBACK_MODEL = os.getenv("CLAUDE_FALLBACK_MODEL", "claude-sonnet-4-6")
+CLAUDE_FALLBACK_ATTEMPTS = int(os.getenv("CLAUDE_FALLBACK_ATTEMPTS", "2"))
+CLAUDE_API_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_API_TIMEOUT_SECONDS", "120"))
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_FALLBACK_MAX_TOKENS", "8192"))
+
+
+def gemini_fallback_chain():
+    """Ordered Gemini fallback models, from GEMINI_FALLBACK_MODELS or defaults."""
+
+    configured = os.getenv("GEMINI_FALLBACK_MODELS", "")
+    if configured.strip():
+        candidates = [part.strip() for part in configured.split(",")]
+    else:
+        candidates = list(DEFAULT_GEMINI_FALLBACK_CHAIN)
+
+    chain = []
+    for model in candidates:
+        if model and model not in chain:
+            chain.append(model)
+    return chain
+
+
+def claude_api_key():
+    """The Anthropic key, accepting both the raw string and the JSON secret."""
+
+    raw_secret = os.environ.get("CLAUDE_API_KEY", "")
+    if not raw_secret:
+        return ""
+    try:
+        key = json.loads(raw_secret).get("claude_api_key", "")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        key = raw_secret
+    return str(key or "").strip()
 BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
 LLM_BATCH_WORKERS_ENV = "LLM_BATCH_WORKERS"
 # Conservative: Gemini batches are the one place a 429 costs a retry with a
@@ -138,6 +190,42 @@ def is_rate_limit_error(exc):
         or "rate limit" in text
         or "rate_limit" in text
     )
+
+
+def is_transient_model_error(exc):
+    """True for provider-side outages that a retry or another model can answer.
+
+    The 503 `UNAVAILABLE` / "model is currently experiencing high demand"
+    response is the common one: it is not a quota error, so the rate-limit
+    branch never saw it and the batch failed outright with
+    `LLM batch failed: 503 UNAVAILABLE`.
+    """
+
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "503",
+            "unavailable",
+            "overloaded",
+            "high demand",
+            "500",
+            "internal error",
+            "502",
+            "bad gateway",
+            "504",
+            "deadline",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "temporarily",
+        )
+    )
+
+
+def is_retryable_model_error(exc):
+    return is_rate_limit_error(exc) or is_transient_model_error(exc)
 
 
 def normalized_model_name(model):
@@ -224,6 +312,51 @@ class GeminiJsonHelper:
         return results
 
 
+class ClaudeJsonHelper:
+    """Last-resort provider: the Anthropic Messages API.
+
+    Used only after every configured Gemini model has failed, so a
+    Gemini-wide outage (503 UNAVAILABLE) no longer sends a whole run to
+    human intervention. The same CLAUDE_API_KEY secret already used for
+    address translation in response_data_extractor.py is reused here.
+    """
+
+    @staticmethod
+    def generate_json_list(api_key, model, prompt):
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": CLAUDE_MAX_TOKENS,
+                "system": (
+                    "You return JSON only: no prose, no markdown fences, "
+                    "no explanation before or after the JSON."
+                ),
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=CLAUDE_API_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        text = "".join(
+            block.get("text", "")
+            for block in payload.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        results = json.loads(GeminiJsonHelper.clean_json_response(text))
+
+        if not isinstance(results, list):
+            raise ValueError("LLM response was not a JSON list")
+
+        return results
+
+
 class RequestedDataDetector:
 
     def __init__(self, model=DEFAULT_MODEL, fallback_model=FALLBACK_MODEL):
@@ -238,6 +371,57 @@ class RequestedDataDetector:
         self.last_model_used = ""
         self.last_model_attempts = ""
         self.system_prompt = self._load_prompt(PROMPT_PATH)
+        self.claude_api_key = claude_api_key() if CLAUDE_FALLBACK_ENABLED else ""
+        self.providers = self._build_providers()
+        print(
+            "LLM provider chain: "
+            + " -> ".join(provider["model"] for provider in self.providers)
+        )
+
+    def _build_providers(self):
+        """Every model that may answer a batch, in the order they are tried."""
+
+        providers = [
+            {
+                "model": self.model,
+                "provider": "gemini",
+                "attempts": max(1, PRIMARY_MODEL_ATTEMPTS),
+            }
+        ]
+        seen = {normalized_model_name(self.model)}
+
+        chain = list(gemini_fallback_chain())
+        if self.fallback_model and self.fallback_model not in chain:
+            chain.insert(0, self.fallback_model)
+
+        for fallback in chain:
+            name = normalized_model_name(fallback)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            providers.append(
+                {
+                    "model": fallback,
+                    "provider": "gemini",
+                    "attempts": max(1, FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS),
+                }
+            )
+
+        if self.claude_api_key:
+            providers.append(
+                {
+                    "model": CLAUDE_FALLBACK_MODEL,
+                    "provider": "claude",
+                    "attempts": max(1, CLAUDE_FALLBACK_ATTEMPTS),
+                }
+            )
+        elif CLAUDE_FALLBACK_ENABLED:
+            print(
+                "CLAUDE_API_KEY is not set: the Anthropic fallback is "
+                "unavailable and only Gemini models will be tried."
+            )
+
+        return providers
 
     @staticmethod
     def _load_prompt(path):
@@ -286,6 +470,15 @@ class RequestedDataDetector:
 
         return results
 
+    def _generate_once(self, provider, model, prompt):
+        if provider == "claude":
+            return ClaudeJsonHelper.generate_json_list(
+                self.claude_api_key,
+                model,
+                prompt,
+            )
+        return GeminiJsonHelper.generate_json_list(self.client, model, prompt)
+
     def _generate_with_retries(
         self,
         *,
@@ -293,41 +486,42 @@ class RequestedDataDetector:
         prompt,
         max_attempts,
         attempted_models,
-        wait_on_rate_limit,
+        provider="gemini",
     ):
+        """Call one model, retrying it while the error looks transient.
+
+        A rate limit and a 503/overloaded response are both worth waiting
+        out briefly; anything else (a bad prompt, an unknown model id, an
+        unparseable answer) is raised straight away so the caller moves on
+        to the next model instead of sleeping for nothing.
+        """
+
         last_error = None
 
         for attempt in range(max_attempts):
             attempted_models.append(model)
             try:
-                return GeminiJsonHelper.generate_json_list(
-                    self.client,
-                    model,
-                    prompt,
-                )
+                return self._generate_once(provider, model, prompt)
             except Exception as exc:
                 last_error = exc
 
-                if not is_rate_limit_error(exc):
+                if not is_retryable_model_error(exc):
                     raise
 
-                if wait_on_rate_limit and attempt < max_attempts - 1:
-                    wait_seconds = 30 * (attempt + 1)
+                if attempt < max_attempts - 1:
+                    base = (
+                        RATE_LIMIT_RETRY_BASE_SECONDS
+                        if is_rate_limit_error(exc)
+                        else TRANSIENT_RETRY_BASE_SECONDS
+                    )
+                    wait_seconds = base * (attempt + 1)
                     print(
-                        f"Rate limit reached for {model}. "
-                        f"Waiting {wait_seconds}s before retry."
+                        f"{model} is unavailable ({exc}). "
+                        f"Waiting {wait_seconds:.0f}s before retry."
                     )
                     time.sleep(wait_seconds)
 
         raise last_error
-
-    def _should_fallback_after_rate_limit(self, exc, model):
-        return (
-            is_rate_limit_error(exc)
-            and is_gemini_25_flash_model(model)
-            and bool(self.fallback_model)
-            and normalized_model_name(self.fallback_model) != normalized_model_name(model)
-        )
 
     def detect_batch(self, batch_payload):
         prompt = f"""
@@ -359,49 +553,37 @@ REQUESTS:
         attempted_models = []
         self.last_model_used = ""
         self.last_model_attempts = ""
-        primary_has_fallback = (
-            is_gemini_25_flash_model(self.model)
-            and self.fallback_model
-            and normalized_model_name(self.fallback_model) != normalized_model_name(self.model)
-        )
-        primary_attempts = 1 if primary_has_fallback else 3
+        last_error = None
 
-        try:
-            results = self._generate_with_retries(
-                model=self.model,
-                prompt=prompt,
-                max_attempts=primary_attempts,
-                attempted_models=attempted_models,
-                wait_on_rate_limit=primary_attempts > 1,
-            )
-            return self._normalize_results(results, self.model, attempted_models)
-        except Exception as exc:
-            self.last_model_attempts = summarize_model_attempts(attempted_models)
+        # Every provider in the chain gets a turn. Previously only a 429 on
+        # exactly gemini-2.5-flash moved to the single configured fallback,
+        # so a 503 UNAVAILABLE ended the batch with no model having answered.
+        for index, provider in enumerate(self.providers):
+            model = provider["model"]
 
-            if not self._should_fallback_after_rate_limit(exc, self.model):
-                raise
-
-            print(
-                f"Rate limit reached for {self.model}; "
-                f"switching to fallback model {self.fallback_model}."
-            )
+            if index:
+                print(
+                    f"Falling back to {model} after {attempted_models[-1]} failed: "
+                    f"{last_error}"
+                )
 
             try:
                 results = self._generate_with_retries(
-                    model=self.fallback_model,
+                    model=model,
                     prompt=prompt,
-                    max_attempts=max(1, FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS),
+                    max_attempts=provider["attempts"],
                     attempted_models=attempted_models,
-                    wait_on_rate_limit=True,
+                    provider=provider["provider"],
                 )
-                return self._normalize_results(
-                    results,
-                    self.fallback_model,
-                    attempted_models,
-                )
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 self.last_model_attempts = summarize_model_attempts(attempted_models)
-                raise
+                continue
+
+            return self._normalize_results(results, model, attempted_models)
+
+        self.last_model_attempts = summarize_model_attempts(attempted_models)
+        raise last_error if last_error else RuntimeError("No LLM provider configured")
 
 
 def build_source_id(row):
