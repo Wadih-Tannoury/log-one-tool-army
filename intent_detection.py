@@ -44,6 +44,7 @@ from order_reference_resolver import contains_blocked_order_reference
 from customs_rules import (
     BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
+    NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED,
     UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
     clean_latest_request_text,
@@ -53,6 +54,7 @@ from customs_rules import (
     is_acknowledgement_only,
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
+    is_noreply_autoreply_first_request,
     is_purely_informative_request,
     is_request_number_2_or_higher,
     is_request_number_3_or_higher,
@@ -230,10 +232,6 @@ def is_retryable_model_error(exc):
 
 def normalized_model_name(model):
     return str(model or "").strip().lower().rsplit("/", 1)[-1]
-
-
-def is_gemini_25_flash_model(model):
-    return normalized_model_name(model) == "gemini-2.5-flash"
 
 
 def summarize_model_attempts(attempted_models):
@@ -775,6 +773,33 @@ def is_order_processing_blocked(row) -> bool:
     )
 
 
+def build_noreply_autoreply_first_request_row(source_row):
+    """Request 1 from a noreply*/autoreply* sender: solved, never analyzed."""
+
+    output = base_output_row(source_row)
+    output.update(
+        {
+            "engine": "noreply_autoreply_first_request_guard",
+            "matched": True,
+            "excluded": False,
+            "request_types": [NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+            "requested_data": [NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+            "confidence": 0.99,
+            "llm_confidence": None,
+            "notes": (
+                "Requester email starts with noreply/autoreply and this is "
+                "request number 1. Submitted as solved without a response; "
+                "the request was not analyzed."
+            ),
+            "human_intervention_required": False,
+            "llm_was_used": False,
+            "llm_model_used": "",
+            "llm_model_attempts": "",
+        }
+    )
+    return output
+
+
 def build_blocked_order_output_row(source_row):
     output = base_output_row(source_row)
     output.update(
@@ -1131,7 +1156,16 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if is_order_processing_blocked(row):
+        if is_noreply_autoreply_first_request(
+            row.get("requester_email"), row.get("request_number", 1)
+        ):
+            # Request 1 from a noreply*/autoreply* sender is solved without a
+            # response and without analysis. Checked before the blocked
+            # prefix: the request is never analyzed, so which order it
+            # references cannot change the outcome, and routing it to the
+            # blocked branch left the ticket open in the escalation group.
+            llm_results.append(build_noreply_autoreply_first_request_row(row))
+        elif is_order_processing_blocked(row):
             # RC-US / RC-EU / LN-EU / LN-US: never analyzed, never answered,
             # and the ticket is left exactly as it is.
             llm_results.append(build_blocked_order_output_row(row))
