@@ -136,19 +136,107 @@ Requester emails whose address starts with `noreply` are never answered automati
 
 If instead the message does contain data/action request language, the row falls back to the existing `HUMAN INTERVENTION REQUIRED` behavior below.
 
-## Gemini LLM fallback
+### EORI numbers are answered with the invoice
 
-`intent_detection.py` uses `GEMINI_MODEL` as the primary model, defaulting to `gemini-2.5-flash`. If that exact primary model fails with a Gemini limit/quota error such as HTTP 429 or `RESOURCE_EXHAUSTED`, the detector immediately switches to the fallback model. The fallback defaults to `gemini-3.1-flash-lite` and can be overridden with either `GEMINI_RATE_LIMIT_FALLBACK_MODEL` or `GEMINI_FALLBACK_MODEL`.
+The EORI number is printed on the invoice itself, so a request for it is a
+request for the invoice. `eori_number` is therefore in
+`DOCUMENT_EMBEDDED_REQUESTED_DATA` alongside `tax_information`,
+`country_of_origin` and `product_description`: it collapses into
+`commercial_invoice` (or `return_proforma_invoice` when the tracking role says
+so), and `append_eori_invoice_note()` adds one line to the reply saying where
+the number is:
 
-Useful optional environment variables:
+```text
+Il numero EORI è riportato all'interno della fattura allegata.
+The EORI number is stated in the attached invoice.
+```
+
+This applies when EORI is the only thing requested, in which case the reply is
+the invoice plus that line. Previously `eori_number` was silently dropped on
+request number 1 (leaving `Regex candidates were removed by safety filters` and
+no reply at all when it was the only match) and escalated to a human from
+request 2 on; neither happens now. The line is added only when the reply
+actually carries an invoice, so the usual guardrail still applies: no local
+invoice PDF means human intervention, not a reply pointing at a document that
+was never attached.
+
+## LLM provider chain
+
+`intent_detection.py` tries a chain of models for every batch and uses the
+first one that answers. The chain is printed once per run:
+
+```text
+LLM provider chain: gemini-2.5-flash -> gemini-3.1-flash-lite -> gemini-2.5-flash-lite -> gemini-2.5-pro -> claude-sonnet-4-6
+```
+
+**Why this changed.** The old logic fell back only when *both* conditions held:
+the error was a rate limit (429 / `RESOURCE_EXHAUSTED`), and the primary model
+was exactly `gemini-2.5-flash`. A `503 UNAVAILABLE` ("This model is currently
+experiencing high demand") is neither, so it was re-raised on the first attempt
+with no retry and no second model — the batch died with
+`LLM batch failed: 503 UNAVAILABLE`, every request in it was logged as
+`LLM could not identify actionable requested_data`, and whole runs went to
+`LOG II lvl` while Gemini was briefly busy.
+
+Now:
+
+1. `is_transient_model_error()` recognizes 503/`UNAVAILABLE`/overloaded/high
+   demand/500/502/504/deadline/timeout/connection-reset, and
+   `is_retryable_model_error()` is that plus the existing rate-limit check.
+2. Each model is retried in place while the error stays retryable
+   (`GEMINI_PRIMARY_ATTEMPTS`, default 2, for the primary;
+   `GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS`, default 3, for the others), waiting
+   `LLM_TRANSIENT_RETRY_SECONDS` (5s, scaled per attempt) for an outage and
+   `LLM_RATE_LIMIT_RETRY_SECONDS` (30s) for a quota error. A non-retryable
+   failure — unknown model id, malformed prompt, unparseable answer — is not
+   slept on; the chain simply moves to the next model.
+3. **Every** model in the chain is tried, whatever the primary is and whatever
+   the error was. The `gemini-2.5-flash`-only condition is gone.
+4. `llm_model_used` records the model that actually answered and
+   `llm_model_attempts` the whole attempted path, so the history table shows
+   e.g. `gemini-2.5-flash -> gemini-2.5-flash -> gemini-3.1-flash-lite`.
+
+### Anthropic fallback
+
+When every Gemini model has failed, the batch goes to the Anthropic Messages
+API through `ClaudeJsonHelper`, using the **same `CLAUDE_API_KEY` secret** that
+`response_data_extractor.py` already uses for address translation (raw key or
+the `{"claude_api_key": "..."}` JSON shape, both accepted). It sends the
+identical prompt with a JSON-only system instruction and parses the answer with
+the same cleaner, so the rows it returns are indistinguishable downstream apart
+from `llm_model_used = claude-sonnet-4-6`. If the secret is missing, the run
+logs one line and continues with Gemini only.
+
+Because this is the last resort for a provider-wide outage, it is a different
+vendor on purpose: a second Gemini model does not help when Gemini itself is
+the thing that is down.
+
+Environment variables:
 
 ```text
 GEMINI_MODEL=gemini-2.5-flash
-GEMINI_RATE_LIMIT_FALLBACK_MODEL=gemini-3.1-flash-lite
+GEMINI_FALLBACK_MODELS=gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-pro
+GEMINI_RATE_LIMIT_FALLBACK_MODEL=gemini-3.1-flash-lite   # legacy, still honored, placed first
+GEMINI_PRIMARY_ATTEMPTS=2
 GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS=3
+LLM_TRANSIENT_RETRY_SECONDS=5
+LLM_RATE_LIMIT_RETRY_SECONDS=30
+LLM_CLAUDE_FALLBACK_ENABLED=true
+CLAUDE_FALLBACK_MODEL=claude-sonnet-4-6
+CLAUDE_FALLBACK_ATTEMPTS=2
+CLAUDE_FALLBACK_MAX_TOKENS=8192
+CLAUDE_API_TIMEOUT_SECONDS=120
 ```
 
-Whenever Gemini analyzes a row, `intent_detection.py` writes the successful model into `llm_model_used` and the attempted model path into `llm_model_attempts`. `response_generator.py` then prepends `LLM analysis model: <model>.` to the internal `draft_response` only, including the attempted fallback path when applicable. This metadata is added after `final_response` is built, so public Zendesk replies never expose internal model-routing details.
+`GEMINI_FALLBACK_MODELS` replaces the default chain entirely when set, so the
+model ids can be corrected without a code change if Google retires one of them.
+
+Whenever an LLM analyzes a row, `intent_detection.py` writes the successful
+model into `llm_model_used` and the attempted path into `llm_model_attempts`.
+`response_generator.py` then prepends `LLM analysis model: <model>.` to the
+internal `draft_response` only, including the attempted fallback path when
+applicable. This metadata is added after `final_response` is built, so public
+Zendesk replies never expose internal model-routing details.
 
 The reviewed regex table generated from the historical-ticket analysis is included in:
 
@@ -325,6 +413,54 @@ Additional response guardrails:
 - For UPS-style `Returns Customs Clearance` request number `1`, when regex/effective requested-data detection finds at least one of `export_tracking_number`, `return_proforma_invoice`, `ups_account_number`, or `returned_items_confirmation`, the response data is expanded to include all four. This ensures a partial first-request regex hit still prepares the complete export TRK + RPI + UPS code + returned-items package.
 - If the ticket request body contains `sdoganamento`, `export_tracking_number` is included in the response data so the draft and final public response mention the export tracking number.
 - If `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, the row is processed like any other row (it is no longer routed to human intervention). The only difference is the closing section of the public reply, which becomes `Sincerely,` + blank line + `Scarosso | Customer Care` (in Italian, `Cordiali saluti,` + blank line + `Scarosso | Customer Care`). It replaces the template's usual closing phrase and any signer line after it. See `apply_sc_closing()` in `response_generator.py`.
+### Invoice requested together with the dichiarazione di libera esportazione
+
+Italian carrier customs desks ask for both in one sentence:
+
+```text
+la dogana necessita per la spedizione in oggetto di fattura e dichiarazione di libera esportazione   (FedEx)
+e' priva di fattura accompagnatoria e dichiarazione di libera esportazione                            (DHL)
+```
+
+Only the declaration used to be detected, so the row was excluded with
+`Only dichiarazione_di_libera_esportazione was regex-detected; no automatic
+reply is required.` and the invoice -- which was in the same sentence and which
+the pipeline can retrieve -- was never sent.
+
+Two things changed:
+
+- **Detection.** `EXPLICIT_INVOICE_REQUEST_RE` now covers request verbs used by
+  those desks (`necessita`, `occorre`, `serve`, `richiede`, `trasmettere`, ...)
+  plus `fattura accompagnatoria`/`proforma` and the `fattura ... dichiarazione
+  di libera esportazione` pairing in either order;
+  `MISSING_INVOICE_REQUEST_RE` accepts `priva **di** fattura` next to the
+  existing `priva della fattura`. `non serve/non necessita` is excluded by a
+  negative lookbehind, so acknowledgements are still not invoice requests.
+  Both messages now resolve to `regex_request_types = [dichiarazione_di_libera_esportazione, invoice]`
+  and `requested_data = [commercial_invoice]`.
+- **Reply.** The declaration is still never generated as a document -- it is
+  already filed with the carrier -- but it is no longer silently ignored.
+  When the only response data is the invoice/RPI and the message also asked for
+  the declaration, `build_invoice_with_libera_esportazione_response()` replaces
+  the generic document-list reply with:
+
+  ```text
+  Buongiorno,
+
+  In allegato quanto richiesto.
+  La dichiarazione di libera esportazione e' gia' depositata presso i vostri sistemi.
+
+  Cordiali saluti
+  ```
+
+  (English: "Please find attached the requested document. / The free export
+  declaration is already filed in your systems.") The invoice PDF is attached
+  by the usual `document_attachment_paths_for_response()` path, so the normal
+  guardrails still apply: if no local invoice PDF can be produced, the row goes
+  to human intervention instead of sending this reply with nothing attached.
+
+The declaration on its own is unchanged: still no public reply.
+
 - Informational carrier notices, delivery/pickup notifications, import/export document receipts, automatic billing/case updates, acknowledgement-only replies, and customs-cleared/status-only messages are excluded from processing. They receive an internal `draft_response` reason and never produce a public Zendesk `final_response`.
 - `noreply*` requester emails remain human-intervention rows with no public Zendesk reply. If the message is also a status/no-action notification, the draft summary says that no actionable data request was detected instead of listing misleading requested-data labels. The sole exception is `noreply@fedex.com`, which is instead submitted as `solved` with no comment (see above).
 - A missing shipping-label PDF is never a reason by itself to block a reply or force human intervention; the export tracking number (and everything else requested) is still sent, with the shipping-label line/attachment simply omitted.
