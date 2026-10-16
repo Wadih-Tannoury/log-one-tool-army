@@ -15,7 +15,7 @@ The system should classify requests into requested data elements, not a single i
 | `value_confirmation` | Declared value / value confirmation |
 | `returned_items_confirmation` | Which items are returning / partial or full return |
 | `dichiarazione_di_libera_esportazione` | Dichiarazione di libera esportazione / dichiarazione di intento / declaration of intent. This declaration is not answered automatically by itself and should not be converted into a commercial invoice. |
-| `eori_number` | EORI number |
+| `eori_number` | EORI number. Printed on the invoice: the reply attaches the invoice and says the number is stated in it, rather than sending the number as a separate line. |
 | `power_of_attorney` | POA / power of attorney / authorization delegate. Do not use for ATR-certificate mandate/form requests. |
 | `address_translation` | Address translation request |
 | `exporter_ein` | Exporter EIN |
@@ -43,7 +43,7 @@ Do not output these as standalone requested_data values:
 - `declaration_of_intent`
 
 Map tax/country/product fields to `commercial_invoice` or `return_proforma_invoice` depending on context. Map customs-description and importer-details fields to `return_proforma_invoice`.
-Map declaration wording to `dichiarazione_di_libera_esportazione` for every request number. Do not convert it to `commercial_invoice`; response generation omits it when other request types are present and sends no public reply when it is the only detected request.
+Map declaration wording to `dichiarazione_di_libera_esportazione` for every request number. Do not convert it to `commercial_invoice`, and do not drop an invoice requested in the same sentence (`fattura e dichiarazione di libera esportazione` is both). Response generation attaches the invoice and replies that the declaration is already filed with the carrier; it sends no public reply only when the declaration is the single detected request.
 
 ## Design Principle
 
