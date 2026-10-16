@@ -37,7 +37,6 @@ from order_reference_resolver import contains_blocked_order_reference
 from customs_rules import (
     BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
-    UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
     NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED,
     align_invoice_requested_data_with_tracking_context,
@@ -406,37 +405,14 @@ class RegexEngine:
             "y",
         } or contains_blocked_order_reference(shipment_order_number)
 
-        if blocked_order:
-            # RC-US / RC-EU / LN-EU / LN-US: do not process the request at
-            # all. The ticket is left exactly as it is. Checked before every
-            # other rule, including the noreply/autoreply solve.
-            return self._as_output(
-                matched=True,
-                excluded=True,
-                request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
-                requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
-                cleaned_request_text=cleaned_text,
-                matched_spans=[],
-                confidence=HIGH_CONFIDENCE,
-                notes=(
-                    "The order number is on a blocked prefix "
-                    "(RC-US, RC-EU, LN-EU or LN-US). The request is not "
-                    "processed and the ticket is left untouched."
-                ),
-                needs_llm_confirmation=False,
-                force_human_intervention=False,
-                human_intervention_required=False,
-                regex_request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
-                regex_requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
-                quoted_history_removed=quoted_history_removed,
-                signature_removed=signature_removed,
-            )
-
         if is_noreply_autoreply_first_request(requester_email, request_number):
             # Policy: every request number 1 from a sender whose address
             # starts with noreply or autoreply is submitted as solved
             # without a response and WITHOUT analysis: no regex matching, no
-            # guardrails, no LLM. Checked before every other rule.
+            # guardrails, no LLM. Checked before every other rule, the
+            # blocked order prefix below included: the request is not
+            # analyzed, so the order it references is irrelevant and the
+            # ticket must still be solved rather than escalated.
             return self._as_output(
                 matched=True,
                 excluded=False,
@@ -455,6 +431,34 @@ class RegexEngine:
                 human_intervention_required=False,
                 regex_request_types=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
                 regex_requested_data=[NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if blocked_order:
+            # RC-US / RC-EU / LN-EU / LN-US: do not process the request at
+            # all. The ticket is left exactly as it is. Checked before every
+            # other rule except the noreply/autoreply request-1 solve
+            # above, which never analyzes the request at all and so does
+            # not care which order it happens to reference.
+            return self._as_output(
+                matched=True,
+                excluded=True,
+                request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "The order number is on a blocked prefix "
+                    "(RC-US, RC-EU, LN-EU or LN-US). The request is not "
+                    "processed and the ticket is left untouched."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=False,
+                human_intervention_required=False,
+                regex_request_types=[BLOCKED_ORDER_PREFIX_SKIPPED],
+                regex_requested_data=[BLOCKED_ORDER_PREFIX_SKIPPED],
                 quoted_history_removed=quoted_history_removed,
                 signature_removed=signature_removed,
             )
