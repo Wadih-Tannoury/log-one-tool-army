@@ -39,6 +39,7 @@ from pipeline_io import (
 )
 from customs_rules import (
     CARRIER_EMAIL_DOMAINS,
+    row_order_processing_blocked_final,
     PURELY_INFORMATIVE_SOLVED,
     VALID_TICKET_CATEGORIES,
     carrier_code_from_email,
@@ -54,7 +55,10 @@ from customs_rules import (
     normalize_requested_data,
 )
 from order_reference_resolver import (
+    ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES,
+    BLOCKED_DESTINATION_COUNTRY_CODES,
     BLOCKED_ORDER_REFERENCE_PREFIXES,
+    DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES,
     ORDER_REFERENCE_SOURCE_PDF,
     ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS,
     ORDER_REFERENCE_SOURCE_TEXT,
@@ -62,6 +66,7 @@ from order_reference_resolver import (
     SHIPMENT_SELECTION_ALL,
     SHIPMENT_SELECTION_BY_TRACKING,
     SHIPMENT_SELECTION_EXACT,
+    contains_always_blocked_order_reference,
     contains_blocked_order_reference,
     find_order_references,
     find_order_references_in_pdfs,
@@ -2367,14 +2372,12 @@ def submit_final_responses(
                 solve_without_response_rows.append((ticket_id, row))
             continue
 
-        # RC-US / RC-EU / LN-EU / LN-US orders are never answered and never
-        # solved automatically, but the ticket must not be dropped: like every
-        # other request the workflow cannot serve, it is handed to the
-        # second-level logistics group.
-        if _to_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
-            row.get("shipment_order_number"),
-            row.get("extracted_order_reference"),
-        ):
+        # RC-US / LN-US are never answered. RC-EU / LN-EU are answered
+        # normally unless the GET_FULL_ORDER destination country is US or GB
+        # (or could not be determined at all). Either way the ticket is not
+        # dropped: like every other request the workflow cannot serve, it is
+        # handed to the second-level logistics group.
+        if row_order_processing_blocked_final(row):
             blocked_rows.append(row)
             unhandled_rows.append(row)
             continue
@@ -2466,10 +2469,23 @@ def submit_final_responses(
     # escalation path below like any other unserved request, which records
     # SUBMISSION_STATUS_ASSIGNED_TO_GROUP once the group assignment lands.
     if blocked_rows:
+        always_blocked = sum(
+            1
+            for row in blocked_rows
+            if contains_always_blocked_order_reference(
+                row.get("shipment_order_number"),
+                row.get("extracted_order_reference"),
+            )
+        )
         print(
-            f"{len(blocked_rows)} request(s) on a blocked order prefix "
-            f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}): no reply, no "
-            f"solve, assigned to {ZENDESK_ESCALATION_GROUP_NAME!r}."
+            f"{len(blocked_rows)} request(s) not processed: "
+            f"{always_blocked} on an always-blocked prefix "
+            f"({', '.join(ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES)}) and "
+            f"{len(blocked_rows) - always_blocked} on "
+            f"{'/'.join(DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES)} shipping "
+            f"to {'/'.join(sorted(BLOCKED_DESTINATION_COUNTRY_CODES))} or with no "
+            f"known destination. No reply, no solve, assigned to "
+            f"{ZENDESK_ESCALATION_GROUP_NAME!r}."
         )
 
     if not response_rows and not solve_without_response_rows:
