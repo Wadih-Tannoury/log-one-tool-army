@@ -183,14 +183,44 @@ ORDER_REFERENCE_PREFIX_SET = frozenset(ORDER_REFERENCE_PREFIXES)
 
 PREFIX_LENGTH = 5
 
-# Orders on these prefixes are never processed: the ticket is left untouched.
-BLOCKED_ORDER_REFERENCE_PREFIXES: tuple[str, ...] = (
+# Orders on these prefixes are never processed, whatever the destination:
+# the ticket gets no reply and goes to the second-level logistics group.
+ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES: tuple[str, ...] = (
     "RC-US",
-    "RC-EU",
-    "LN-EU",
     "LN-US",
 )
+ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIX_SET = frozenset(
+    ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES
+)
+
+# Orders on these prefixes depend on where the shipment is going. They are
+# answered normally unless the GET_FULL_ORDER destination country is one of
+# BLOCKED_DESTINATION_COUNTRY_CODES, in which case they are treated exactly
+# like the always-blocked prefixes above. The destination is only known after
+# the GET_FULL_ORDER lookup, so these rows must be allowed through the earlier
+# stages rather than short-circuited there.
+DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES: tuple[str, ...] = (
+    "RC-EU",
+    "LN-EU",
+)
+DESTINATION_CHECKED_ORDER_REFERENCE_PREFIX_SET = frozenset(
+    DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES
+)
+
+# Destination countries that block a RC-EU / LN-EU order.
+BLOCKED_DESTINATION_COUNTRY_CODES = frozenset({"US", "GB"})
+
+# Every prefix that may end up blocked, for messages and back-compatibility.
+BLOCKED_ORDER_REFERENCE_PREFIXES: tuple[str, ...] = (
+    ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES
+    + DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES
+)
 BLOCKED_ORDER_REFERENCE_PREFIX_SET = frozenset(BLOCKED_ORDER_REFERENCE_PREFIXES)
+
+# Three-state outcome of order_processing_state().
+ORDER_PROCESSING_ALLOWED = "allowed"
+ORDER_PROCESSING_BLOCKED = "blocked"
+ORDER_PROCESSING_DESTINATION_PENDING = "destination_pending"
 
 
 # ---------------------------------------------------------------------------
@@ -405,9 +435,105 @@ def order_number_from_order_reference(value: object) -> str:
 
 
 def is_blocked_order_reference(value: object) -> bool:
-    """True for RC-US / RC-EU / LN-EU / LN-US orders, which are never processed."""
+    """True for any prefix that may be blocked (RC-US / LN-US / RC-EU / LN-EU).
+
+    Kept for callers that only need "could this order be blocked at all".
+    Whether a RC-EU / LN-EU order *is* blocked depends on its destination:
+    use order_processing_state() for that decision.
+    """
 
     return order_reference_prefix(value) in BLOCKED_ORDER_REFERENCE_PREFIX_SET
+
+
+def is_always_blocked_order_reference(value: object) -> bool:
+    """True for RC-US / LN-US orders, which are never processed."""
+
+    return order_reference_prefix(value) in ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIX_SET
+
+
+def is_destination_checked_order_reference(value: object) -> bool:
+    """True for RC-EU / LN-EU orders, whose outcome depends on the destination."""
+
+    return (
+        order_reference_prefix(value)
+        in DESTINATION_CHECKED_ORDER_REFERENCE_PREFIX_SET
+    )
+
+
+def normalize_destination_country_code(value: object) -> str:
+    """ISO alpha-2 destination country, upper-cased; "" when not known yet."""
+
+    if is_missing_value(value):
+        return ""
+    text = str(value).strip().upper()
+    if text in {"", "NAN", "NONE", "N/A", "NA", "<NA>"}:
+        return ""
+    return text
+
+
+def destination_country_blocks_order(value: object) -> bool:
+    """True when this destination blocks a RC-EU / LN-EU order."""
+
+    return normalize_destination_country_code(value) in BLOCKED_DESTINATION_COUNTRY_CODES
+
+
+def order_processing_state(
+    *references: object,
+    destination_country_code: object = None,
+    blocked_flag: object = False,
+) -> str:
+    """Decide whether an order may be processed, in three states.
+
+    * ``ORDER_PROCESSING_BLOCKED`` - no reply, no solve, assigned to the
+      second-level logistics group. RC-US / LN-US always; RC-EU / LN-EU when
+      the GET_FULL_ORDER destination country is US or GB.
+    * ``ORDER_PROCESSING_DESTINATION_PENDING`` - a RC-EU / LN-EU order whose
+      destination is not known yet. The request must be processed normally up
+      to and including the GET_FULL_ORDER lookup, and this function asked
+      again once ``full_order_country_code`` is populated.
+    * ``ORDER_PROCESSING_ALLOWED`` - answer normally.
+
+    ``blocked_flag`` is the upstream ``order_processing_blocked`` column. It
+    is produced before any destination is known, so on its own it only blocks
+    when no reference is available to classify; a RC-EU / LN-EU reference
+    always decides for itself.
+    """
+
+    found = []
+    for value in references:
+        for reference in split_order_references(value):
+            if reference not in found:
+                found.append(reference)
+
+    if any(is_always_blocked_order_reference(reference) for reference in found):
+        return ORDER_PROCESSING_BLOCKED
+
+    destination_checked = [
+        reference
+        for reference in found
+        if is_destination_checked_order_reference(reference)
+    ]
+    if destination_checked:
+        country = normalize_destination_country_code(destination_country_code)
+        if not country:
+            return ORDER_PROCESSING_DESTINATION_PENDING
+        return (
+            ORDER_PROCESSING_BLOCKED
+            if country in BLOCKED_DESTINATION_COUNTRY_CODES
+            else ORDER_PROCESSING_ALLOWED
+        )
+
+    # No blockable reference of our own. Fall back to the upstream flag, which
+    # is the only signal left when the reference never made it into a column.
+    if not is_missing_value(blocked_flag) and str(blocked_flag).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "y",
+    }:
+        return ORDER_PROCESSING_BLOCKED
+
+    return ORDER_PROCESSING_ALLOWED
 
 
 def is_missing_value(value: object) -> bool:
@@ -449,6 +575,16 @@ def split_order_references(value: object) -> list[str]:
             if reference not in references:
                 references.append(reference)
     return references
+
+
+def contains_always_blocked_order_reference(*values: object) -> bool:
+    """True when any reference is RC-US / LN-US."""
+
+    for value in values:
+        for reference in split_order_references(value):
+            if is_always_blocked_order_reference(reference):
+                return True
+    return False
 
 
 def contains_blocked_order_reference(*values: object) -> bool:
