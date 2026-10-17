@@ -38,6 +38,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from customs_rules import (
+    row_order_processing_blocked_now,
     PLACEHOLDER,
     UPS_BROKERAGE_EMAIL,
     align_invoice_requested_data_with_tracking_context,
@@ -63,7 +64,6 @@ from order_reference_resolver import (
     SHIPMENT_SELECTION_ALL,
     SHIPMENT_SELECTION_BY_TRACKING,
     SHIPMENT_SELECTION_EXACT,
-    contains_blocked_order_reference,
     is_missing_value,
     is_shipment_shaped_order_reference,
 )
@@ -591,19 +591,16 @@ def is_ups_requester_email(email: object) -> bool:
 
 
 def row_order_processing_blocked(row: Mapping[str, Any]) -> bool:
-    """True for RC-US / RC-EU / LN-EU / LN-US orders, which are never processed."""
+    """True for an order that is blocked whatever its destination.
 
-    flag = row.get("order_processing_blocked")
-    if isinstance(flag, bool):
-        if flag:
-            return True
-    elif not is_blank(flag) and str(flag).strip().lower() in {"true", "1", "yes", "y"}:
-        return True
+    RC-US / LN-US always; RC-EU / LN-EU only once the GET_FULL_ORDER
+    destination is known to be US or GB. A RC-EU / LN-EU order with no
+    destination yet is deliberately NOT blocked here, because this function
+    gates the lookup that produces the destination -- blocking it would make
+    the decision unresolvable.
+    """
 
-    return contains_blocked_order_reference(
-        row.get("shipment_order_number"),
-        row.get("extracted_order_reference"),
-    )
+    return row_order_processing_blocked_now(row)
 
 
 def row_needs_full_order_lookup(
