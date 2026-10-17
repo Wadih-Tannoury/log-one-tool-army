@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1965,6 +1966,66 @@ _FIELD_ID_TO_SHIPMENT_DATA: dict[int, str] = {
 }
 
 
+def _normalize_country_label(value: object) -> str:
+    """Fold a country name or option value to a comparable form.
+
+    Lower-cased, accents stripped, every run of non-alphanumerics collapsed
+    to a single space: "Côte d\'Ivoire", "cote_d_ivoire" and "COTE D IVOIRE"
+    all become "cote d ivoire".
+    """
+
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return text.strip()
+
+
+def _option_value_label_variants(value: str, brand_key: str) -> set:
+    """Comparable forms of an option *value*, brand decoration removed.
+
+    The live drop-downs store name-shaped values with a brand suffix
+    ("united_kingdom_ln", "korea_ln"). Comparing those against the plain
+    country name never matched, which is why every country whose option name
+    was not spelled exactly like the ISO name fell through to "no option
+    matches".
+    """
+
+    label = _normalize_country_label(value)
+    variants = {label}
+    if not label:
+        return variants
+
+    parts = label.split(" ")
+    # Trailing brand token: "united kingdom ln" -> "united kingdom".
+    if brand_key and len(parts) > 1 and parts[-1] == brand_key:
+        variants.add(" ".join(parts[:-1]))
+    # Leading decoration: "country united kingdom" / "country ln united kingdom".
+    if parts[0] == "country":
+        rest = parts[1:]
+        if brand_key and rest[:1] == [brand_key]:
+            rest = rest[1:]
+        if rest:
+            variants.add(" ".join(rest))
+    return {variant for variant in variants if variant}
+
+
+def split_destination_country_codes(value: object) -> list:
+    """Every ISO alpha-2 code in a country column, in order, de-duplicated.
+
+    `full_order_country_code` holds one code per order normally, but an order
+    whose shipments go to different places arrives as "CH;GB". Treating that
+    as a single code matched nothing and left the Zendesk country field empty,
+    which then made the solve fail.
+    """
+
+    codes = []
+    for part in re.split(r"[^A-Za-z]+", str(value or "")):
+        code = part.strip().upper()
+        if len(code) == 2 and code not in codes:
+            codes.append(code)
+    return codes
+
+
 def _country_field_option_value(
     field_id: int,
     iso_code: str,
@@ -1975,12 +2036,16 @@ def _country_field_option_value(
     """Return the option value the Zendesk country drop-down actually accepts.
 
     "Country <BRAND>" is a FieldTagger: Zendesk only stores values that exist
-    in the field's own ``custom_field_options`` list. A constructed tag such
+    in the field\'s own ``custom_field_options`` list. A constructed tag such
     as ``country_dj_us`` is silently discarded when it is not one of those
     options, which leaves the field empty and makes Zendesk reject the solve
     with "Country <BRAND>: is required when solving a ticket" even though we
     did send a value. So the real option list is fetched (and cached) and the
     ISO code is matched against it.
+
+    ``iso_code`` may carry several codes ("CH;GB") when an order ships to more
+    than one country; each is tried in order and the first that matches an
+    option wins.
 
     Returns None when no option matches; the caller then falls back to
     posting the comment without the status change, as before. The first
@@ -1989,8 +2054,8 @@ def _country_field_option_value(
     """
     from customs_rules import country_names_for_iso2
 
-    iso = str(iso_code or "").strip().lower()
-    if not iso:
+    codes = split_destination_country_codes(iso_code)
+    if not codes:
         return None
     brand_key = str(brand or "").strip().lower()
 
@@ -2011,40 +2076,45 @@ def _country_field_option_value(
     def _name(option) -> str:
         return str(option.get("name") or "").strip()
 
-    # 1. Exact value match against the shapes we know are in use.
-    exact_candidates = {f"country_{iso}", iso}
-    if brand_key:
-        exact_candidates.update({f"country_{brand_key}_{iso}", f"{brand_key}_{iso}"})
-    for option in options:
-        if _value(option).lower() in exact_candidates:
-            return _value(option)
+    for iso in (code.lower() for code in codes):
+        # 1. Exact value match against the shapes we know are in use.
+        exact_candidates = {f"country_{iso}", iso}
+        if brand_key:
+            exact_candidates.update({f"country_{brand_key}_{iso}", f"{brand_key}_{iso}", f"{iso}_{brand_key}"})
+        for option in options:
+            if _value(option).lower() in exact_candidates:
+                return _value(option)
 
-    # 2. Any option value whose last segment is the ISO code
-    #    (e.g. "dj::country_us", "country-dj-us").
-    for option in options:
-        tail = re.split(r"[^a-z0-9]+", _value(option).lower())
-        if tail and tail[-1] == iso:
-            return _value(option)
+        # 2. Any option value whose last meaningful segment is the ISO code
+        #    (e.g. "dj::country_us", "country-dj-us", "us_ln").
+        for option in options:
+            segments = [part for part in re.split(r"[^a-z0-9]+", _value(option).lower()) if part]
+            if not segments:
+                continue
+            if segments[-1] == iso:
+                return _value(option)
+            if brand_key and len(segments) > 1 and segments[-1] == brand_key and segments[-2] == iso:
+                return _value(option)
 
-    # 3. Match on the human-readable option name (or a name-shaped value),
-    #    e.g. name "United States" / value "united_states".
-    wanted_names = {iso}
-    for country_name in country_names_for_iso2(iso):
-        lowered = country_name.strip().lower()
-        wanted_names.add(lowered)
-        wanted_names.add(re.sub(r"[^a-z0-9]+", "_", lowered).strip("_"))
-    for option in options:
-        if _name(option).lower() in wanted_names:
-            return _value(option)
-        if _value(option).lower() in wanted_names:
-            return _value(option)
+        # 3. Match on the human-readable option name, or on a name-shaped
+        #    value once its brand decoration is stripped.
+        wanted = {_normalize_country_label(iso)}
+        for country_name in country_names_for_iso2(iso):
+            wanted.add(_normalize_country_label(country_name))
+        wanted.discard("")
+
+        for option in options:
+            if _normalize_country_label(_name(option)) in wanted:
+                return _value(option)
+            if _option_value_label_variants(_value(option), brand_key) & wanted:
+                return _value(option)
 
     sample = ", ".join(
         f"{_name(option)!r}={_value(option)!r}" for option in options[:10]
     )
     print(
         f"Zendesk ticket field {field_id}: no option matches country "
-        f"'{iso.upper()}' (brand {brand_key.upper() or 'unknown'}). "
+        f"{'/'.join(codes)} (brand {brand_key.upper() or 'unknown'}). "
         f"First options: {sample}"
     )
     return None
