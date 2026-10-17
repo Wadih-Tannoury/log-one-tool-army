@@ -33,7 +33,10 @@ from pipeline_io import (
     UNMATCHED_TICKETS_PATH,
     write_dataframe,
 )
-from order_reference_resolver import contains_blocked_order_reference
+from order_reference_resolver import (
+    ORDER_PROCESSING_BLOCKED,
+    order_processing_state,
+)
 from customs_rules import (
     BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
@@ -398,12 +401,15 @@ class RegexEngine:
             order_resolution_complete
         ).strip().lower() not in {"false", "0", "no", "n"}
 
-        blocked_order = str(order_processing_blocked or "").strip().lower() in {
-            "true",
-            "1",
-            "yes",
-            "y",
-        } or contains_blocked_order_reference(shipment_order_number)
+        # RC-EU / LN-EU are decided by the GET_FULL_ORDER destination, which
+        # is not known at this stage, so they are processed normally here and
+        # the block (if any) is applied after the lookup. Only an unavoidable
+        # block -- RC-US / LN-US, or the upstream flag with no reference to
+        # classify -- short-circuits the regex stage.
+        blocked_order = order_processing_state(
+            shipment_order_number,
+            blocked_flag=order_processing_blocked,
+        ) == ORDER_PROCESSING_BLOCKED
 
         if is_noreply_autoreply_first_request(requester_email, request_number):
             # Policy: every request number 1 from a sender whose address
@@ -450,9 +456,9 @@ class RegexEngine:
                 matched_spans=[],
                 confidence=HIGH_CONFIDENCE,
                 notes=(
-                    "The order number is on a blocked prefix "
-                    "(RC-US, RC-EU, LN-EU or LN-US). The request is not "
-                    "processed and the ticket is left untouched."
+                    "The order number is on an always-blocked prefix "
+                    "(RC-US or LN-US). The request is not processed and the "
+                    "ticket is handed to the second-level logistics group."
                 ),
                 needs_llm_confirmation=False,
                 force_human_intervention=False,
