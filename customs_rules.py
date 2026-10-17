@@ -12,6 +12,7 @@ import unicodedata
 from typing import Dict, List, Tuple
 
 from order_reference_resolver import (
+    is_missing_value,
     ORDER_PROCESSING_BLOCKED,
     ORDER_PROCESSING_DESTINATION_PENDING,
     order_processing_state,
@@ -414,6 +415,38 @@ _ISO2_COUNTRY_NAME_ALIASES: Dict[str, list] = {
     "MK": ["Macedonia"],
     "CI": ["Ivory Coast"],
     "CD": ["Congo"],
+    # Spellings Zendesk drop-downs use that differ from the ISO 3166 name.
+    "MO": ["Macau", "Macao SAR China", "Macau SAR China", "Macao SAR", "Macau SAR"],
+    "HK": ["Hong Kong SAR China", "Hong Kong SAR"],
+    "MM": ["Burma"],
+    "SZ": ["Swaziland"],
+    "CV": ["Cape Verde"],
+    "TL": ["East Timor"],
+    "BN": ["Brunei"],
+    "BL": ["St. Barthelemy", "Saint Barthelemy"],
+    "SX": ["Sint Maarten"],
+    "MF": ["St. Martin", "Saint Martin"],
+    "KN": ["St. Kitts and Nevis"],
+    "LC": ["St. Lucia"],
+    "VC": ["St. Vincent and the Grenadines"],
+    "PM": ["St. Pierre and Miquelon"],
+    "SH": ["St. Helena"],
+    "VA": ["Vatican City", "Vatican"],
+    "PS": ["Palestinian Territories", "Palestine"],
+    "FK": ["Falkland Islands (Malvinas)", "Falkland Islands"],
+    "VG": ["British Virgin Islands"],
+    "VI": ["U.S. Virgin Islands", "US Virgin Islands"],
+    "CC": ["Cocos (Keeling) Islands", "Cocos Islands"],
+    "BQ": ["Caribbean Netherlands", "Bonaire, Sint Eustatius and Saba"],
+    "CW": ["Curacao"],
+    "RE": ["Reunion"],
+    "AX": ["Aland Islands"],
+    "ST": ["Sao Tome and Principe"],
+    "SJ": ["Svalbard and Jan Mayen"],
+    "WF": ["Wallis and Futuna"],
+    "TF": ["French Southern Territories"],
+    "UM": ["U.S. Outlying Islands", "United States Minor Outlying Islands"],
+    "GS": ["South Georgia and the South Sandwich Islands"],
 }
 
 
@@ -2370,6 +2403,28 @@ def row_order_processing_state(row, destination_country_code=None):
         row.get("extracted_order_reference"),
         destination_country_code=destination_country_code,
         blocked_flag=row.get("order_processing_blocked"),
+    )
+
+
+def row_needs_destination_lookup(row, destination_country_code=None):
+    """True when GET_FULL_ORDER must run purely to learn the destination.
+
+    A RC-EU / LN-EU order is answerable only once its destination is known to
+    be outside US/GB, and the destination comes from GET_FULL_ORDER. The
+    normal lookup gate asks "does the *answer* need order data", which is a
+    different question: a request whose requested_data needs nothing from the
+    API (or is empty) skipped the lookup entirely, so the destination stayed
+    unknown and the row was blocked for lack of information that the API
+    would have returned. This makes the routing decision its own reason to
+    call the API.
+    """
+
+    if is_missing_value(row.get("shipment_order_number")) or not str(
+        row.get("shipment_order_number") or ""
+    ).strip():
+        return False
+    return row_order_processing_state(row, destination_country_code) == (
+        ORDER_PROCESSING_DESTINATION_PENDING
     )
 
 
