@@ -460,21 +460,44 @@ def is_destination_checked_order_reference(value: object) -> bool:
     )
 
 
-def normalize_destination_country_code(value: object) -> str:
-    """ISO alpha-2 destination country, upper-cased; "" when not known yet."""
+def destination_country_codes(value: object) -> list[str]:
+    """Every ISO alpha-2 destination in a country column, in order.
+
+    Normally one code, but an order whose shipments go to different places
+    arrives joined, e.g. "CH;GB". Reading that as a single string hides the
+    GB, so every consumer has to look at the list rather than the raw value.
+    """
 
     if is_missing_value(value):
-        return ""
-    text = str(value).strip().upper()
-    if text in {"", "NAN", "NONE", "N/A", "NA", "<NA>"}:
-        return ""
-    return text
+        return []
+
+    codes: list[str] = []
+    for part in re.split(r"[^A-Za-z]+", str(value)):
+        code = part.strip().upper()
+        if len(code) == 2 and code not in {"NA"} and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def normalize_destination_country_code(value: object) -> str:
+    """The first ISO alpha-2 destination, upper-cased; "" when not known yet."""
+
+    codes = destination_country_codes(value)
+    return codes[0] if codes else ""
 
 
 def destination_country_blocks_order(value: object) -> bool:
-    """True when this destination blocks a RC-EU / LN-EU order."""
+    """True when ANY destination on the order blocks a RC-EU / LN-EU order.
 
-    return normalize_destination_country_code(value) in BLOCKED_DESTINATION_COUNTRY_CODES
+    Any is deliberate: an order with one parcel to Switzerland and one to
+    Great Britain still has a GB leg, and the policy is that GB legs are not
+    answered automatically.
+    """
+
+    return any(
+        code in BLOCKED_DESTINATION_COUNTRY_CODES
+        for code in destination_country_codes(value)
+    )
 
 
 def order_processing_state(
@@ -514,14 +537,12 @@ def order_processing_state(
         if is_destination_checked_order_reference(reference)
     ]
     if destination_checked:
-        country = normalize_destination_country_code(destination_country_code)
-        if not country:
+        codes = destination_country_codes(destination_country_code)
+        if not codes:
             return ORDER_PROCESSING_DESTINATION_PENDING
-        return (
-            ORDER_PROCESSING_BLOCKED
-            if country in BLOCKED_DESTINATION_COUNTRY_CODES
-            else ORDER_PROCESSING_ALLOWED
-        )
+        if any(code in BLOCKED_DESTINATION_COUNTRY_CODES for code in codes):
+            return ORDER_PROCESSING_BLOCKED
+        return ORDER_PROCESSING_ALLOWED
 
     # No blockable reference of our own. Fall back to the upstream flag, which
     # is the only signal left when the reference never made it into a column.
