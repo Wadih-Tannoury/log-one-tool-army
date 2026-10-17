@@ -965,6 +965,67 @@ per-key checks in `missing_required_full_order_values()` still cannot reach
 Zendesk. The different-carrier wording ("non disponibile, avvenuto con altro
 vettore") contains no placeholder and is unaffected.
 
+### A `noreply*` request 1 outranks the blocked prefix
+
+The noreply/autoreply request-1 solve is checked **before** the blocked-order-prefix
+guard at every stage: `regex_engine.detect()`, `intent_detection.main()`,
+`response_generator.build_final_response()` / `pre_submission_status()` and
+`ticket_fetcher.submit_final_responses()`. The request is never analyzed, so
+which order it happens to reference cannot change the outcome.
+
+Previously the submitter checked the blocked prefix first while
+`_build_response_body()` checked the noreply rule first, so a FedEx delivery
+notification from `noreply@fedex.com` whose order sat on `LN-EU` / `RC-EU` had a
+draft reading "Ticket submitted as solved, without a response" and was then
+handed to `LOG II lvl` with `zendesk_submission_status = assigned_to_group` —
+left open for a human, for an automated notification nobody needs to read. Those
+rows are now solved with a status-only update like any other noreply request 1,
+and `pre_submission_status()` returns `pending_submission` rather than the
+terminal `blocked_order_prefix`, so a failed solve is retried.
+
+### LN-EU / RC-EU: blocked only when shipping to the US or GB
+
+`RC-US` and `LN-US` are never processed, whatever the destination.
+
+`RC-EU` and `LN-EU` are **answered normally**, unless the GET_FULL_ORDER
+destination country is `US` or `GB`. The destination is
+`shippingAddress.country`, already stored in `full_order_country_code`.
+
+That makes the decision three-state, because the destination is not known
+until the GET_FULL_ORDER lookup has run — which is after the regex and LLM
+stages. `order_reference_resolver.order_processing_state()` returns:
+
+| State | Meaning | Who acts on it |
+| --- | --- | --- |
+| `blocked` | `RC-US`/`LN-US`, or `RC-EU`/`LN-EU` going to US/GB, or the upstream `order_processing_blocked` flag with no reference to classify | every stage: no reply, no solve, assigned to `LOG II lvl` |
+| `destination_pending` | `RC-EU`/`LN-EU` with no destination yet | the request is processed normally **through** the GET_FULL_ORDER lookup, then asked again |
+| `allowed` | everything else | answered normally |
+
+Two row-level wrappers in `customs_rules.py` pick the right question for the
+stage:
+
+- `row_order_processing_blocked_now()` — used by `regex_engine.detect()`,
+  `intent_detection.main()` and `response_data_extractor.row_needs_full_order_lookup()`.
+  A pending row is **not** blocked here, because these stages run before the
+  lookup and blocking them would make the destination permanently unknowable.
+- `row_order_processing_blocked_final()` — used by
+  `response_generator.is_blocked_order_prefix_row()` and
+  `ticket_fetcher.submit_final_responses()`. A pending row **is** blocked
+  here: the lookup was its chance to prove the destination is outside US/GB,
+  and without that proof the request goes to the logistics group rather than
+  being answered on an assumption.
+
+The internal "NOT PROCESSED AUTOMATICALLY" note now says which of the three
+reasons applied (always-blocked prefix / shipping to US or GB / destination
+unknown). It is never posted to Zendesk.
+
+Replaying the September-October history over this change gives 418 differing
+rows, **all of them that internal note and nothing else** — no change to
+`requested_data`, `final_response`, human intervention, submission status,
+document keys or reason of contact. That is the expected result: the export
+has no `full_order_country_code` for these rows, because the old code blocked
+them before the lookup that would have filled it.
+
 ### Blocked order prefixes
 
 Orders starting with `RC-US`, `RC-EU`, `LN-EU` or `LN-US` are never processed.
