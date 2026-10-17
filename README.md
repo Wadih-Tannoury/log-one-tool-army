@@ -231,6 +231,27 @@ CLAUDE_API_TIMEOUT_SECONDS=120
 `GEMINI_FALLBACK_MODELS` replaces the default chain entirely when set, so the
 model ids can be corrected without a code change if Google retires one of them.
 
+**The secret has to be passed to the step.** A repository secret is not
+visible to a workflow step that does not name it, so
+`CLAUDE_API_KEY is not set` can appear even when the secret exists — it just
+means the `intent_detection.py` step has no `env:` entry for it, while the
+`response_data_extractor.py` step (which already uses the key for address
+translation) does. In `.github/workflows/agent_triggerer.yml`:
+
+```yaml
+- name: Detect requested data
+  run: python intent_detection.py
+  env:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}   # <- add this
+```
+
+The key itself is read lazily on every call and accepts the raw key, or JSON
+under `claude_api_key`, `anthropic_api_key`, `api_key` or `key`, from either
+`CLAUDE_API_KEY` or `ANTHROPIC_API_KEY`. If the secret is JSON with none of
+those fields, the log now says which fields it did find instead of reporting
+the key as absent.
+
 Whenever an LLM analyzes a row, `intent_detection.py` writes the successful
 model into `llm_model_used` and the attempted path into `llm_model_attempts`.
 `response_generator.py` then prepends `LLM analysis model: <model>.` to the
@@ -983,6 +1004,40 @@ rows are now solved with a status-only update like any other noreply request 1,
 and `pre_submission_status()` returns `pending_submission` rather than the
 terminal `blocked_order_prefix`, so a failed solve is retried.
 
+### Matching the Zendesk "Country <BRAND>" drop-down
+
+`Country <BRAND>` is a FieldTagger, so Zendesk only stores values that exist
+in the field's own `custom_field_options`. `_country_field_option_value()`
+fetches the real option list and matches the ISO code against it in three
+passes: exact value, value whose last segment is the ISO code, then the
+human-readable name.
+
+Two shapes used to fall through to `no option matches country`:
+
+- **Name-shaped values with a brand suffix.** The live options are
+  `united_kingdom_ln`, `korea_ln`, `macau_ln`. Pass 2 splits the value and
+  compares the last segment, which is `ln`, not the country. Pass 3 compared
+  the raw value against the plain country name, so `united_kingdom_ln` never
+  matched `united_kingdom` either; it only worked when the *name* happened to
+  be spelled exactly like the ISO 3166 name. `_option_value_label_variants()`
+  now strips the brand suffix and a leading `country_`, and
+  `_normalize_country_label()` folds case, accents and punctuation, so
+  `Côte d'Ivoire` matches `cote_d_ivoire_ln`.
+- **Multiple countries in one column.** An order whose shipments go to
+  different places arrives as `CH;GB`, which matched nothing at all.
+  `split_destination_country_codes()` splits it and each code is tried in
+  order.
+
+Names that differ between ISO 3166 and the Zendesk list (`Macao` vs `Macau`,
+`Eswatini` vs `Swaziland`, `Myanmar` vs `Burma`, the `St.`/`Saint` pairs, the
+`SAR China` suffixes) are in `_ISO2_COUNTRY_NAME_ALIASES`. An unmatched code
+is still never guessed: no option means no status change, the same fallback as
+before, because filing a ticket under an arbitrary wrong country is worse than
+leaving it open.
+
+A multi-country order also blocks an `LN-EU` / `RC-EU` request if **any** leg
+goes to US or GB: `CH;GB` is blocked, `CH;IT` is answered.
+
 ### LN-EU / RC-EU: blocked only when shipping to the US or GB
 
 `RC-US` and `LN-US` are never processed, whatever the destination.
@@ -1014,6 +1069,33 @@ stage:
   here: the lookup was its chance to prove the destination is outside US/GB,
   and without that proof the request goes to the logistics group rather than
   being answered on an assumption.
+
+#### The destination lookup is its own reason to call GET_FULL_ORDER
+
+`row_needs_full_order_lookup()` answers "does the *answer* need order data",
+and that is a different question from "do we need the destination to decide
+whether to answer at all". A destination-pending row whose `requested_data`
+needed nothing from the API — or was empty — skipped the lookup entirely, so
+the destination stayed unknown and the row was blocked for want of
+information the API would happily have returned. That is why tickets were
+rejected with "the GET_FULL_ORDER destination country could not be
+determined" even though the order clearly had a country.
+
+`customs_rules.row_needs_destination_lookup()` now forces the call for any
+RC-EU / LN-EU row that has a `shipment_order_number` and no destination yet,
+ahead of every "this row is not answerable" early return in both
+`response_data_extractor.row_needs_full_order_lookup()` and
+`response_generator.response_row_needs_full_order_lookup()`.
+
+`row_has_full_order_attempt()` makes the matching exception: an attempt that
+produced no destination has not answered the question the row is blocked on,
+so a still-pending row is retried instead of being treated as already looked
+up. Every other prefix keeps the old skip-if-attempted behaviour.
+
+When a row is still blocked for lack of a destination, the note now says
+which of four things happened: the lookup did not run, it failed (with the
+API error), it returned the order but no `shippingAddress` country, or there
+was no `shipment_order_number` to look up.
 
 The internal "NOT PROCESSED AUTOMATICALLY" note now says which of the three
 reasons applied (always-blocked prefix / shipping to US or GB / destination
