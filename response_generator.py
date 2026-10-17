@@ -40,8 +40,11 @@ from response_data_extractor import (
 )
 
 from order_reference_resolver import (
-    BLOCKED_ORDER_REFERENCE_PREFIXES,
-    contains_blocked_order_reference,
+    ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES,
+    BLOCKED_DESTINATION_COUNTRY_CODES,
+    DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES,
+    ORDER_PROCESSING_DESTINATION_PENDING,
+    normalize_destination_country_code,
 )
 from ticket_fetcher import (
     SUBMISSION_STATUS_AWAITING_ORDER_DATA,
@@ -59,6 +62,9 @@ from ticket_fetcher import (
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, build_request_id, read_dataframe
 from customs_rules import (
     DOCUMENT_EMBEDDED_REQUESTED_DATA,
+    ORDER_COUNTRY_CODE_COLUMN,
+    row_order_processing_blocked_final,
+    row_order_processing_state,
     is_dhl_requester_email,
     is_fedex_requester_email,
     is_first_returns_customs_request,
@@ -840,14 +846,18 @@ def row_has_request_type(row, request_type):
 
 
 def is_blocked_order_prefix_row(row):
-    """True for RC-US / RC-EU / LN-EU / LN-US orders, which are never processed."""
+    """True for an order this workflow must not answer.
 
-    if as_bool(row.get("order_processing_blocked")):
-        return True
-    return contains_blocked_order_reference(
-        row.get("shipment_order_number"),
-        row.get("extracted_order_reference"),
-    )
+    RC-US / LN-US always. RC-EU / LN-EU only when the shipment is going to
+    the US or GB; those orders are answered normally for every other
+    destination. This runs after GET_FULL_ORDER, so a RC-EU / LN-EU row whose
+    `full_order_country_code` is still empty counts as blocked: the lookup
+    was its chance to prove the destination is outside US/GB, and without
+    that proof the request goes to the second-level logistics group rather
+    than being answered on an assumption.
+    """
+
+    return row_order_processing_blocked_final(row)
 
 
 def build_blocked_order_prefix_note(row):
@@ -863,13 +873,37 @@ def build_blocked_order_prefix_note(row):
         row.get("extracted_order_reference"),
         default="(unknown)",
     )
+    state = row_order_processing_state(row)
+    country = normalize_destination_country_code(row.get(ORDER_COUNTRY_CODE_COLUMN))
+
+    if state == ORDER_PROCESSING_DESTINATION_PENDING:
+        why = (
+            f"Order {order_number} is on a destination-checked prefix "
+            f"({', '.join(DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES)}) and the "
+            "GET_FULL_ORDER destination country could not be determined.\n"
+            "These orders are answered automatically only when the destination "
+            f"is outside {', '.join(sorted(BLOCKED_DESTINATION_COUNTRY_CODES))}; "
+            "with no destination to check, the request is not answered."
+        )
+    elif country in BLOCKED_DESTINATION_COUNTRY_CODES:
+        why = (
+            f"Order {order_number} is on a destination-checked prefix "
+            f"({', '.join(DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES)}) and is "
+            f"shipping to {country}.\n"
+            "By policy these requests are not answered automatically."
+        )
+    else:
+        why = (
+            f"Order {order_number} is on an always-blocked prefix "
+            f"({', '.join(ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES)}).\n"
+            "By policy these requests are not answered automatically."
+        )
+
     return (
         "NOT PROCESSED AUTOMATICALLY\n\n"
-        f"Order {order_number} is on a blocked prefix "
-        f"({', '.join(BLOCKED_ORDER_REFERENCE_PREFIXES)}).\n"
-        "By policy these requests are not answered automatically: no reply "
-        "was sent and the ticket was not solved. It has been assigned to the "
-        "second-level logistics group for manual handling.\n"
+        f"{why}\n"
+        "No reply was sent and the ticket was not solved. It has been "
+        "assigned to the second-level logistics group for manual handling.\n"
         f"Ticket: {row.get('zendesk_ticket_id', '')}\n"
         f"Request number: {row.get('request_number', '')}"
     )
