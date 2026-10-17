@@ -38,6 +38,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from customs_rules import (
+    row_needs_destination_lookup,
     row_order_processing_blocked_now,
     PLACEHOLDER,
     UPS_BROKERAGE_EMAIL,
@@ -609,6 +610,14 @@ def row_needs_full_order_lookup(
 ) -> bool:
     if row_order_processing_blocked(row):
         return False
+
+    # A RC-EU / LN-EU row still waiting on its destination needs the lookup
+    # for the routing decision itself, whatever its requested_data says --
+    # including when requested_data is empty, which used to skip the call and
+    # leave the destination permanently unknown.
+    if row_needs_destination_lookup(row):
+        return True
+
     if is_noreply_requester_email(row.get("requester_email")):
         return False
     if is_noreply_autoreply_first_request(row.get("requester_email"), row.get("request_number", 1)):
@@ -871,7 +880,11 @@ def enrich_dataframe_with_full_order_data(
 
     lookup_indices = []
     for index, row in df.iterrows():
-        if skip_existing and row_has_full_order_attempt(row):
+        if (
+            skip_existing
+            and row_has_full_order_attempt(row)
+            and not row_needs_destination_lookup(row)
+        ):
             continue
         if row_order_processing_blocked(row):
             # Blocked order prefix: the ticket is left exactly as it is, so no
