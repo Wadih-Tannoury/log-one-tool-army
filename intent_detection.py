@@ -40,7 +40,6 @@ from pipeline_io import (
     read_dataframe,
     write_dataframe,
 )
-from order_reference_resolver import contains_blocked_order_reference
 from customs_rules import (
     BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
@@ -55,6 +54,7 @@ from customs_rules import (
     is_no_action_carrier_notification,
     is_missing_extracted_tracking_number,
     is_noreply_autoreply_first_request,
+    row_order_processing_blocked_now,
     is_purely_informative_request,
     is_request_number_2_or_higher,
     is_request_number_3_or_higher,
@@ -767,10 +767,14 @@ def has_resolved_order(row) -> bool:
 
 
 def is_order_processing_blocked(row) -> bool:
-    return as_bool(row.get("order_processing_blocked")) or contains_blocked_order_reference(
-        row.get("shipment_order_number"),
-        row.get("extracted_order_reference"),
-    )
+    """True only for an order that is blocked whatever its destination.
+
+    RC-EU / LN-EU depend on the GET_FULL_ORDER destination country, which is
+    resolved further down the pipeline, so those rows are analyzed normally
+    here instead of being short-circuited.
+    """
+
+    return row_order_processing_blocked_now(row)
 
 
 def build_noreply_autoreply_first_request_row(source_row):
@@ -812,9 +816,9 @@ def build_blocked_order_output_row(source_row):
             "confidence": 0.99,
             "llm_confidence": None,
             "notes": (
-                "The order number is on a blocked prefix (RC-US, RC-EU, LN-EU "
-                "or LN-US). The request is not processed and the ticket is "
-                "left untouched."
+                "The order number is on an always-blocked prefix (RC-US or "
+                "LN-US). The request is not processed and the ticket is "
+                "handed to the second-level logistics group."
             ),
             "human_intervention_required": False,
             "llm_was_used": False,
