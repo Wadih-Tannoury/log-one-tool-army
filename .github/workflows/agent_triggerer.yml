@@ -47,6 +47,13 @@ jobs:
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
+      # Anthropic key, used for two things: the address translation in
+      # response_data_extractor.py, and the last-resort LLM fallback in
+      # intent_detection.py when every Gemini model in the chain has failed.
+      # Both read it from the environment, and a job-level entry is what
+      # makes a repository secret visible to the steps -- creating the
+      # secret alone does not expose it to anything.
+      CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
       GET_FULL_ORDER_API_CREDENTIALS: ${{ secrets.GET_FULL_ORDER_API_CREDENTIALS }}
       GENERATED_DOCUMENTS_DIR: generated_documents
       DOCUMENT_PUBLIC_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}
@@ -109,6 +116,11 @@ jobs:
           echo "Persist generated documents: $PERSIST_GENERATED_DOCUMENTS"
           echo "Assign unresolved tickets to group: $ASSIGN_UNHANDLED_TICKETS_TO_GROUP"
           echo "Escalation group: $ZENDESK_ESCALATION_GROUP_NAME"
+          if [ -n "$CLAUDE_API_KEY" ]; then
+            echo "Anthropic fallback: key present"
+          else
+            echo "Anthropic fallback: NO KEY - Gemini-only, address translation disabled"
+          fi
 
       - name: Fetch Tickets
         run: python ticket_fetcher.py
