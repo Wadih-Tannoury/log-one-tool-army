@@ -11,6 +11,12 @@ import re
 import unicodedata
 from typing import Dict, List, Tuple
 
+from order_reference_resolver import (
+    ORDER_PROCESSING_BLOCKED,
+    ORDER_PROCESSING_DESTINATION_PENDING,
+    order_processing_state,
+)
+
 ORDER_CUSTOMS_CLEARANCE = "Order Customs Clearance"
 PENDING_ORDER_RELEASE = "Pending Order Release"
 RETURNS_CUSTOMS_CLEARANCE = "Returns Customs Clearance"
@@ -2342,6 +2348,56 @@ def is_invoice_with_libera_esportazione_request(
         declaration_requested = requests_libera_esportazione_declaration(request_text)
 
     return declaration_requested
+
+
+ORDER_COUNTRY_CODE_COLUMN = "full_order_country_code"
+
+
+def row_order_processing_state(row, destination_country_code=None):
+    """order_processing_state() for a pipeline row.
+
+    The destination comes from GET_FULL_ORDER and lands in
+    `full_order_country_code`, so before the lookup a RC-EU / LN-EU row is
+    reported as ORDER_PROCESSING_DESTINATION_PENDING and must be processed
+    normally; after the lookup the same call returns a final answer.
+    """
+
+    if destination_country_code is None:
+        destination_country_code = row.get(ORDER_COUNTRY_CODE_COLUMN)
+
+    return order_processing_state(
+        row.get("shipment_order_number"),
+        row.get("extracted_order_reference"),
+        destination_country_code=destination_country_code,
+        blocked_flag=row.get("order_processing_blocked"),
+    )
+
+
+def row_order_processing_blocked_now(row, destination_country_code=None):
+    """True when the row is blocked *and the decision is final*.
+
+    A RC-EU / LN-EU row whose destination is still unknown is NOT blocked by
+    this: it has to reach the GET_FULL_ORDER lookup first. Use
+    row_order_processing_blocked_final() at the gates that run after the
+    lookup, where "still unknown" has to resolve one way or the other.
+    """
+
+    return row_order_processing_state(row, destination_country_code) == (
+        ORDER_PROCESSING_BLOCKED
+    )
+
+
+def row_order_processing_blocked_final(row, destination_country_code=None):
+    """Blocking decision for the stages that run after GET_FULL_ORDER.
+
+    An unresolved destination counts as blocked here. A RC-EU / LN-EU order
+    is answerable only once the destination has been shown to be outside
+    US/GB, so if the lookup produced no country the request is handed to the
+    second-level logistics group rather than answered on an assumption.
+    """
+
+    state = row_order_processing_state(row, destination_country_code)
+    return state in {ORDER_PROCESSING_BLOCKED, ORDER_PROCESSING_DESTINATION_PENDING}
 
 
 def normalize_tracking_for_comparison(value: object) -> str:
