@@ -658,7 +658,19 @@ Order of resolution is now:
    `tlg-wlfs-prd.til.prd_tilEvents`** (`til_events`);
 5. order reference inside a PDF attached to the ticket (`pdf_attachment`);
 6. **tracking numbers inside that same PDF**, put back through 2, 3 and 4
-   (`pdf_attachment_tracking`).
+   (`pdf_attachment_tracking`);
+7. an order **another request in the same run** already resolved for the
+   identical tracking number (`cross_request_tracking`).
+
+Step 7 costs nothing: no API call, no OCR, just bookkeeping over work the run
+has already done. Carriers open several tickets about one shipment and do not
+quote the same tracking numbers in each. On run `7dc4149f`, request 5009740_1
+quoted `1ZX662916663848348;1Z7E37218619724391` and resolved to
+`WL-EUA00589535` through the shipments table, while **four** other tickets in
+the same run quoting only `1ZX662916663848348` went to human review as "no
+order reference found" — the answer was already in the dataframe. A tracking
+number the run saw against two different orders is skipped rather than
+guessed.
 
 Steps 1 and 2 are decided inside `apply_order_reference_fallback()`; 3, 4 and 5
 are post-passes over whatever is still unresolved, applied in that order by
@@ -1109,6 +1121,37 @@ leaving it open.
 
 A multi-country order also blocks an `LN-EU` / `RC-EU` request if **any** leg
 goes to US or GB: `CH;GB` is blocked, `CH;IT` is answered.
+
+### Unpaid extra charges and `config/ddp_configuration.json`
+
+When UPS reports that the consignee has not paid the additional costs, who
+pays is decided by the `(destination country, brand)` table in
+`config/ddp_configuration.json` — 901 pairs across 17 brands. `ddp=true` asks
+the carrier to deliver and bill the TLG UPS account; `ddp=false` confirms the
+return.
+
+**That table was unreachable.** Three separate things had to be fixed:
+
+1. `regex_engine.detect()` short-circuited every unpaid-charges request to
+   `human_intervention_required`. The DDP branch in `response_generator`
+   fires only on `requested_data == ["ups_account_number"]`, so it could
+   never run. The regex stage now classifies these as `ups_account_number`
+   and leaves the decision downstream, because the destination country comes
+   from GET_FULL_ORDER and does not exist yet at that point.
+2. `UNPAID_EXTRA_CHARGES_RE` had no English noun for the charge. The UPS
+   wording is "has still not paid the **additional costs** of this shipment",
+   and `costs` was missing from a list that had `charges`, `oneri`, `costi`,
+   `spese`, `dazi`. Only notifications that also carried the Italian text
+   matched. `costs?|fees?|duties|duty|taxes` are now in both copies of the
+   pattern.
+3. An unconfigured pair used to fall through to the return-confirmation
+   reply. It is now escalated, with the pair named in the reason:
+   `(country=IT, brand=HB) is not in config/ddp_configuration.json`. HB has
+   no rows at all, so those tickets stay with a human by design.
+
+The escalation is checked **after** `missing_required_full_order_values()`,
+so a row whose GET_FULL_ORDER lookup has not run yet keeps the retryable
+`awaiting_order_data` status instead of being written off as unconfigured.
 
 ### LN-EU / RC-EU: blocked only when shipping to the US or GB
 
