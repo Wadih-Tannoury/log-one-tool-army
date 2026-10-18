@@ -61,6 +61,7 @@ from order_reference_resolver import (
     BLOCKED_ORDER_REFERENCE_PREFIXES,
     DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES,
     ORDER_REFERENCE_SOURCE_PDF,
+    ORDER_REFERENCE_SOURCE_CROSS_REQUEST,
     ORDER_REFERENCE_SOURCE_PDF_TRACKING,
     ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS,
     ORDER_REFERENCE_SOURCE_TEXT,
@@ -4018,6 +4019,8 @@ def enrich_with_shipment_numbers(
         til_client=til_client,
         bigquery=bigquery,
     )
+    #   7. cross_request_tracking  (free: reuse what this run already resolved)
+    df = apply_cross_request_order_propagation(df)
 
     return df
 
@@ -4568,6 +4571,7 @@ def order_references_from_ticket_pdfs(
         return [], []
 
     if not attachments:
+        log(f"      ticket {ticket_id} has no PDF attachment to scan.")
         return [], []
 
     blobs: list[tuple[str, bytes]] = []
@@ -5031,6 +5035,86 @@ def _apply_resolved_order(
     df.at[index, "order_processing_blocked"] = contains_blocked_order_reference(
         resolved_order
     )
+
+
+def apply_cross_request_order_propagation(df: pd.DataFrame) -> pd.DataFrame:
+    """Share an order already resolved in this run with rows that still lack one.
+
+    Carriers open several tickets about the same shipment, and they do not all
+    quote the same tracking numbers. A ticket whose body carries only the
+    overgoods waybill resolves to nothing, while a sibling ticket that happens
+    to name BOTH the waybill and the original export number resolves fine --
+    and in doing so proves which order the waybill belongs to. That mapping
+    was then thrown away at the end of the row loop.
+
+    Observed on run 7dc4149f: 5009740_1 quoted
+    "1ZX662916663848348;1Z7E37218619724391" and resolved to WL-EUA00589535
+    through the shipments table, while four other tickets quoting only
+    1ZX662916663848348 went to human review as "no order reference found" in
+    the same run.
+
+    Runs last, after every table and the PDF scan: it can only use what those
+    produced, and it costs no API call. A tracking number that this run saw
+    against two different orders is skipped rather than guessed.
+    """
+
+    if df.empty or "extracted_tracking_number" not in df.columns:
+        return df
+
+    orders_by_tracking: dict[str, set] = {}
+    for _, row in df.iterrows():
+        references = split_order_references(row.get("shipment_order_number"))
+        if not references:
+            continue
+        resolved_order = ";".join(references)
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            orders_by_tracking.setdefault(tracking, set()).add(resolved_order)
+
+    learned = {
+        tracking: next(iter(orders))
+        for tracking, orders in orders_by_tracking.items()
+        if len(orders) == 1
+    }
+    if not learned:
+        return df
+
+    df = df.copy()
+    propagated = 0
+
+    for index, row in df.iterrows():
+        if split_order_references(row.get("shipment_order_number")):
+            continue
+
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            resolved_order = learned.get(tracking)
+            if not resolved_order:
+                continue
+
+            references = split_order_references(resolved_order)
+            if not references:
+                continue
+
+            print(
+                f"  Request {row.get('request_id')}: tracking {tracking} was "
+                f"resolved to {resolved_order} by another request in this run."
+            )
+            _apply_resolved_order(
+                df,
+                index,
+                references,
+                ORDER_REFERENCE_SOURCE_CROSS_REQUEST,
+                has_tracking=True,
+            )
+            propagated += 1
+            break
+
+    if propagated:
+        print(
+            f"  Resolved {propagated} request(s) from an order another request "
+            "in this run had already found."
+        )
+
+    return df
 
 
 def apply_order_reference_fallback(
