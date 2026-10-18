@@ -1122,6 +1122,154 @@ leaving it open.
 A multi-country order also blocks an `LN-EU` / `RC-EU` request if **any** leg
 goes to US or GB: `CH;GB` is blocked, `CH;IT` is answered.
 
+### A UPS discrepancy is not the first-request checklist
+
+UPS Italia brokerage sends discrepancy reports in the *same* template, from
+the same mailbox, as the routine documentation request. Ticket 4980950_1:
+
+```text
+La preghiamo di fornirci al piu' presto la seguente documentazione ...
+-
+Discrepanze; in ft export presente p.iva di The Level, in bolla presente
+p.iva di Roberto Cavalli; non e possibile sdoganare in franchigia,
+conferma modo di sdoganamento
+```
+
+The only regex hit in that body was **`Tax ID`, from the UPS legal footer**,
+which maps to invoice/RPI. `expand_first_returns_customs_clearance_bundle()`
+then turned that single boilerplate match into the full
+reintroduzione-in-franchigia reply — export tracking, UPS code, RPI and a
+returned-items list — while the carrier was asking which customs procedure to
+use.
+
+`reports_discrepancy()` now blocks the bundle expansion and escalates instead.
+
+It is deliberately **narrower** than `contains_correction_or_discrepancy()`,
+which the request>=2 guard in `response_generator` uses. That looser pattern
+matches `Fattura di ritorno con valore corretto` and `documentazione per poter
+procedere allo sdoganamento` — both standard checklist wording. Replaying the
+history showed it would have escalated **55** correctly-answered first
+requests. `reports_discrepancy()` requires an explicit mismatch word
+(`discrepanze`, `non corrisponde`, `difforme`, `errata`, `mismatch`,
+`do not match`); `corretto` on its own is not enough, because "with the
+correct value" is a request, not a complaint.
+
+#### The one discrepancy with a standard answer
+
+`non e possibile sdoganare in franchigia, conferma modo di sdoganamento` is a
+discrepancy report, but unlike the others it does not need a judgement call:
+the same return documentation applies, it is simply supporting **definitive**
+clearance rather than reintroduction under the franchise regime. So
+`requires_definitive_clearance()` lets the bundle through, and
+`build_ups_returns_definitive_clearance_response()` swaps one line:
+
+```text
+Buongiorno,
+
+In allegato la documentazione per lo sdoganamento in definitiva:
+
+- TRK in export: 1ZK0G0700430617178
+- Cod UPS: K0G070
+- Return Proforma Invoice: ...
+```
+
+Everything else -- the documents, the returned-items list, the closing -- is
+identical to the franchise reply. The pattern deliberately does **not** match
+`In alternativa vi preghiamo di fornirci autorizzazione allo sdoganamento in
+via definitiva`, which offers definitive clearance as a fallback to a request
+that is still answerable the normal way.
+
+Against the September-October history the narrow rule flips **4** rows, all of
+them genuine discrepancies that were answered automatically and should not
+have been:
+
+```text
+4999831_1  "- Discrepanza valore"
+4995543_1  "il valore della rpi non corrisponde con documentazione in nostro possesso"
+4993357_1  "fornire fattura corretta in quanto gli importi non corrispondono"
+4986995_1  "- Conferma DISCREPANZA TRA RPI E FATTURA"
+```
+
+### Only tickets actually addressed to TLG are processed
+
+A ticket is skipped at fetch time when its **first** inbound email carries no
+`@thelevelgroup.com` recipient in To, CC, or a BCC the receiving mail server
+preserved.
+
+These tickets reach this Zendesk because a brand mailbox forwards into it, but
+the carrier was writing to the brand, not to TLG:
+
+```text
+To: Parajumpers Online Store <customerservice@parajumpers.it>
+CC: roberto.antiga@parajumpers.it, cferretto@ups.com,
+    sandro.donadini@parajumpers.it, tania@apepartners.com,
+    rehamahmed@ups.com                                  -> skipped
+
+To: EA Team <backoffice@thelevelgroup.com>
+CC: service@scarosso.com                                -> processed
+```
+
+Replying to the first would insert TLG into a conversation it was never part
+of. A TLG address anywhere in To **or** CC is enough.
+
+The check is on request number 1 only: once a thread is ours, later replies
+that drop the TLG address still belong to it.
+
+`ticket_recipient_emails()` walks the first comment's `via.source.to` block,
+the ticket's own `via.source.to` and `recipient`, and resolves cc'd Zendesk
+user ids through the per-run user cache. Zendesk is inconsistent about where
+it puts recipients -- `address`, a `name` that is itself an address, an
+`email_ccs` list, `original_recipients` -- so the structure is walked and
+anything address-shaped is collected rather than read from fixed keys.
+
+Two limits worth knowing:
+
+- **A true BCC is invisible.** If TLG was blind-copied and the mail server did
+  not preserve the header, Zendesk never sees the address and the ticket is
+  skipped. If that happens, the ticket's own `recipient` (the support address
+  the mail arrived on) is the only remaining signal, and it is already
+  checked.
+- **Skipped means never ingested**, not excluded-with-a-note: the ticket is
+  not written to the active table at all, so there is no history row for it.
+  The run log names every skipped ticket and its recipients, and the summary
+  line counts them.
+
+Set `REQUIRE_TLG_RECIPIENT=false` to turn the filter off, or
+`TLG_RECIPIENT_DOMAIN` to change the domain.
+
+### An unresolved extra tracking number no longer blocks a resolved order
+
+`order_resolution_complete` used to go False whenever **any** tracking number
+on the ticket was missing from `bi.shipping_platform_shipments`, even when the
+order itself had been resolved. That flag switches off `has_resolved_order()`,
+which re-arms the "tracking number not found" escalation in
+`regex_engine`, `intent_detection` and `response_generator` — so requests that
+had their order, their documents and everything else were never answered.
+
+Sixteen rows in the September-October history, fourteen of them on a single
+order. The "missing" second tracking number is almost never a second shipment:
+
+```text
+5009740_1  1ZX662916663848348 ; 1Z7E37218619724391   overgoods waybill + export leg
+4999624_1  1ZGE71566804228046 ; 1ZGE71566881963393   original + re-ship number
+5010265_1  JJD149990200085537821 ; 9911799752        DHL JJD + its AWB
+4973575_1  877490063901 ; 919820673441               AWB + the recipient's PHONE number
+5006360_1  1Z2V58999190429249 ; 1Z2V58999197485738   two shipments, one order
+```
+
+The row is now marked incomplete only when it is genuinely ambiguous: the
+tracking numbers resolved to **more than one order** *and* some did not
+resolve at all, so which order the unknown ones belong to cannot be decided.
+A single resolved order is never ambiguous.
+
+**Trade-off.** A ticket about two shipments where only one resolves is now
+answered with the documents of the one that did, instead of going to a human.
+Of the 16 affected rows, 14 are single-order, so that case is rare — but it is
+a deliberate loosening of a guard that existed to prevent partial answers. To
+restore the old behaviour, drop the
+`and len(split_order_references(existing_order)) > 1` clause in
+`apply_order_reference_fallback()`.
+
 ### Unpaid extra charges and `config/ddp_configuration.json`
 
 When UPS reports that the consignee has not paid the additional costs, who
@@ -1144,10 +1292,44 @@ return.
    `spese`, `dazi`. Only notifications that also carried the Italian text
    matched. `costs?|fees?|duties|duty|taxes` are now in both copies of the
    pattern.
-3. An unconfigured pair used to fall through to the return-confirmation
-   reply. It is now escalated, with the pair named in the reason:
-   `(country=IT, brand=HB) is not in config/ddp_configuration.json`. HB has
-   no rows at all, so those tickets stay with a human by design.
+3. An unmatched lookup used to fall through to the return-confirmation reply
+   in every case. It is now split in two, which is what reconciles
+   `prompts/response_builder.md` (unmatched pair -> return confirmation) with
+   the `_comment` in `config/ddp_configuration.json` (undetermined -> human):
+
+| lookup | outcome |
+| --- | --- |
+| pair found, `ddp=true` | `Please proceed with the delivery of the shipment on topic.` |
+| pair found, `ddp=false` | `I confirm you the return of shipment on topic.` |
+| pair missing, **brand present** in the table | `I confirm you the return of shipment on topic.` — the table covers the brand, so this destination simply is not DDP |
+| **brand absent** from the table entirely | human intervention |
+
+`brand_in_ddp_configuration()` draws the line. HB has no rows at all, so HB
+tickets stay with a human; DG shipping to a country that is not listed gets
+the return-confirmation reply rather than an escalation.
+
+### What the DDP table does NOT decide
+
+It does not choose between *reintroduzione in franchigia* and *sdoganamento in
+definitiva*. Those are the two UPS Returns first-request templates, and
+`prompts/response_builder.md` ("UPS Returns Customs Clearance First Request")
+keys them on the **carrier comparison** alone:
+
+> Compare the `carrier_code` for the row where `is_return = true` with the
+> `carrier_code` for the row where `is_return = false`. If the two values are
+> the same, use the response that includes the export tracking. If different,
+> use the response that says the export tracking is not available because the
+> export shipment happened with another carrier.
+
+Same carrier → `In allegato la documentazione per la reintroduzione in
+franchigia:`. Different carrier → `Confermo la documentazione in vostro
+possesso per lo sdoganamento in definitiva.` That is
+`return_export_carriers_match()`, and it is independent of DDP.
+
+The DDP table drives a different pair of replies entirely — the English
+"Please proceed with the delivery…" / "I confirm you the return of shipment…"
+pair, both with the letter of authorization attached — and only for the
+unpaid-extra-charges case.
 
 The escalation is checked **after** `missing_required_full_order_values()`,
 so a row whose GET_FULL_ORDER lookup has not run yet keeps the retryable
