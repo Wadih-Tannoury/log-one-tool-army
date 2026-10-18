@@ -649,23 +649,95 @@ number (`format_tracking_numbers_for_display()`).
 
 Order of resolution is now:
 
-1. tracking number -> `bi.shipping_platform_shipments`;
-2. order reference in the subject / description / request body;
-3. order reference inside a PDF attached to the ticket;
-4. **tracking number -> the carrier events in `tlg-wlfs-prd.til.prd_shipmentStatus`.**
+1. **order reference in the subject / description / request body**
+   (`subject_or_description`);
+2. tracking number -> `bi.shipping_platform_shipments` (`tracking_lookup`);
+3. tracking number -> the carrier events in
+   `tlg-wlfs-prd.til.prd_shipmentStatus` (`shipment_status_events`);
+4. **tracking number -> the TIL event stream in
+   `tlg-wlfs-prd.til.prd_tilEvents`** (`til_events`);
+5. order reference inside a PDF attached to the ticket (`pdf_attachment`);
+6. **tracking numbers inside that same PDF**, put back through 2, 3 and 4
+   (`pdf_attachment_tracking`).
 
-Step 4 runs in `apply_shipment_status_order_lookup()`, straight after the
-order-reference fallback, and only for rows that came out of it with a tracking
-number, no order at all, and the tracking number missing from
-`bi.shipping_platform_shipments` — exactly the rows that would otherwise reach
-human review as "no order reference found". The `PACKED` and `SHIPPED` events
-carry `data.shipmentOrderNumber` next to `shippingData[].trackingNumber`, so a
-tracking number the shipments table never received can still be tied to an
-order, which then goes to GET_FULL_ORDER like any other.
+Steps 1 and 2 are decided inside `apply_order_reference_fallback()`; 3, 4 and 5
+are post-passes over whatever is still unresolved, applied in that order by
+`enrich_with_order_references()`.
 
-Rows that already have an order are left untouched: a reference the ticket
-itself carried is better evidence of what the sender is asking about than a
-carrier event.
+Two things moved. **Text now outranks the tracking lookup**: a reference the
+sender wrote in the subject or body is them naming the order directly, so it
+is preferred over one derived from the tracking number. **The PDF scan runs
+last** instead of second, so an attachment is only downloaded and OCR'd for a
+request that nothing cheaper could resolve — previously a ticket with a
+readable PDF never reached either event table.
+
+When both a text reference and a tracking-resolved order exist, the
+tracking-resolved one is kept **only if it names a different order**. Replaying
+the history shows 44 rows where the two disagree, and in 43 of them they are
+the same order written at a different granularity — stored `DG-EUD01670341`
+(one shipment) against a body saying `DG-EU-01670341` (the whole order), or a
+stored multi-shipment list against a body naming one of them. Merging those
+would mix shipment- and order-shaped references, flip
+`shipment_selection_mode`, and silently widen the reply to shipments the sender
+never asked about, so `order_number_from_order_reference()` is used to drop
+them. A genuinely different order is still merged, under
+`subject_or_description+tracking_lookup`.
+
+### Steps 5 and 6: the PDF attachments
+
+`apply_pdf_attachment_order_lookup()` reads **two** things out of one
+text/OCR pass, because that pass is the most expensive step in the pipeline
+and asking twice would double it:
+
+- an **order reference**, which resolves the row outright (`pdf_attachment`);
+- every **tracking-shaped value**, used only when no order reference was
+  found. Those go back through the same three tables the description's
+  tracking number went through — `shipping_platform_shipments`,
+  `prd_shipmentStatus`, `prd_tilEvents`, in that order — and a hit is recorded
+  as `pdf_attachment_tracking`.
+
+Step 6 exists because **the tracking number quoted in a ticket's description
+is often the wrong one**. On a UPS overgoods invoice the "Waybill Number" is
+the overgoods leg (`1ZX662916663848348`), which no TLG table ever received,
+while the ORIGINAL export tracking number sits in the "Invoice No." field
+(`1Z7E37218619724391`) and is the one that resolves to an order. Resolution
+used to stop at the description's number and send the request to human review
+with "no order reference found", with the answer sitting in the attachment.
+
+`find_tracking_numbers()` matches UPS `1Z` + 16 alphanumerics first, then
+12/15-digit FedEx and 10-digit DHL shapes. The patterns are deliberately
+narrow and toll-free/dialling prefixes are dropped, because a looser rule
+turns invoice totals, VAT numbers, dates and phone numbers on the same page
+into phantom tracking numbers. Unmatched candidates cost one row in a
+BigQuery `IN UNNEST`, so a few false positives are harmless; a false *order*
+would not be.
+
+A tracking number resolved this way is appended to the row's
+`extracted_tracking_number`, since downstream shipment selection and the
+export-tracking lookups key off that column and the description's number is
+known not to resolve. `shipments_orders_for_trackings()` is a small
+standalone query against `bi.shipping_platform_shipments` matching both the
+forward and the return tracking column; like the event lookups, a tracking
+number naming more than one order is skipped rather than resolved to an
+arbitrary one.
+
+### Step 4: `til.prd_tilEvents`
+
+`apply_til_events_order_lookup()` unnests `requestPayload.data[]` and reads
+`shipment.orderNumber`, matching the ticket's tracking number against all three
+places it can appear in a payload:
+
+```sql
+JSON_VALUE(item, '$.trackingNumber'),
+JSON_VALUE(item, '$.shipment.trackingNumber'),
+JSON_VALUE(item, '$.carrierShipmentIdentificationNumber')
+```
+
+Semicolon-joined tracking columns are split before matching, so a row carrying
+`877817678173;390221886621` is looked up as two numbers. The same guards as
+step 3 apply: ambiguity is not resolved, every value goes through
+`split_order_references()`, partial resolution stays incomplete, and a query
+failure is logged rather than raised.
 
 Three guards on what the events are allowed to produce:
 
@@ -683,7 +755,7 @@ Three guards on what the events are allowed to produce:
   numbers, `order_resolution_complete` is set only when every one of them found
   an order, so a partly-resolved request still goes to a human.
 
-**Separate credentials.** `til.prd_shipmentStatus` lives in the `tlg-wlfs-prd`
+**Separate credentials.** `til.prd_shipmentStatus` and `til.prd_tilEvents` live in the `tlg-wlfs-prd`
 GCP project, which the BI service account cannot read, so the step uses its own
 client built by `til_bigquery_client()` from the `TIL_BIGQUERY_CREDS` secret
 (service-account JSON, same shape as `BI_BIGQUERY_CREDS`; exposed to the job in
