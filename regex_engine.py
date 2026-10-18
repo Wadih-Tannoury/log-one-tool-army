@@ -632,15 +632,30 @@ class RegexEngine:
             )
 
         if is_unpaid_extra_charges_request(cleaned_text):
+            # "The consignee has not paid the additional costs of this
+            # shipment." Who pays is decided by config/ddp_configuration.json,
+            # keyed on (destination country, brand) -- and the destination
+            # country comes from GET_FULL_ORDER, which has not run yet at this
+            # stage. So the request is classified as needing the UPS account
+            # number (the data the reply carries) and the decision is left to
+            # response_generator, which has the country by then.
+            #
+            # This used to return human_intervention_required outright, which
+            # made the whole DDP branch in response_generator unreachable: it
+            # only fires on requested_data == ["ups_account_number"]. Every
+            # unpaid-charges ticket went to the logistics group with
+            # "a human must verify whether the customer or TLG should pay",
+            # even for the 901 (country, brand) pairs that are configured.
+            # An unconfigured pair still goes to a human, decided downstream.
             return self._as_output(
                 matched=True,
                 excluded=False,
-                request_types=[HUMAN_INTERVENTION_REQUIRED],
-                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                request_types=["ups_account_number"],
+                requested_data=["ups_account_number"],
                 cleaned_request_text=cleaned_text,
                 matched_spans=[
                     {
-                        "request_type": HUMAN_INTERVENTION_REQUIRED,
+                        "request_type": "ups_account_number",
                         "span": "customer did not pay extra/outstanding charges",
                         "start": 0,
                         "end_pos": 0,
@@ -648,14 +663,11 @@ class RegexEngine:
                 ],
                 confidence=HIGH_CONFIDENCE,
                 notes=(
-                    "Customer did not pay extra/outstanding charges. Human intervention "
-                    "is required to verify whether the customer or TLG should pay."
+                    "Customer did not pay extra/outstanding charges. The reply "
+                    "depends on the DDP status for (destination country, brand), "
+                    "resolved after the GET_FULL_ORDER lookup."
                 ),
                 needs_llm_confirmation=False,
-                force_human_intervention=True,
-                human_intervention_required=True,
-                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
-                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
                 quoted_history_removed=quoted_history_removed,
                 signature_removed=signature_removed,
             )
