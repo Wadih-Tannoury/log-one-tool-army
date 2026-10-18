@@ -785,6 +785,13 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"rifiutat[oa][\s\S]{0,40}pagare|rifiuta(?:to)?\s+di\s+pagare)"
     r"[\s\S]{0,120}"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
+    # English nouns UPS actually uses. "additional costs" previously
+    # matched only the Italian "costi", so an English-only UPS exception
+    # notification -- "Your Consignee has still not paid the additional
+    # costs of this shipment." -- never matched at all, and the whole
+    # DDP branch was skipped for it.
+    r"costs?|fees?|duties|duty|taxes|"
+    r"costs?|fees?|duties|duty|taxes|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)|"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
