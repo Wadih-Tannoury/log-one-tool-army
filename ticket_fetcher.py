@@ -61,16 +61,19 @@ from order_reference_resolver import (
     BLOCKED_ORDER_REFERENCE_PREFIXES,
     DESTINATION_CHECKED_ORDER_REFERENCE_PREFIXES,
     ORDER_REFERENCE_SOURCE_PDF,
+    ORDER_REFERENCE_SOURCE_PDF_TRACKING,
     ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS,
     ORDER_REFERENCE_SOURCE_TEXT,
+    ORDER_REFERENCE_SOURCE_TIL_EVENTS,
     ORDER_REFERENCE_SOURCE_TRACKING,
+    order_number_from_order_reference,
     SHIPMENT_SELECTION_ALL,
     SHIPMENT_SELECTION_BY_TRACKING,
     SHIPMENT_SELECTION_EXACT,
     contains_always_blocked_order_reference,
     contains_blocked_order_reference,
     find_order_references,
-    find_order_references_in_pdfs,
+    find_identifiers_in_pdfs,
     is_pdf_attachment,
     is_shipment_shaped_order_reference,
     split_order_references,
@@ -3996,8 +3999,25 @@ def enrich_with_shipment_numbers(
         )
     )
 
+    # Order resolution, cheapest and most direct source first:
+    #   1. subject_or_description  (the sender named the order)
+    #   2. tracking_lookup         (bi.shipping_platform_shipments)
+    #      -- 1 and 2 are both decided inside apply_order_reference_fallback
+    #   3. shipment_status_events  (til.prd_shipmentStatus)
+    #   4. til_events              (til.prd_tilEvents)
+    #   5. pdf_attachment          (download + OCR, so it goes last)
+    # Each pass only looks at rows the previous ones left without an order.
     df = apply_order_reference_fallback(df, auth=auth, base_url=base_url)
     df = apply_shipment_status_order_lookup(df, til_client, bigquery)
+    df = apply_til_events_order_lookup(df, til_client, bigquery)
+    df = apply_pdf_attachment_order_lookup(
+        df,
+        auth=auth,
+        base_url=base_url,
+        client=client,
+        til_client=til_client,
+        bigquery=bigquery,
+    )
 
     return df
 
@@ -4237,6 +4257,217 @@ def apply_shipment_status_order_lookup(
     return df
 
 
+TIL_EVENTS_TABLE = "`tlg-wlfs-prd`.til.prd_tilEvents"
+
+# The TIL event stream carries each shipment block under
+# requestPayload.data[].shipment, and the order number with it. The tracking
+# number can appear in three different places depending on the event, so all
+# three are matched; a ticket tracking number that bi.shipping_platform_shipments
+# and prd_shipmentStatus both missed can still be tied to an order here.
+TIL_EVENTS_QUERY = f"""
+WITH wanted AS (
+
+    SELECT DISTINCT TRIM(tracking) AS tracking_number
+    FROM UNNEST(@tracking_numbers) AS raw,
+         UNNEST(SPLIT(raw, ';')) AS tracking
+    WHERE TRIM(tracking) != ''
+),
+
+matches AS (
+
+    SELECT
+        w.tracking_number                                  AS tracking_number,
+        JSON_VALUE(item, '$.shipment.orderNumber')         AS shipment_order_number,
+        JSON_VALUE(item, '$.shipment.carrierCode')         AS carrier_code,
+        JSON_VALUE(item, '$.shipment.isReturn')            AS is_return,
+        e.ingestionTimestamp                               AS event_timestamp
+
+    FROM {TIL_EVENTS_TABLE} AS e,
+         UNNEST(JSON_EXTRACT_ARRAY(e.requestPayload, '$.data')) AS item
+    JOIN wanted AS w
+      ON w.tracking_number IN (
+             JSON_VALUE(item, '$.trackingNumber'),
+             JSON_VALUE(item, '$.shipment.trackingNumber'),
+             JSON_VALUE(item, '$.carrierShipmentIdentificationNumber')
+         )
+)
+
+-- One row per (tracking number, order). A tracking number normally appears in
+-- several events naming the same order and those collapse here; one that
+-- genuinely names two different orders survives as two rows, and the caller
+-- refuses to guess between them rather than reporting an arbitrary one.
+SELECT
+    tracking_number,
+    shipment_order_number,
+    ANY_VALUE(carrier_code) AS carrier_code,
+    ANY_VALUE(is_return)    AS is_return,
+    MAX(event_timestamp)    AS last_event_at
+
+FROM matches
+
+WHERE shipment_order_number IS NOT NULL
+  AND TRIM(shipment_order_number) != ''
+
+GROUP BY tracking_number, shipment_order_number
+"""
+
+
+def til_events_orders_for_trackings(
+    tracking_numbers: list[str],
+    client,
+    bigquery,
+) -> dict[str, str]:
+    """Map tracking number -> shipment order number, from til.prd_tilEvents.
+
+    Mirrors shipment_status_orders_for_trackings(): a tracking number that
+    names more than one order is dropped rather than resolved to an arbitrary
+    one of them.
+    """
+
+    if not tracking_numbers or client is None:
+        return {}
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "tracking_numbers", "STRING", tracking_numbers
+            )
+        ]
+    )
+
+    rows = list(client.query(TIL_EVENTS_QUERY, job_config=job_config).result())
+
+    orders_by_tracking: dict[str, set] = {}
+    for row in rows:
+        tracking = _to_str(row.get("tracking_number")).strip()
+        reference = _to_str(row.get("shipment_order_number")).strip()
+        if not tracking or not reference:
+            continue
+        orders_by_tracking.setdefault(tracking, set()).add(reference)
+
+    resolved: dict[str, str] = {}
+    for tracking, references in orders_by_tracking.items():
+        if len(references) != 1:
+            print(
+                f"  Tracking {tracking} names {len(references)} different "
+                f"orders in prd_tilEvents ({', '.join(sorted(references))}); "
+                "not resolved."
+            )
+            continue
+        reference = next(iter(references))
+        if split_order_references(reference):
+            resolved[tracking] = reference
+
+    return resolved
+
+
+def apply_til_events_order_lookup(
+    df: pd.DataFrame,
+    client,
+    bigquery,
+) -> pd.DataFrame:
+    """Fourth resolution step, after prd_shipmentStatus and before the PDFs.
+
+    ``client`` is the TIL-project BigQuery client, NOT the BI one: the table
+    lives in another project. ``None`` skips the step.
+
+    Applies only to rows that still have no order after the tracking lookup
+    and the prd_shipmentStatus events -- i.e. the rows that would otherwise
+    reach the PDF scan, and failing that human review.
+    """
+
+    if df.empty or "extracted_tracking_number" not in df.columns:
+        return df
+
+    if client is None:
+        # No TIL credentials: the rows this step would have rescued simply
+        # stay unresolved, which is the pre-existing behavior.
+        return df
+
+    df = df.copy()
+
+    def _needs_lookup(row: Mapping[str, Any]) -> bool:
+        if split_order_references(row.get("shipment_order_number")):
+            return False
+        return bool(_row_tracking_numbers(row.get("extracted_tracking_number")))
+
+    pending = [row for _, row in df.iterrows() if _needs_lookup(row)]
+    if not pending:
+        return df
+
+    tracking_numbers: list[str] = []
+    for row in pending:
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            if tracking not in tracking_numbers:
+                tracking_numbers.append(tracking)
+
+    print(
+        f"TIL-events lookup: {len(pending)} request(s) still without an order; "
+        f"querying prd_tilEvents for {len(tracking_numbers)} tracking number(s)."
+    )
+
+    try:
+        resolved_map = til_events_orders_for_trackings(
+            tracking_numbers, client, bigquery
+        )
+    except Exception as error:  # noqa: BLE001 - a failed fallback must not
+        # break the run: these rows were already heading for the PDF scan.
+        print(f"  prd_tilEvents lookup failed: {error}")
+        return df
+
+    if not resolved_map:
+        print("  No order found in prd_tilEvents for any of them.")
+        return df
+
+    resolved_count = 0
+
+    for index, row in df.iterrows():
+        if not _needs_lookup(row):
+            continue
+
+        references: list[str] = []
+        covered = 0
+        for tracking in _row_tracking_numbers(row.get("extracted_tracking_number")):
+            reference = resolved_map.get(tracking)
+            if not reference:
+                continue
+            covered += 1
+            if reference not in references:
+                references.append(reference)
+
+        if not references:
+            continue
+
+        resolved_order = ";".join(references)
+        df.at[index, "shipment_order_number"] = resolved_order
+        df.at[index, "extracted_order_reference"] = resolved_order
+        df.at[index, "order_reference_source"] = ORDER_REFERENCE_SOURCE_TIL_EVENTS
+        # The event payload names one specific shipment, so only that block of
+        # the GET_FULL_ORDER payload is read -- the same rule every other
+        # source applies to a shipment-shaped reference.
+        df.at[index, "shipment_selection_mode"] = (
+            SHIPMENT_SELECTION_EXACT
+            if all(
+                is_shipment_shaped_order_reference(reference)
+                for reference in references
+            )
+            else SHIPMENT_SELECTION_BY_TRACKING
+        )
+        # Complete only when every tracking number of the row found an order;
+        # a partially resolved row must still go to a human, as before.
+        df.at[index, "order_resolution_complete"] = covered == len(
+            _row_tracking_numbers(row.get("extracted_tracking_number"))
+        )
+        df.at[index, "order_processing_blocked"] = contains_blocked_order_reference(
+            resolved_order
+        )
+        resolved_count += 1
+
+    print(f"  Resolved {resolved_count} request(s) from prd_tilEvents.")
+
+    return df
+
+
 # ============================================================================
 # ORDER-REFERENCE FALLBACK
 # ============================================================================
@@ -4307,8 +4538,14 @@ def order_references_from_ticket_pdfs(
     base_url: str,
     session: requests.Session | None = None,
     log: Callable[[str], None] = print,
-) -> list[str]:
-    """Open the ticket's PDF attachments and look for an order reference.
+) -> tuple[list[str], list[str]]:
+    """Open the ticket's PDF attachments; return (order references, trackings).
+
+    Both are read in one pass because the text extraction may OCR every page,
+    and the tracking numbers matter: on a UPS overgoods invoice the waybill
+    number is the overgoods leg, which no TLG table knows, while the original
+    export tracking sits in the "Invoice No." field and is the one that
+    resolves to an order.
 
     Mirrors ticket_order_numbers.py: embedded text layer first, local Tesseract
     OCR as a fallback for scanned invoices.  Any failure (download, unreadable
@@ -4328,10 +4565,10 @@ def order_references_from_ticket_pdfs(
         )
     except Exception as exc:  # noqa: BLE001 - never abort the fetch over one ticket
         log(f"  Could not list attachments for ticket {ticket_id}: {exc}")
-        return []
+        return [], []
 
     if not attachments:
-        return []
+        return [], []
 
     blobs: list[tuple[str, bytes]] = []
     for attachment in attachments:
@@ -4347,9 +4584,9 @@ def order_references_from_ticket_pdfs(
             log(f"      download failed for {file_name}: {exc}")
 
     if not blobs:
-        return []
+        return [], []
 
-    return find_order_references_in_pdfs(blobs, log=log)
+    return find_identifiers_in_pdfs(blobs, log=log)
 
 
 def request_needs_no_reply(row: Mapping[str, Any]) -> bool:
@@ -4406,17 +4643,27 @@ def scan_ticket_pdfs_for_order_references(
     ]
     try:
         with requests.Session() as session:
-            references = order_references_from_ticket_pdfs(
+            references, trackings = order_references_from_ticket_pdfs(
                 ticket_id,
                 auth=auth,
                 base_url=base_url,
                 session=session,
                 log=messages.append,
             )
-        return {"ticket_id": ticket_id, "references": references, "messages": messages}
+        return {
+            "ticket_id": ticket_id,
+            "references": references,
+            "trackings": trackings,
+            "messages": messages,
+        }
     except Exception as exc:  # noqa: BLE001 - one bad ticket must not stop the rest
         messages.append(f"      PDF scan failed for ticket {ticket_id}: {exc}")
-        return {"ticket_id": ticket_id, "references": [], "messages": messages}
+        return {
+            "ticket_id": ticket_id,
+            "references": [],
+            "trackings": [],
+            "messages": messages,
+        }
 
 
 def _prefetch_pdf_order_references(
@@ -4424,15 +4671,19 @@ def _prefetch_pdf_order_references(
     *,
     auth,
     base_url: str,
-) -> dict[int, list[str]]:
-    """Resolve the PDF order references for many tickets concurrently.
+) -> dict[int, dict[str, list[str]]]:
+    """Resolve the PDF identifiers for many tickets concurrently.
+
+    Each entry is ``{"references": [...], "trackings": [...]}``: the order
+    references found in the attachments, and every tracking-shaped value,
+    both from the same single text/OCR pass.
 
     The per-ticket work (list attachments, download, OCR) is independent, so it
     parallelizes cleanly.  Results are returned as a cache the sequential
     row loop then reads, leaving its resolution logic untouched.
     """
 
-    cache: dict[int, list[str]] = {}
+    cache: dict[int, dict[str, list[str]]] = {}
     if not ticket_ids:
         return cache
 
@@ -4484,9 +4735,302 @@ def _prefetch_pdf_order_references(
             continue
         for message in result["messages"]:
             print(message)
-        cache[ticket_id] = result["references"]
+        cache[ticket_id] = {
+            "references": result["references"],
+            "trackings": result.get("trackings") or [],
+        }
 
     return cache
+
+
+SHIPMENTS_BY_TRACKING_QUERY = """
+SELECT DISTINCT
+    tracking_number,
+    return_tracking_number,
+    shipment_order_number
+
+FROM `tlg-business-intelligence-prd.bi.shipping_platform_shipments`
+
+WHERE is_deleted = false
+  AND shipment_order_number IS NOT NULL
+  AND TRIM(shipment_order_number) != ''
+  AND (
+        tracking_number IN UNNEST(@tracking_numbers)
+     OR return_tracking_number IN UNNEST(@tracking_numbers)
+  )
+"""
+
+
+def shipments_orders_for_trackings(
+    tracking_numbers: list[str],
+    client,
+    bigquery,
+) -> dict[str, str]:
+    """Map tracking number -> order, straight from bi.shipping_platform_shipments.
+
+    The main fetch already joins this table, but only for the tracking number
+    the ticket text carried. This is the same question asked again for the
+    tracking numbers found inside a PDF attachment, so it is a small standalone
+    query rather than a refactor of that join.
+
+    Both the forward and the return tracking column are matched, and a tracking
+    number naming more than one order is skipped rather than resolved to an
+    arbitrary one -- the same rule the event-table lookups follow.
+    """
+
+    if not tracking_numbers or client is None:
+        return {}
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "tracking_numbers", "STRING", tracking_numbers
+            )
+        ]
+    )
+
+    wanted = {value.strip() for value in tracking_numbers if value and value.strip()}
+    orders_by_tracking: dict[str, set] = {}
+
+    for row in client.query(SHIPMENTS_BY_TRACKING_QUERY, job_config=job_config).result():
+        reference = _to_str(row.get("shipment_order_number")).strip()
+        if not reference or not split_order_references(reference):
+            continue
+        for column in ("tracking_number", "return_tracking_number"):
+            tracking = _to_str(row.get(column)).strip()
+            if tracking and tracking in wanted:
+                orders_by_tracking.setdefault(tracking, set()).add(reference)
+
+    resolved: dict[str, str] = {}
+    for tracking, references in orders_by_tracking.items():
+        if len(references) != 1:
+            print(
+                f"  Tracking {tracking} names {len(references)} different orders "
+                f"in shipping_platform_shipments ({', '.join(sorted(references))}); "
+                "not resolved."
+            )
+            continue
+        resolved[tracking] = next(iter(references))
+
+    return resolved
+
+
+def apply_pdf_attachment_order_lookup(
+    df: pd.DataFrame,
+    auth,
+    base_url: str,
+    client=None,
+    til_client=None,
+    bigquery=None,
+) -> pd.DataFrame:
+    """Last resolution step: the ticket's PDF attachments.
+
+    Runs after the tracking lookup, prd_shipmentStatus and prd_tilEvents, so
+    an attachment is only ever downloaded and OCR'd for a request no cheaper
+    source could resolve.
+
+    Two things are read out of the same text/OCR pass:
+
+    * an **order reference**, which resolves the row outright;
+    * every **tracking-shaped value**, used only when no order reference was
+      found. Those tracking numbers then go through the same three tables the
+      description's tracking number went through (shipping_platform_shipments
+      -> prd_shipmentStatus -> prd_tilEvents).
+
+    The second half exists because the tracking number quoted in a ticket's
+    description is often the wrong one. On a UPS overgoods invoice the
+    "Waybill Number" is the overgoods leg, which no TLG table ever received,
+    while the ORIGINAL export tracking number sits in the "Invoice No." field
+    (1ZX662916646304172 against 1Z7E38280412626229 on the examples that
+    prompted this). Only the second resolves to an order.
+    """
+
+    if df.empty:
+        return df
+
+    # Downloading and OCR-ing attachments to find an order for a request that
+    # will be excluded without a reply is wasted work. NOTE: a blocked order
+    # prefix inside those attachments is therefore not detected, so such a
+    # ticket is solved rather than left untouched.
+    skip_no_reply = _env_bool(
+        SKIP_PDF_SCAN_FOR_NO_REPLY_ENV,
+        DEFAULT_SKIP_PDF_SCAN_FOR_NO_REPLY,
+    )
+
+    def _needs_lookup(row: Mapping[str, Any]) -> bool:
+        if split_order_references(row.get("shipment_order_number")):
+            return False
+        if skip_no_reply and request_needs_no_reply(row):
+            return False
+        return _to_int(row.get("zendesk_ticket_id")) is not None
+
+    pending_ticket_ids = []
+    for _, row in df.iterrows():
+        if not _needs_lookup(row):
+            continue
+        ticket_id = _to_int(row.get("zendesk_ticket_id"))
+        if ticket_id is not None and ticket_id not in pending_ticket_ids:
+            pending_ticket_ids.append(ticket_id)
+
+    if not pending_ticket_ids:
+        return df
+
+    df = df.copy()
+
+    print(
+        f"PDF attachment scan: {len(pending_ticket_ids)} ticket(s) still "
+        "without an order."
+    )
+
+    pdf_cache = _prefetch_pdf_order_references(
+        pending_ticket_ids,
+        auth=auth,
+        base_url=base_url,
+    )
+
+    # --- pass A: an order reference in the PDF resolves the row outright ----
+    resolved_from_reference = 0
+
+    for index, row in df.iterrows():
+        if not _needs_lookup(row):
+            continue
+
+        ticket_id = _to_int(row.get("zendesk_ticket_id"))
+        references = list((pdf_cache.get(ticket_id) or {}).get("references") or [])
+        if not references:
+            continue
+
+        _apply_resolved_order(
+            df,
+            index,
+            references,
+            ORDER_REFERENCE_SOURCE_PDF,
+            has_tracking=bool(_row_tracking_numbers(row.get("extracted_tracking_number"))),
+        )
+        resolved_from_reference += 1
+
+    print(
+        f"  Resolved {resolved_from_reference} request(s) from an order "
+        "reference in a PDF attachment."
+    )
+
+    # --- pass B: the PDF's tracking numbers go through the order tables -----
+    still_pending = [
+        (index, row) for index, row in df.iterrows() if _needs_lookup(row)
+    ]
+    if not still_pending:
+        return df
+
+    candidates: list[str] = []
+    for index, row in still_pending:
+        ticket_id = _to_int(row.get("zendesk_ticket_id"))
+        for tracking in (pdf_cache.get(ticket_id) or {}).get("trackings") or []:
+            if tracking not in candidates:
+                candidates.append(tracking)
+
+    if not candidates:
+        return df
+
+    print(
+        f"  {len(still_pending)} request(s) still without an order; trying "
+        f"{len(candidates)} tracking-shaped value(s) found in their PDFs."
+    )
+
+    # Same three sources, in the same order, as for the description's tracking
+    # number. Each only sees what the previous one could not resolve.
+    resolved_map: dict[str, str] = {}
+    for label, lookup, lookup_client in (
+        ("shipping_platform_shipments", shipments_orders_for_trackings, client),
+        ("prd_shipmentStatus", shipment_status_orders_for_trackings, til_client),
+        ("prd_tilEvents", til_events_orders_for_trackings, til_client),
+    ):
+        remaining = [value for value in candidates if value not in resolved_map]
+        if not remaining or lookup_client is None or bigquery is None:
+            continue
+        try:
+            found = lookup(remaining, lookup_client, bigquery)
+        except Exception as error:  # noqa: BLE001 - a failed fallback must not
+            # break the run: these rows were already heading for human review.
+            print(f"    {label} lookup failed for PDF trackings: {error}")
+            continue
+        if found:
+            print(f"    {label} resolved {len(found)} PDF tracking number(s).")
+        resolved_map.update(found)
+
+    if not resolved_map:
+        print("    No order found for any tracking number read from a PDF.")
+        return df
+
+    resolved_from_tracking = 0
+
+    for index, row in still_pending:
+        ticket_id = _to_int(row.get("zendesk_ticket_id"))
+        references: list[str] = []
+        matched_trackings: list[str] = []
+        for tracking in (pdf_cache.get(ticket_id) or {}).get("trackings") or []:
+            reference = resolved_map.get(tracking)
+            if not reference:
+                continue
+            if tracking not in matched_trackings:
+                matched_trackings.append(tracking)
+            if reference not in references:
+                references.append(reference)
+
+        if not references:
+            continue
+
+        # The PDF's tracking number is the one that actually identifies the
+        # shipment, so it joins the row's tracking numbers: downstream
+        # shipment selection and the export-tracking lookups key off this
+        # column, and the description's number is known not to resolve.
+        existing = _row_tracking_numbers(row.get("extracted_tracking_number"))
+        merged_trackings = existing + [
+            tracking for tracking in matched_trackings if tracking not in existing
+        ]
+        df.at[index, "extracted_tracking_number"] = ";".join(merged_trackings)
+
+        _apply_resolved_order(
+            df,
+            index,
+            references,
+            ORDER_REFERENCE_SOURCE_PDF_TRACKING,
+            has_tracking=True,
+        )
+        resolved_from_tracking += 1
+
+    print(
+        f"  Resolved {resolved_from_tracking} request(s) from a tracking "
+        "number read out of a PDF attachment."
+    )
+
+    return df
+
+
+def _apply_resolved_order(
+    df: pd.DataFrame,
+    index,
+    references: list[str],
+    source: str,
+    *,
+    has_tracking: bool,
+) -> None:
+    """Write one resolved order onto a row, with the usual selection rules."""
+
+    resolved_order = ";".join(references)
+
+    df.at[index, "shipment_order_number"] = resolved_order
+    df.at[index, "extracted_order_reference"] = resolved_order
+    df.at[index, "order_reference_source"] = source
+    if all(is_shipment_shaped_order_reference(reference) for reference in references):
+        df.at[index, "shipment_selection_mode"] = SHIPMENT_SELECTION_EXACT
+    elif has_tracking:
+        df.at[index, "shipment_selection_mode"] = SHIPMENT_SELECTION_BY_TRACKING
+    else:
+        df.at[index, "shipment_selection_mode"] = SHIPMENT_SELECTION_ALL
+    df.at[index, "order_resolution_complete"] = True
+    df.at[index, "order_processing_blocked"] = contains_blocked_order_reference(
+        resolved_order
+    )
 
 
 def apply_order_reference_fallback(
@@ -4516,61 +5060,6 @@ def apply_order_reference_fallback(
         df["extracted_order_reference"] = ""
 
     session = requests.Session() if (auth and base_url) else None
-
-    # Resolve every ticket that will need a PDF scan up front, in parallel.
-    # The condition below must stay identical to the one guarding the scan
-    # inside the loop: a row needs a scan when the tracking lookup found no
-    # order AND the ticket text carried no reference. Both are pure functions
-    # of the row, so hoisting the work out of the loop cannot change results.
-    pdf_reference_cache: dict[int, list[str]] = {}
-    skip_no_reply = _env_bool(
-        SKIP_PDF_SCAN_FOR_NO_REPLY_ENV,
-        DEFAULT_SKIP_PDF_SCAN_FOR_NO_REPLY,
-    )
-    skipped_no_reply_tickets: set[int] = set()
-    if session is not None:
-        pending_ticket_ids: list[int] = []
-        seen_ticket_ids: set[int] = set()
-        for _, row in df.iterrows():
-            # Downloading and OCR-ing attachments to find an order for a
-            # request that will be excluded without a reply is wasted work.
-            if skip_no_reply and request_needs_no_reply(row):
-                skipped_ticket_id = _to_int(row.get("zendesk_ticket_id"))
-                if skipped_ticket_id is not None:
-                    skipped_no_reply_tickets.add(skipped_ticket_id)
-                continue
-            # Mirrors the loop exactly, including its rejection of a stored
-            # order that is not a real reference: such a row is re-resolved
-            # there, so it must be scanned here too.
-            stored_order = (_to_str(row.get("shipment_order_number")) or "").strip()
-            if stored_order and split_order_references(stored_order):
-                continue
-            if split_order_references(row.get("extracted_order_reference")):
-                continue
-            ticket_id = _to_int(row.get("zendesk_ticket_id"))
-            if ticket_id is None or ticket_id in seen_ticket_ids:
-                continue
-            seen_ticket_ids.add(ticket_id)
-            pending_ticket_ids.append(ticket_id)
-
-        # A ticket is only really spared if none of its other requests needs a
-        # scan: the scan is per ticket, not per request.
-        spared = skipped_no_reply_tickets - set(pending_ticket_ids)
-        if spared:
-            print(
-                f"Skipping the PDF scan for {len(spared)} ticket(s) whose "
-                "request needs no reply (noreply/autoreply first request, or a "
-                "carrier notification). NOTE: a blocked order prefix inside "
-                "those attachments is therefore not detected, so such a ticket "
-                "is solved rather than left untouched. Set "
-                f"{SKIP_PDF_SCAN_FOR_NO_REPLY_ENV}=false to scan them anyway."
-            )
-
-        pdf_reference_cache = _prefetch_pdf_order_references(
-            pending_ticket_ids,
-            auth=auth,
-            base_url=base_url,
-        )
 
     resolved_orders: list[Any] = []
     references_out: list[str] = []
@@ -4619,94 +5108,95 @@ def apply_order_reference_fallback(
                 _to_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
             )
 
-            if existing_order:
+            # Resolution precedence:
+            #   subject_or_description -> tracking_lookup
+            #     -> shipment_status_events -> til_events -> pdf_attachment
+            # The first two are decided here. The last three are post-passes
+            # over whatever is still unresolved when this loop ends, in that
+            # order, so a PDF is only ever opened once every cheaper source
+            # has been exhausted.
+            if references:
+                # An order reference written in the subject or the body is the
+                # sender naming the order directly, so it outranks anything
+                # derived from the tracking number. When the tracking lookup
+                # also produced an order, both are kept: the ticket may be
+                # about several shipments and dropping either one would lose
+                # a shipment from the reply.
+                source = ORDER_REFERENCE_SOURCE_TEXT
+                merged = [
+                    reference
+                    for reference in split_order_references(existing_order)
+                    if reference.upper() not in {
+                        value.upper() for value in references
+                    }
+                    # Keep only tracking-resolved references that name a
+                    # DIFFERENT order. Replaying the history shows that when
+                    # the two disagree they are almost always the same order
+                    # written at a different granularity -- stored
+                    # "DG-EUD01670341" (one shipment) against a body saying
+                    # "DG-EU-01670341" (the whole order), or a stored
+                    # multi-shipment list against the body naming one of them.
+                    # Merging those would mix shipment- and order-shaped
+                    # references, which flips shipment_selection_mode and
+                    # silently widens the reply to shipments the sender never
+                    # asked about.
+                    and order_number_from_order_reference(reference)
+                    not in {
+                        order_number_from_order_reference(value)
+                        for value in references
+                    }
+                ]
+                if merged:
+                    references = [*references, *merged]
+                    source = (
+                        f"{ORDER_REFERENCE_SOURCE_TEXT}+"
+                        f"{ORDER_REFERENCE_SOURCE_TRACKING}"
+                    )
+
+                resolved_order = ";".join(references)
+                resolved_from_text += 1
+
+                # The shape of the reference decides what is read:
+                #
+                # * shipment number (a letter after the prefix, e.g.
+                #   DG-EUA01663254) identifies one specific shipment, so
+                #   only that shipment block is read;
+                # * order number (a dash after the prefix, e.g.
+                #   DG-EU-01663254) covers the whole order, so every
+                #   shipment block is read -- narrowed to the block
+                #   carrying the ticket's tracking number when the ticket
+                #   had one that the shipments table did not know.
+                #
+                # A mixed list keeps the row-level mode here; the extractor
+                # then narrows each shipment-shaped reference on its own.
+                if all(
+                    is_shipment_shaped_order_reference(reference)
+                    for reference in references
+                ):
+                    mode = SHIPMENT_SELECTION_EXACT
+                elif has_tracking:
+                    mode = SHIPMENT_SELECTION_BY_TRACKING
+                else:
+                    mode = SHIPMENT_SELECTION_ALL
+
+            elif existing_order:
                 # The tracking number resolved to a shipment in
-                # bi.shipping_platform_shipments: unchanged historic behavior.
+                # bi.shipping_platform_shipments.
                 source = ORDER_REFERENCE_SOURCE_TRACKING
                 resolved_order = existing_order
 
                 if tracking_not_found:
                     # Partial resolution: the ticket carries several tracking
-                    # numbers and only some are in the shipments table. Merge
-                    # in any order reference from the ticket text so the
-                    # unresolved shipment is not silently dropped from the
-                    # reply. Without a reference the request stays incomplete
-                    # and is routed to human review as before.
-                    merged = [
-                        reference
-                        for reference in references
-                        if reference.upper()
-                        not in {
-                            part.strip().upper()
-                            for part in existing_order.split(";")
-                            if part.strip()
-                        }
-                    ]
-                    if merged:
-                        resolved_order = ";".join([existing_order, *merged])
-                        source = f"{ORDER_REFERENCE_SOURCE_TRACKING}+{ORDER_REFERENCE_SOURCE_TEXT}"
-                        mode = SHIPMENT_SELECTION_BY_TRACKING
-                        resolved_from_text += 1
-                    else:
-                        resolution_complete = False
-            else:
-                if references:
-                    source = ORDER_REFERENCE_SOURCE_TEXT
-
-                if (
-                    not references
-                    and session is not None
-                    and not (skip_no_reply and request_needs_no_reply(row))
-                ):
-                    ticket_id = _to_int(row.get("zendesk_ticket_id"))
-                    if ticket_id is not None:
-                        if ticket_id not in pdf_reference_cache:
-                            print(
-                                f"  No tracking/order reference in ticket {ticket_id}; "
-                                "scanning PDF attachments."
-                            )
-                            pdf_reference_cache[ticket_id] = order_references_from_ticket_pdfs(
-                                ticket_id,
-                                auth=auth,
-                                base_url=base_url,
-                                session=session,
-                            )
-                        references = list(pdf_reference_cache[ticket_id])
-                        if references:
-                            source = ORDER_REFERENCE_SOURCE_PDF
-
-                resolved_order = ";".join(references)
-
-                if references:
-                    # The shape of the reference decides what is read:
-                    #
-                    # * shipment number (a letter after the prefix, e.g.
-                    #   DG-EUA01663254) identifies one specific shipment, so
-                    #   only that shipment block is read;
-                    # * order number (a dash after the prefix, e.g.
-                    #   DG-EU-01663254) covers the whole order, so every
-                    #   shipment block is read -- narrowed to the block
-                    #   carrying the ticket's tracking number when the ticket
-                    #   had one that the shipments table did not know.
-                    #
-                    # A mixed list keeps the row-level mode here; the extractor
-                    # then narrows each shipment-shaped reference on its own.
-                    if all(
-                        is_shipment_shaped_order_reference(reference)
-                        for reference in references
-                    ):
-                        mode = SHIPMENT_SELECTION_EXACT
-                    elif has_tracking:
-                        mode = SHIPMENT_SELECTION_BY_TRACKING
-                    else:
-                        mode = SHIPMENT_SELECTION_ALL
-                    if source == ORDER_REFERENCE_SOURCE_PDF:
-                        resolved_from_pdf += 1
-                    else:
-                        resolved_from_text += 1
-                else:
-                    unresolved += 1
+                    # numbers and only some are in the shipments table, and it
+                    # carries no reference of its own to fill the gap. The
+                    # request stays incomplete and goes to human review unless
+                    # one of the post-passes below resolves the rest.
                     resolution_complete = False
+
+            else:
+                resolved_order = ""
+                unresolved += 1
+                resolution_complete = False
 
             blocked = contains_blocked_order_reference(resolved_order, *references)
 
