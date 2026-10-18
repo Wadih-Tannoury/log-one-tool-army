@@ -1190,53 +1190,6 @@ have been:
 4986995_1  "- Conferma DISCREPANZA TRA RPI E FATTURA"
 ```
 
-### Only tickets actually addressed to TLG are processed
-
-A ticket is skipped at fetch time when its **first** inbound email carries no
-`@thelevelgroup.com` recipient in To, CC, or a BCC the receiving mail server
-preserved.
-
-These tickets reach this Zendesk because a brand mailbox forwards into it, but
-the carrier was writing to the brand, not to TLG:
-
-```text
-To: Parajumpers Online Store <customerservice@parajumpers.it>
-CC: roberto.antiga@parajumpers.it, cferretto@ups.com,
-    sandro.donadini@parajumpers.it, tania@apepartners.com,
-    rehamahmed@ups.com                                  -> skipped
-
-To: EA Team <backoffice@thelevelgroup.com>
-CC: service@scarosso.com                                -> processed
-```
-
-Replying to the first would insert TLG into a conversation it was never part
-of. A TLG address anywhere in To **or** CC is enough.
-
-The check is on request number 1 only: once a thread is ours, later replies
-that drop the TLG address still belong to it.
-
-`ticket_recipient_emails()` walks the first comment's `via.source.to` block,
-the ticket's own `via.source.to` and `recipient`, and resolves cc'd Zendesk
-user ids through the per-run user cache. Zendesk is inconsistent about where
-it puts recipients -- `address`, a `name` that is itself an address, an
-`email_ccs` list, `original_recipients` -- so the structure is walked and
-anything address-shaped is collected rather than read from fixed keys.
-
-Two limits worth knowing:
-
-- **A true BCC is invisible.** If TLG was blind-copied and the mail server did
-  not preserve the header, Zendesk never sees the address and the ticket is
-  skipped. If that happens, the ticket's own `recipient` (the support address
-  the mail arrived on) is the only remaining signal, and it is already
-  checked.
-- **Skipped means never ingested**, not excluded-with-a-note: the ticket is
-  not written to the active table at all, so there is no history row for it.
-  The run log names every skipped ticket and its recipients, and the summary
-  line counts them.
-
-Set `REQUIRE_TLG_RECIPIENT=false` to turn the filter off, or
-`TLG_RECIPIENT_DOMAIN` to change the domain.
-
 ### An unresolved extra tracking number no longer blocks a resolved order
 
 `order_resolution_complete` used to go False whenever **any** tracking number
