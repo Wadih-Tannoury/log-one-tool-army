@@ -2956,122 +2956,6 @@ def _zendesk_comment_fetch_workers(ticket_count: int) -> int:
     return min(configured, ticket_count)
 
 
-TLG_RECIPIENT_DOMAIN = os.getenv("TLG_RECIPIENT_DOMAIN", "thelevelgroup.com").strip().lower()
-REQUIRE_TLG_RECIPIENT_ENV = "REQUIRE_TLG_RECIPIENT"
-DEFAULT_REQUIRE_TLG_RECIPIENT = True
-
-_EMAIL_IN_TEXT_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
-
-
-def _emails_in_value(value: object) -> list[str]:
-    """Every email address inside a nested Zendesk `via`/recipient structure.
-
-    Zendesk is inconsistent about where it puts recipients: `via.source.to`
-    may carry `address`, a `name` that is itself an address, or a list under
-    `email_ccs`/`ccs`, and some channels put the whole header line in
-    `original_recipients`. Rather than guess the shape, walk it and collect
-    anything that looks like an address.
-    """
-
-    found: list[str] = []
-
-    def _walk(node):
-        if isinstance(node, str):
-            found.extend(_EMAIL_IN_TEXT_RE.findall(node))
-        elif isinstance(node, Mapping):
-            for item in node.values():
-                _walk(item)
-        elif isinstance(node, (list, tuple, set)):
-            for item in node:
-                _walk(item)
-
-    _walk(value)
-    return found
-
-
-def _cc_user_ids(*sources: object) -> list[int]:
-    """Numeric Zendesk user ids found under cc-ish keys."""
-
-    ids: list[int] = []
-    for source in sources:
-        if not isinstance(source, Mapping):
-            continue
-        for key in ("email_cc_ids", "email_ccs", "ccs", "cc_ids", "follower_ids"):
-            for value in source.get(key) or []:
-                try:
-                    user_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if user_id not in ids:
-                    ids.append(user_id)
-    return ids
-
-
-def ticket_recipient_emails(
-    ticket: Mapping[str, Any],
-    first_comment: Mapping[str, Any] | None,
-    *,
-    auth,
-    base_url: str,
-    user_email_cache: dict | None = None,
-    session: requests.Session | None = None,
-) -> list[str]:
-    """Every address the first inbound email was addressed to (To/CC/BCC).
-
-    Sources, in the order Zendesk tends to populate them:
-
-    * the first comment's ``via.source.to`` block -- the actual envelope
-      recipients of the inbound mail, including its cc list;
-    * the ticket's own ``via.source.to`` and ``recipient`` (the Zendesk
-      support address the mail arrived on);
-    * cc'd Zendesk users, by id, from either object -- those are only user
-      ids in the payload, so they are resolved through the same per-run user
-      cache the requester lookup already uses.
-
-    A BCC'd address is only visible when the receiving mail server preserved
-    it; Zendesk does not expose it otherwise. See the note on
-    ticket_has_tlg_recipient().
-    """
-
-    emails: list[str] = []
-
-    def _add(values):
-        for value in values:
-            normalized = normalize_email(value)
-            if normalized and normalized not in emails:
-                emails.append(normalized)
-
-    comment_via = (first_comment or {}).get("via") if first_comment else None
-    _add(_emails_in_value((comment_via or {}).get("source", {}).get("to")))
-    _add(_emails_in_value(ticket.get("via", {}).get("source", {}).get("to")))
-    _add(_emails_in_value(ticket.get("recipient")))
-
-    cc_ids = _cc_user_ids(ticket, (comment_via or {}).get("source", {}).get("to"))
-    for user_id in cc_ids:
-        _add([
-            get_zendesk_user_email(
-                user_id,
-                auth=auth,
-                base_url=base_url,
-                cache=user_email_cache,
-                session=session,
-            )
-        ])
-
-    return emails
-
-
-def ticket_has_tlg_recipient(emails) -> bool:
-    """True when at least one recipient is on the TLG domain."""
-
-    suffix = f"@{TLG_RECIPIENT_DOMAIN}"
-    return any(str(email or "").strip().lower().endswith(suffix) for email in emails)
-
-
-def require_tlg_recipient_enabled() -> bool:
-    return _env_bool(REQUIRE_TLG_RECIPIENT_ENV, DEFAULT_REQUIRE_TLG_RECIPIENT)
-
-
 def get_comments_for_ticket(
     ticket: Mapping[str, Any],
     *,
@@ -3531,7 +3415,6 @@ def fetch_ticket_rows(
     skipped_non_carrier = 0
     skipped_unexpected_status = 0
     skipped_escalation_group = 0
-    skipped_no_tlg_recipient = 0
     comment_error_count = 0
 
     # Tickets already assigned to the escalation group are waiting on a human,
@@ -3734,31 +3617,6 @@ def fetch_ticket_rows(
             if not comments:
                 continue
 
-            # A ticket whose FIRST inbound email was not addressed to anyone
-            # at TLG -- not in To, not in CC, not in a BCC the mail server
-            # preserved -- is not ours to answer. It reaches this Zendesk
-            # because a brand mailbox forwards into it, but the carrier was
-            # writing to the brand, not to us, so replying would insert TLG
-            # into a conversation it was never part of. The check is on
-            # request 1 only: once the thread is ours, later replies that drop
-            # the TLG address still belong to it.
-            if require_tlg_recipient_enabled():
-                recipients = ticket_recipient_emails(
-                    ticket,
-                    comments[0] if comments else None,
-                    auth=auth,
-                    base_url=base_url,
-                    user_email_cache=user_email_cache,
-                )
-                if not ticket_has_tlg_recipient(recipients):
-                    skipped_no_tlg_recipient += 1
-                    print(
-                        f"Ticket {ticket_id}: first request has no "
-                        f"@{TLG_RECIPIENT_DOMAIN} recipient "
-                        f"(found: {', '.join(recipients) or 'none'}). Skipped."
-                    )
-                    continue
-
             requester_comment_counter = 0
             requester_requests = []
 
@@ -3864,8 +3722,6 @@ def fetch_ticket_rows(
         f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
         f"skipped {skipped_non_carrier} non-carrier ticket(s), "
         f"{skipped_unexpected_status} ticket(s) with unexpected statuses, "
-        f"{skipped_no_tlg_recipient} ticket(s) whose first request had no "
-        f"@{TLG_RECIPIENT_DOMAIN} recipient, "
         f"{skipped_escalation_group} ticket(s) already assigned to "
         f"{ZENDESK_ESCALATION_GROUP_NAME!r}, and "
         f"{comment_error_count} ticket(s) with comment-fetch errors."
