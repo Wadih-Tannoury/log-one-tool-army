@@ -1374,6 +1374,45 @@ def looks_like_commercial_invoice_boilerplate(text: object) -> bool:
     return marker_hits >= 1 and field_hits >= 2
 
 
+# A body that REPORTS a mismatch, as opposed to one that asks for a document
+# with the correct value. The distinction matters because the standard UPS
+# first-request checklist contains "Fattura di ritorno con valore corretto"
+# and "documentazione per poter procedere allo sdoganamento" -- phrases that
+# CORRECTION_OR_DISCREPANCY_RE matches on purpose, for the request>=2 guard in
+# response_generator, but which must NOT stop the first-request bundle.
+# Replaying the history shows the looser pattern would have escalated 55
+# correctly-answered first requests.
+#
+# So this one requires an explicit mismatch word. "corretto" alone is not
+# enough; "discrepanze", "non corrisponde", "difforme", "errata" are.
+REPORTS_DISCREPANCY_RE = re.compile(
+    r"(?:"
+    r"\bdiscrepanz[ae]\b|"
+    r"\bdiscrepanc(?:y|ies)\b|"
+    r"\bdifform\w*|"
+    r"\bmismatch\w*|"
+    r"\bnon\s+(?:corrispond\w*|coincid\w*|combac\w*)|"
+    r"\bno\s+(?:coincid\w*|correspond\w*|concuerd\w*)|"
+    r"\bdo(?:es)?\s+not\s+match\b|\bdon['\u2019]?t\s+match\b|"
+    r"\b(?:fattur[ae]|ft|boll[ae]|p\.?\s*iva|partita\s+iva|invoice|factura)"
+    r"[\s\S]{0,120}\b(?:errat[oaie]|incorrect|wrong|erronea)\b|"
+    r"\b(?:errat[oaie]|incorrect|wrong|erronea)\b"
+    r"[\s\S]{0,120}\b(?:fattur[ae]|ft|boll[ae]|p\.?\s*iva|partita\s+iva|invoice|factura)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def reports_discrepancy(text: object) -> bool:
+    """True when the message REPORTS a mismatch rather than asking for a document.
+
+    Narrower than contains_correction_or_discrepancy() on purpose: see the
+    comment on REPORTS_DISCREPANCY_RE.
+    """
+
+    return bool(REPORTS_DISCREPANCY_RE.search(normalize_whitespace(text)))
+
+
 def contains_correction_or_discrepancy(text: object) -> bool:
     return bool(CORRECTION_OR_DISCREPANCY_RE.search(normalize_whitespace(text)))
 
@@ -1502,6 +1541,29 @@ def ddp_status_for_country_and_brand(
 
     table = load_ddp_configuration(path)
     return table.get((country_key, brand_key))
+
+
+def brand_in_ddp_configuration(brand: object, path: str = DDP_CONFIGURATION_PATH) -> bool:
+    """True when the brand appears anywhere in config/ddp_configuration.json.
+
+    The distinction that matters for an unmatched lookup:
+
+    * the brand IS in the table but this destination is not listed -> the
+      table covers the brand, the missing country just means "not DDP", so
+      the return-confirmation reply applies (prompts/response_builder.md,
+      "UPS Extra Charges Rule");
+    * the brand is absent from the table entirely -- HB has no rows at all --
+      -> nothing has been decided for that brand, so a human must judge.
+    """
+
+    brand_key = str(brand or "").strip().upper()
+    if not brand_key:
+        return False
+
+    return any(
+        configured_brand == brand_key
+        for _, configured_brand in load_ddp_configuration(path)
+    )
 
 
 def is_customer_refused_return_request(text: object) -> bool:
