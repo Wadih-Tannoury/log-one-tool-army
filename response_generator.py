@@ -175,6 +175,13 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"rifiutat[oa][\s\S]{0,40}pagare|rifiuta(?:to)?\s+di\s+pagare)"
     r"[\s\S]{0,120}"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
+    # English nouns UPS actually uses. "additional costs" previously
+    # matched only the Italian "costi", so an English-only UPS exception
+    # notification -- "Your Consignee has still not paid the additional
+    # costs of this shipment." -- never matched at all, and the whole
+    # DDP branch was skipped for it.
+    r"costs?|fees?|duties|duty|taxes|"
+    r"costs?|fees?|duties|duty|taxes|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)|"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|import\s+charges?|charges?|"
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
@@ -2383,14 +2390,6 @@ def should_force_human_intervention(row, requested_data):
             "tlg-business-intelligence-prd.bi.shipping_platform_shipments.",
         )
 
-    if is_unpaid_extra_charges_request(request_text):
-        ddp_status = ddp_status_for_row(row)
-        if ddp_status is None:
-            # Country/brand pair not found in ddp_configuration.json.
-            # Default to the return-confirmation response so the ticket can
-            # be answered automatically without human intervention.
-            pass
-
     data_policy_reason = human_intervention_data_policy_reason(row, requested_data)
     if data_policy_reason:
         return True, data_policy_reason
@@ -2410,6 +2409,28 @@ def should_force_human_intervention(row, requested_data):
         if document_error:
             reason += f" Document detail: {document_error}"
         return True, reason
+
+    if is_unpaid_extra_charges_request(request_text):
+        # Who pays is decided by (destination country, brand) in
+        # config/ddp_configuration.json: ddp=true asks the carrier to deliver
+        # and bill TLG, ddp=false confirms the return. An unconfigured pair --
+        # HB has no rows there at all -- is exactly the case a human has to
+        # judge, so it is the only one escalated.
+        #
+        # Checked AFTER missing_required_full_order_values() on purpose: the
+        # destination country comes from GET_FULL_ORDER, so a row that has not
+        # been enriched yet keeps the retryable awaiting_order_data status
+        # instead of being written off as unconfigured.
+        if ddp_status_for_row(row) is None:
+            country_code, brand = ddp_lookup_country_and_brand(row)
+            return (
+                True,
+                "Customer did not pay extra/outstanding charges and "
+                f"(country={country_code or 'unknown'}, brand={brand or 'unknown'}) "
+                "is not in config/ddp_configuration.json, so the DDP status "
+                "cannot be determined. A human must verify whether the "
+                "customer or TLG should pay.",
+            )
 
     # The per-carrier "does this first-returns reply need the carrier
     # comparison?" flag used to be computed here across three branches, from
@@ -2560,9 +2581,8 @@ def _build_response_body(row):
                 return build_ddp_deliver_response(row)
             if ddp_status is False:
                 return build_return_confirmation_response(row)
-            # Country/brand pair not in ddp_configuration.json: default to
-            # the return-confirmation response so the ticket is answered
-            # automatically without human intervention.
+            # An unconfigured (country, brand) pair never reaches here:
+            # should_force_human_intervention() has already escalated it.
             return build_return_confirmation_response(row)
         return build_return_confirmation_response(row)
 
