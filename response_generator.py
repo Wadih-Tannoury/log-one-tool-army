@@ -62,6 +62,7 @@ from ticket_fetcher import (
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, build_request_id, read_dataframe
 from customs_rules import (
     DOCUMENT_EMBEDDED_REQUESTED_DATA,
+    brand_in_ddp_configuration,
     row_needs_destination_lookup,
     ORDER_COUNTRY_CODE_COLUMN,
     row_order_processing_blocked_final,
@@ -2176,6 +2177,11 @@ def build_ups_returns_different_carrier_response(row):
 
 
 def build_ups_returns_first_rpi_account_response(row):
+    # franchigia vs "sdoganamento in definitiva" is decided ONLY by the
+    # carrier comparison, per prompts/response_builder.md, "UPS Returns
+    # Customs Clearance First Request". It is not a DDP decision: the DDP
+    # table drives the unpaid-extra-charges reply, which is a different pair
+    # of templates entirely.
     if return_export_carriers_match(row):
         return build_ups_returns_same_carrier_response(row)
     return build_ups_returns_different_carrier_response(row)
@@ -2412,25 +2418,35 @@ def should_force_human_intervention(row, requested_data):
 
     if is_unpaid_extra_charges_request(request_text):
         # Who pays is decided by (destination country, brand) in
-        # config/ddp_configuration.json: ddp=true asks the carrier to deliver
-        # and bill TLG, ddp=false confirms the return. An unconfigured pair --
-        # HB has no rows there at all -- is exactly the case a human has to
-        # judge, so it is the only one escalated.
+        # config/ddp_configuration.json. Three outcomes, per
+        # prompts/response_builder.md "UPS Extra Charges Rule":
         #
-        # Checked AFTER missing_required_full_order_values() on purpose: the
-        # destination country comes from GET_FULL_ORDER, so a row that has not
-        # been enriched yet keeps the retryable awaiting_order_data status
-        # instead of being written off as unconfigured.
+        #   pair found, ddp=true   -> ask the carrier to deliver, bill TLG
+        #   pair found, ddp=false  -> confirm the return, bill TLG
+        #   pair missing but the BRAND is in the table
+        #                          -> same as ddp=false; the table covers the
+        #                             brand and this destination simply is
+        #                             not DDP
+        #   brand absent entirely  -> nothing has been decided for that brand
+        #                             (HB has no rows at all), so a human
+        #                             must judge
+        #
+        # Only the last case is escalated here. Checked AFTER
+        # missing_required_full_order_values() on purpose: the destination
+        # country comes from GET_FULL_ORDER, so a row that has not been
+        # enriched yet keeps the retryable awaiting_order_data status instead
+        # of being written off as unconfigured.
         if ddp_status_for_row(row) is None:
             country_code, brand = ddp_lookup_country_and_brand(row)
-            return (
-                True,
-                "Customer did not pay extra/outstanding charges and "
-                f"(country={country_code or 'unknown'}, brand={brand or 'unknown'}) "
-                "is not in config/ddp_configuration.json, so the DDP status "
-                "cannot be determined. A human must verify whether the "
-                "customer or TLG should pay.",
-            )
+            if not brand_in_ddp_configuration(brand):
+                return (
+                    True,
+                    "Customer did not pay extra/outstanding charges and brand "
+                    f"{brand or 'unknown'} has no rows at all in "
+                    "config/ddp_configuration.json, so the DDP status cannot "
+                    "be determined. A human must verify whether the customer "
+                    "or TLG should pay.",
+                )
 
     # The per-carrier "does this first-returns reply need the carrier
     # comparison?" flag used to be computed here across three branches, from
@@ -2581,7 +2597,9 @@ def _build_response_body(row):
                 return build_ddp_deliver_response(row)
             if ddp_status is False:
                 return build_return_confirmation_response(row)
-            # An unconfigured (country, brand) pair never reaches here:
+            # Pair not configured, but the brand is in the table: the
+            # destination simply is not DDP, so this is the ddp=false reply.
+            # A brand that is absent from the table never reaches here --
             # should_force_human_intervention() has already escalated it.
             return build_return_confirmation_response(row)
         return build_return_confirmation_response(row)
