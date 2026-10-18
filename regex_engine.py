@@ -50,6 +50,7 @@ from customs_rules import (
     filter_libera_esportazione_response_data,
     is_atr_certificate_mandate_request,
     contains_correction_or_discrepancy,
+    reports_discrepancy,
     get_standard_reply_requested_data,
     has_actionable_request_language,
     is_customer_refused_return_request,
@@ -1046,20 +1047,38 @@ class RegexEngine:
             return_tracking_number=return_tracking_number,
         )
         requested_data_before_bundle = list(requested_data)
-        regex_requested_data = expand_first_returns_customs_clearance_bundle(
-            regex_requested_data,
-            ticket_category=ticket_category,
-            request_number=request_number,
-            requester_email=requester_email,
-            trigger_requested_data=requested_data,
-        )
-        requested_data = expand_first_returns_customs_clearance_bundle(
-            requested_data,
-            ticket_category=ticket_category,
-            request_number=request_number,
-            requester_email=requester_email,
-            trigger_requested_data=requested_data,
-        )
+
+        # A UPS first-request body that reports a DISCREPANCY is not the
+        # standard documentation checklist, even though it arrives in the same
+        # template and from the same mailbox. Example seen on 4980950_1:
+        #
+        #   "Discrepanze; in ft export presente p.iva di The Level, in bolla
+        #    presente p.iva di Roberto Cavalli; non e possibile sdoganare in
+        #    franchigia, conferma modo di sdoganamento"
+        #
+        # The only regex hit there was "Tax ID" in the UPS legal footer, which
+        # mapped to invoice/RPI; the bundle expansion then turned that single
+        # boilerplate match into the full reintroduzione-in-franchigia reply,
+        # and the ticket was answered with export tracking, UPS code, RPI and
+        # a returned-items list while the carrier was actually asking which
+        # customs procedure to use. Skip the expansion and send it to a human.
+        bundle_blocked_by_discrepancy = reports_discrepancy(cleaned_text)
+
+        if not bundle_blocked_by_discrepancy:
+            regex_requested_data = expand_first_returns_customs_clearance_bundle(
+                regex_requested_data,
+                ticket_category=ticket_category,
+                request_number=request_number,
+                requester_email=requester_email,
+                trigger_requested_data=requested_data,
+            )
+            requested_data = expand_first_returns_customs_clearance_bundle(
+                requested_data,
+                ticket_category=ticket_category,
+                request_number=request_number,
+                requester_email=requester_email,
+                trigger_requested_data=requested_data,
+            )
         requested_data = align_invoice_requested_data_with_tracking_context(
             requested_data,
             real_request_types,
@@ -1083,6 +1102,15 @@ class RegexEngine:
             audit_notes.append(
                 "Expanded first Returns Customs Clearance regex match to the "
                 "full UPS first-request bundle."
+            )
+
+        if bundle_blocked_by_discrepancy:
+            force_human = True
+            review_reasons.append(
+                "The request reports a discrepancy (VAT/consignee/document "
+                "mismatch) rather than asking for the standard documentation, "
+                "so the UPS first-request bundle was not applied and the "
+                "customs procedure has to be confirmed by a human."
             )
 
         if suppressed_types:
