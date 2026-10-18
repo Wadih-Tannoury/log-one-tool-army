@@ -254,6 +254,13 @@ ORDER_REFERENCE_SOURCE_PDF = "pdf_attachment"
 # and the ticket carried no reference, so the shipment order number came from
 # the carrier events in til.prd_shipmentStatus.
 ORDER_REFERENCE_SOURCE_SHIPMENT_STATUS = "shipment_status_events"
+# Set when the order came from the TIL event stream in til.prd_tilEvents,
+# which carries the shipment block (and its order number) under
+# requestPayload.data[].shipment.
+ORDER_REFERENCE_SOURCE_TIL_EVENTS = "til_events"
+# Set when no order reference was in the PDF, but a tracking number read
+# out of it resolved to one through the order tables.
+ORDER_REFERENCE_SOURCE_PDF_TRACKING = "pdf_attachment_tracking"
 
 
 # ---------------------------------------------------------------------------
@@ -722,3 +729,109 @@ def find_order_references_in_pdfs(
             if reference not in references:
                 references.append(reference)
     return references
+
+
+# ============================================================================
+# TRACKING NUMBERS IN PDF ATTACHMENTS
+# ============================================================================
+#
+# The tracking number quoted in a ticket's description is not always the one
+# that identifies the order. UPS overgoods invoices are the clearest case: the
+# "Waybill Number" is the overgoods/return leg (1ZX66291...), which no TLG
+# table ever received, while the ORIGINAL export tracking number sits in the
+# "Invoice No." field (1Z7E38280412626229). That second number is the one that
+# resolves to an order, so every tracking-shaped value in the PDF is collected,
+# not just the one labelled as the waybill.
+
+# UPS: 1Z + 16 alphanumerics. Matched first and reported first because it is
+# the most specific pattern and the one that actually resolves on these forms.
+UPS_TRACKING_RE = re.compile(r"\b1Z[0-9A-Z]{16}\b", re.IGNORECASE)
+
+# FedEx (12 or 15 digits) and DHL Express (10 digits). Deliberately narrow:
+# a looser rule turns invoice totals, phone numbers, VAT numbers and dates on
+# the same page into phantom tracking numbers.
+NUMERIC_TRACKING_RE = re.compile(r"(?<![0-9A-Za-z])(\d{10}|\d{12}|\d{15})(?![0-9A-Za-z])")
+
+# Values that match the numeric shapes but are never tracking numbers. Phone
+# numbers on these invoices are the main source of false positives.
+_NON_TRACKING_PREFIXES = ("39", "1800", "1866", "1877", "1888")
+
+
+def find_tracking_numbers(text: object) -> list[str]:
+    """Every tracking-shaped value in a blob of text, UPS 1Z numbers first.
+
+    Order matters: callers try these in sequence against the order tables, so
+    the most reliable shape has to come first.
+    """
+
+    body = str(text or "")
+
+    found: list[str] = []
+    for match in UPS_TRACKING_RE.finditer(body):
+        value = match.group(0).upper()
+        if value not in found:
+            found.append(value)
+
+    numeric: list[str] = []
+    for match in NUMERIC_TRACKING_RE.finditer(body):
+        value = match.group(1)
+        if value in numeric or value in found:
+            continue
+        # A 10-digit value starting with a country/toll-free dialling prefix is
+        # a phone number on the invoice header, not a shipment.
+        if len(value) == 10 and value.startswith(_NON_TRACKING_PREFIXES):
+            continue
+        numeric.append(value)
+
+    return found + numeric
+
+
+def find_pdf_identifiers_in_pdf_bytes(
+    pdf_bytes: bytes,
+) -> tuple[list[str], list[str], str]:
+    """Order references AND tracking numbers from one PDF, in a single pass.
+
+    One pass is the point: _pdf_text() may OCR every page, so asking for the
+    two kinds of identifier separately would double the cost of the most
+    expensive step in the pipeline.
+    """
+
+    text, method = _pdf_text(pdf_bytes, PDF_OCR_DPI)
+    return find_order_references(text), find_tracking_numbers(text), method
+
+
+def find_identifiers_in_pdfs(
+    pdf_blobs: Iterable[tuple[str, bytes]],
+    *,
+    log: Callable[[str], None] = print,
+) -> tuple[list[str], list[str]]:
+    """Scan several PDFs; return (order references, tracking numbers)."""
+
+    references: list[str] = []
+    trackings: list[str] = []
+
+    for file_name, pdf_bytes in pdf_blobs:
+        try:
+            found_refs, found_trackings, method = find_pdf_identifiers_in_pdf_bytes(
+                pdf_bytes
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad PDF must not stop the rest
+            log(f"      could not read PDF {file_name}: {exc}")
+            continue
+
+        if found_refs:
+            log(f"      order reference(s) in {file_name}: {found_refs} (via {method})")
+        elif found_trackings:
+            log(
+                f"      no order reference in {file_name}, but tracking-shaped "
+                f"value(s): {found_trackings[:5]} (via {method})"
+            )
+
+        for reference in found_refs:
+            if reference not in references:
+                references.append(reference)
+        for tracking in found_trackings:
+            if tracking not in trackings:
+                trackings.append(tracking)
+
+    return references, trackings
