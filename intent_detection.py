@@ -24,6 +24,8 @@ from math import ceil
 from typing import Dict, List
 
 import pandas as pd
+from collections.abc import Mapping
+
 import requests
 from google import genai
 
@@ -110,17 +112,44 @@ def gemini_fallback_chain():
     return chain
 
 
-def claude_api_key():
-    """The Anthropic key, accepting both the raw string and the JSON secret."""
+CLAUDE_API_KEY_ENV_NAMES = ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY")
+CLAUDE_API_KEY_JSON_FIELDS = ("claude_api_key", "anthropic_api_key", "api_key", "key")
 
-    raw_secret = os.environ.get("CLAUDE_API_KEY", "")
-    if not raw_secret:
-        return ""
-    try:
-        key = json.loads(raw_secret).get("claude_api_key", "")
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        key = raw_secret
-    return str(key or "").strip()
+
+def claude_api_key():
+    """The Anthropic key, read fresh from the environment on every call.
+
+    Read lazily rather than cached at construction so a key exported after
+    the detector was built is still picked up, and tolerant about its shape:
+    the secret may be the raw key, or JSON wrapping it under any of several
+    field names.
+    """
+
+    for name in CLAUDE_API_KEY_ENV_NAMES:
+        raw_secret = str(os.environ.get(name, "") or "").strip()
+        if not raw_secret:
+            continue
+
+        if raw_secret.startswith("{"):
+            try:
+                payload = json.loads(raw_secret)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, Mapping):
+                for field in CLAUDE_API_KEY_JSON_FIELDS:
+                    value = str(payload.get(field, "") or "").strip()
+                    if value:
+                        return value
+                print(
+                    f"{name} is JSON but carries none of "
+                    f"{', '.join(CLAUDE_API_KEY_JSON_FIELDS)}: "
+                    f"found {sorted(payload)}. The Anthropic fallback is unavailable."
+                )
+                continue
+
+        return raw_secret
+
+    return ""
 BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
 LLM_BATCH_WORKERS_ENV = "LLM_BATCH_WORKERS"
 # Conservative: Gemini batches are the one place a 429 costs a retry with a
@@ -369,7 +398,6 @@ class RequestedDataDetector:
         self.last_model_used = ""
         self.last_model_attempts = ""
         self.system_prompt = self._load_prompt(PROMPT_PATH)
-        self.claude_api_key = claude_api_key() if CLAUDE_FALLBACK_ENABLED else ""
         self.providers = self._build_providers()
         print(
             "LLM provider chain: "
@@ -405,7 +433,7 @@ class RequestedDataDetector:
                 }
             )
 
-        if self.claude_api_key:
+        if CLAUDE_FALLBACK_ENABLED and claude_api_key():
             providers.append(
                 {
                     "model": CLAUDE_FALLBACK_MODEL,
@@ -415,8 +443,13 @@ class RequestedDataDetector:
             )
         elif CLAUDE_FALLBACK_ENABLED:
             print(
-                "CLAUDE_API_KEY is not set: the Anthropic fallback is "
-                "unavailable and only Gemini models will be tried."
+                "No Anthropic key found in "
+                f"{' or '.join(CLAUDE_API_KEY_ENV_NAMES)}: the Anthropic "
+                "fallback is unavailable and only Gemini models will be "
+                "tried. If the secret exists in the repository, the workflow "
+                "step that runs intent_detection.py has to pass it through "
+                "its own `env:` block -- a secret is not visible to a step "
+                "that does not name it."
             )
 
         return providers
@@ -471,7 +504,7 @@ class RequestedDataDetector:
     def _generate_once(self, provider, model, prompt):
         if provider == "claude":
             return ClaudeJsonHelper.generate_json_list(
-                self.claude_api_key,
+                claude_api_key(),
                 model,
                 prompt,
             )
