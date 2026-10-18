@@ -261,6 +261,10 @@ ORDER_REFERENCE_SOURCE_TIL_EVENTS = "til_events"
 # Set when no order reference was in the PDF, but a tracking number read
 # out of it resolved to one through the order tables.
 ORDER_REFERENCE_SOURCE_PDF_TRACKING = "pdf_attachment_tracking"
+# Set when another request in the SAME run resolved the identical tracking
+# number to an order. Costs no API call and no OCR; it is pure bookkeeping
+# over work the run has already done.
+ORDER_REFERENCE_SOURCE_CROSS_REQUEST = "cross_request_tracking"
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +790,11 @@ def find_tracking_numbers(text: object) -> list[str]:
     return found + numeric
 
 
+# Character count of the most recent PDF read, for the diagnostic line in
+# find_identifiers_in_pdfs(). Set by find_pdf_identifiers_in_pdf_bytes().
+_last_text_length = 0
+
+
 def find_pdf_identifiers_in_pdf_bytes(
     pdf_bytes: bytes,
 ) -> tuple[list[str], list[str], str]:
@@ -796,7 +805,10 @@ def find_pdf_identifiers_in_pdf_bytes(
     expensive step in the pipeline.
     """
 
+    global _last_text_length
+
     text, method = _pdf_text(pdf_bytes, PDF_OCR_DPI)
+    _last_text_length = len(text or "")
     return find_order_references(text), find_tracking_numbers(text), method
 
 
@@ -825,6 +837,17 @@ def find_identifiers_in_pdfs(
             log(
                 f"      no order reference in {file_name}, but tracking-shaped "
                 f"value(s): {found_trackings[:5]} (via {method})"
+            )
+        else:
+            # Silence here used to be indistinguishable from "the scan never
+            # ran". Say what was read so an empty result can be diagnosed:
+            # a near-zero character count means the text layer was empty and
+            # OCR produced nothing (Tesseract missing, or an image the DPI
+            # could not resolve), while a healthy count means the document
+            # genuinely carries neither identifier.
+            log(
+                f"      nothing usable in {file_name} (via {method}; "
+                f"{_last_text_length} characters read)"
             )
 
         for reference in found_refs:
