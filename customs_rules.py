@@ -137,6 +137,52 @@ def country_ticket_field_id_for_brand(brand: str):
     return _COUNTRY_TICKET_FIELD_IDS.get(brand_key)
 
 
+# ---------------------------------------------------------------------------
+# "Watch Sheet" ticket field
+# ---------------------------------------------------------------------------
+#
+# When the ticket subject or description mentions a watch sheet, the Zendesk
+# "Watch Sheet" custom field is populated with YES on every ticket update the
+# workflow performs. The match is case-insensitive and tolerates any run of
+# whitespace, hyphens or underscores between the two words, so "Watch Sheet",
+# "watch  sheet", "WATCH-SHEET" and "watch_sheet" all count. A separator is
+# required, so an unrelated word ending in "watch" followed directly by
+# "sheet" inside a longer token is not matched.
+
+WATCH_SHEET_TICKET_FIELD_ID = 30866865588636
+WATCH_SHEET_FIELD_DISPLAY_VALUE = "YES"
+
+WATCH_SHEET_RE = re.compile(r"watch[\s\-_]+sheet", re.IGNORECASE)
+
+
+def watch_sheet_ticket_field_id() -> int:
+    """Return the Zendesk ticket field id of the "Watch Sheet" field.
+
+    Overridable at runtime with ZENDESK_WATCH_SHEET_FIELD_ID so the id can be
+    corrected without a code change; an unparseable value falls back to the
+    built-in default.
+    """
+
+    raw = os.environ.get("ZENDESK_WATCH_SHEET_FIELD_ID", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return WATCH_SHEET_TICKET_FIELD_ID
+
+
+def mentions_watch_sheet(*texts) -> bool:
+    """True when any of the given texts mentions a watch sheet."""
+
+    for text in texts:
+        if text is None:
+            continue
+        if WATCH_SHEET_RE.search(str(text)):
+            return True
+    return False
+
+
 # ISO 3166-1 alpha-2 -> English country name variants. Used to match our
 # shipping-address country code against the option NAMES of the per-brand
 # "Country <BRAND>" Zendesk drop-down, whose option values are defined in
