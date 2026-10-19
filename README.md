@@ -413,6 +413,44 @@ Repository persistence is controlled separately by `persist_generated_documents`
 
 The submission decision is independent from BigQuery history de-duplication. This means a dry run with `submit_zendesk_responses=false` can be followed by another run with `submit_zendesk_responses=true`; the agent will still evaluate the current non-human `final_response` values for Zendesk submission. The duplicate-comment guard skips a ticket when the exact same public response body is already present.
 
+### The "Watch Sheet" ticket field
+
+When the ticket **subject or description** mentions a watch sheet, the Zendesk
+custom field **Watch Sheet** (field id `30866865588636`) is set to `YES` on
+every ticket update the workflow performs: the automatic public reply, the
+solve-without-response update, and the assignment of an unresolved ticket to
+`LOG II lvl`. A ticket the workflow leaves untouched entirely gets no update,
+so no field either.
+
+The match is case-insensitive and tolerates any run of whitespace, hyphens or
+underscores between the two words (`Watch Sheet`, `watch  sheet`,
+`WATCH-SHEET`, `watch_sheet`); a separator is required, so a longer token that
+happens to contain the letters is not matched
+(`customs_rules.mentions_watch_sheet()`).
+
+**The decision is made at fetch time.** The ticket description exists only in
+`ticket_fetcher.fetch_ticket_rows()` and is not carried down the pipeline, so
+the subject, the description and the latest requester message are checked
+there and the result is stored in the new `watch_sheet_requested` BOOL column,
+on the active-ticket table and on the history table (added through the
+existing `_ADDITIVE_HISTORY_COLUMNS` migration, so no manual DDL is needed).
+`row_requests_watch_sheet()` reads that column and, for a legacy row that does
+not carry it, falls back to scanning `subject` / `cleaned_request_body` /
+`request_body`, so the field is still set rather than silently skipped.
+
+**The value sent depends on the field's type**, which is read once per run:
+a drop-down/FieldTagger only stores a value from its own
+`custom_field_options`, so the option whose name or value is `YES` is used; a
+checkbox gets `true`; anything else gets the literal `YES`. If the field
+cannot be read at all, the literal is sent and Zendesk decides — a failed
+lookup never costs the ticket its update.
+
+The field id can be changed at runtime without a code change:
+
+```bash
+ZENDESK_WATCH_SHEET_FIELD_ID=30866865588636
+```
+
 ### Per-brand "Country" ticket field
 
 Some brands have a Zendesk custom ticket field named `Country <BRAND>` (e.g. `Country DJ`) that Zendesk requires to be set before a ticket can be moved to `solved`. When the GET_FULL_ORDER `shippingAddress.country` value and the brand prefix from `shipment_order_number` (e.g. `DJ` from `DJ-USC11593083`) are both available, `response_generator.py` builds a `country_{brand}_{iso2}` tag and `submit_ticket_response()` in `ticket_fetcher.py` sends it as that field's value. `response_data_extractor.extract_shipment_order_data()` stores the shipping-address country code in the `full_order_country_code` column for this purpose (a prior version of the extractor never populated this column, so the field was always empty and every solve on a country-gated brand hit the 422 error described below).
