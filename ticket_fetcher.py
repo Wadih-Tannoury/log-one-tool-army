@@ -52,8 +52,11 @@ from customs_rules import (
     is_noreply_autoreply_first_request,
     is_missing_extracted_tracking_number,
     is_purely_informative_request,
+    mentions_watch_sheet,
+    WATCH_SHEET_FIELD_DISPLAY_VALUE,
     normalize_email,
     normalize_requested_data,
+    watch_sheet_ticket_field_id,
 )
 from order_reference_resolver import (
     ALWAYS_BLOCKED_ORDER_REFERENCE_PREFIXES,
@@ -141,6 +144,7 @@ ACTIVE_TICKET_COLUMNS = [
     "shipment_selection_mode",
     "order_processing_blocked",
     "order_resolution_complete",
+    "watch_sheet_requested",
 ]
 
 HISTORY_COLUMNS = [
@@ -167,6 +171,7 @@ HISTORY_COLUMNS = [
     "shipment_selection_mode",
     "order_processing_blocked",
     "order_resolution_complete",
+    "watch_sheet_requested",
     "notes",
     "human_intervention_required",
     "regex_request_types",
@@ -409,6 +414,7 @@ def active_tickets_schema(bigquery):
         bigquery.SchemaField("shipment_selection_mode", "STRING"),
         bigquery.SchemaField("order_processing_blocked", "BOOL"),
         bigquery.SchemaField("order_resolution_complete", "BOOL"),
+        bigquery.SchemaField("watch_sheet_requested", "BOOL"),
     ]
 
 
@@ -437,7 +443,8 @@ def empty_active_tickets_table(client) -> None:
             order_reference_source STRING,
             shipment_selection_mode STRING,
             order_processing_blocked BOOL,
-            order_resolution_complete BOOL
+            order_resolution_complete BOOL,
+            watch_sheet_requested BOOL
         )
         """
     ).result()
@@ -763,6 +770,7 @@ def history_schema(bigquery):
         bigquery.SchemaField("shipment_selection_mode", "STRING"),
         bigquery.SchemaField("order_processing_blocked", "BOOL"),
         bigquery.SchemaField("order_resolution_complete", "BOOL"),
+        bigquery.SchemaField("watch_sheet_requested", "BOOL"),
         bigquery.SchemaField("notes", "STRING"),
         bigquery.SchemaField("human_intervention_required", "BOOL"),
         bigquery.SchemaField("regex_request_types", "STRING", mode="REPEATED"),
@@ -801,6 +809,7 @@ _ADDITIVE_HISTORY_COLUMNS = (
     ("order_processing_blocked", "BOOL"),
     ("order_resolution_complete", "BOOL"),
     ("full_order_export_tracking_number", "STRING"),
+    ("watch_sheet_requested", "BOOL"),
 )
 _HISTORY_SCHEMA_ENSURED = False
 
@@ -948,6 +957,7 @@ def prepare_history_row(
         "shipment_selection_mode": _to_str(row.get("shipment_selection_mode")),
         "order_processing_blocked": bool(_to_bool(row.get("order_processing_blocked"))),
         "order_resolution_complete": bool(_to_bool(row.get("order_resolution_complete"))),
+        "watch_sheet_requested": row_requests_watch_sheet(row),
         "notes": _to_str(row.get("notes")),
         "human_intervention_required": bool(
             _to_bool(row.get("human_intervention_required"))
@@ -1493,6 +1503,90 @@ def _zendesk_field_value(field_id:int,display_name:str,auth,base_url):
         if str(opt.get("name","")).strip().lower()==str(display_name).strip().lower():
             return opt.get("value")
     return fld.get("custom_field_options",[{}])[0].get("value")
+def row_requests_watch_sheet(row: Mapping[str, Any]) -> bool:
+    """True when this request's ticket mentions a watch sheet.
+
+    The decision is made once at fetch time, where the ticket description is
+    available, and stored in ``watch_sheet_requested``. Rows produced before
+    that column existed -- and any row that lost it on the way down the
+    pipeline -- fall back to scanning the text the row does carry, so the
+    field is still set rather than silently skipped.
+    """
+
+    flag = row.get("watch_sheet_requested")
+    if flag is not None and not (isinstance(flag, float) and pd.isna(flag)):
+        return bool(_to_bool(flag))
+
+    return mentions_watch_sheet(
+        *(
+            row.get(column)
+            for column in ("subject", "cleaned_request_body", "request_body")
+        )
+    )
+
+
+def _watch_sheet_custom_field(auth, base_url) -> dict[str, Any] | None:
+    """Return the "Watch Sheet" custom-field entry to send with an update.
+
+    The field id is known, but not its type: a drop-down/FieldTagger only
+    stores a value present in its own ``custom_field_options`` list, and a
+    checkbox only stores a boolean. So the field is read once per run and the
+    value is matched to its shape; a plain text field just gets "YES". A
+    failed lookup is not fatal -- the literal value is sent and Zendesk
+    decides -- because no ticket update may be lost over this field.
+    """
+
+    field_id = watch_sheet_ticket_field_id()
+    literal = WATCH_SHEET_FIELD_DISPLAY_VALUE
+
+    try:
+        field = _zendesk_ticket_field(int(field_id), auth, base_url)
+    except Exception as exc:  # noqa: BLE001 - the update must still go out.
+        print(f"Could not read Zendesk ticket field {field_id} (Watch Sheet): {exc}")
+        return {"id": int(field_id), "value": literal}
+
+    field_type = str(field.get("type") or "").strip().lower()
+    if field_type == "checkbox":
+        return {"id": int(field_id), "value": True}
+
+    options = field.get("custom_field_options") or []
+    if options:
+        wanted = literal.strip().lower()
+        for option in options:
+            name = str(option.get("name") or "").strip().lower()
+            value = str(option.get("value") or "").strip().lower()
+            if wanted in (name, value) or value.rsplit("_", 1)[-1] == wanted:
+                return {"id": int(field_id), "value": option.get("value")}
+        print(
+            f"Zendesk ticket field {field_id} (Watch Sheet): no option matches "
+            f"{literal!r}. Options: "
+            + ", ".join(
+                f"{option.get('name')!r}={option.get('value')!r}" for option in options
+            )
+        )
+
+    return {"id": int(field_id), "value": literal}
+
+
+def _append_watch_sheet_field(
+    custom_fields: list[dict[str, Any]],
+    watch_sheet: bool,
+    auth,
+    base_url: str,
+) -> None:
+    """Add the "Watch Sheet" = YES entry to a ticket update, when requested."""
+
+    if not watch_sheet:
+        return
+
+    entry = _watch_sheet_custom_field(auth, base_url)
+    if entry is None:
+        return
+    if any(_to_int(f.get("id")) == _to_int(entry.get("id")) for f in custom_fields):
+        return
+    custom_fields.append(entry)
+
+
 def _brand_from_country_tag(tag: str) -> str:
     """Extract the brand code from a country tag like 'country_dj_us' -> 'DJ'."""
     # Tags are always: country_{brand}_{iso2}
@@ -1528,6 +1622,7 @@ def submit_ticket_response(
     order_note: str = '-',
     country_tag: str | None = None,
     country_code: str | None = None,
+    watch_sheet: bool = False,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1597,6 +1692,10 @@ def submit_ticket_response(
                 custom_fields.append(
                     {"id": field_id, "value": option_value or country_tag}
                 )
+
+    # "Watch Sheet" = YES whenever the ticket subject or description mentions
+    # a watch sheet.
+    _append_watch_sheet_field(custom_fields, watch_sheet, auth, base_url)
 
     ticket_update["custom_fields"] = custom_fields
 
@@ -1750,6 +1849,7 @@ def submit_ticket_solved_without_response(
     order_note: str = '-',
     country_tag: str | None = None,
     country_code: str | None = None,
+    watch_sheet: bool = False,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1802,6 +1902,10 @@ def submit_ticket_solved_without_response(
                 custom_fields.append(
                     {"id": field_id, "value": option_value or country_tag}
                 )
+
+    # "Watch Sheet" = YES whenever the ticket subject or description mentions
+    # a watch sheet.
+    _append_watch_sheet_field(custom_fields, watch_sheet, auth, base_url)
 
     ticket_update["custom_fields"] = custom_fields
 
@@ -2260,6 +2364,7 @@ def assign_ticket_to_group(
     *,
     auth,
     base_url: str,
+    watch_sheet: bool = False,
     session: requests.Session | None = None,
 ) -> bool:
     """Move one ticket to a group, leaving its status untouched.
@@ -2291,14 +2396,28 @@ def assign_ticket_to_group(
         print(f"Zendesk ticket {ticket_id} is closed; skipped group assignment.")
         return False
 
-    if _to_int(ticket.get("group_id")) == int(group_id):
+    already_in_group = _to_int(ticket.get("group_id")) == int(group_id)
+    if already_in_group and not watch_sheet:
         # Already with the group; nothing to do, and re-sending would only add
         # a pointless audit event.
         return True
 
-    fields: dict[str, Any] = {"group_id": int(group_id)}
-    if _env_bool(ZENDESK_ESCALATION_CLEAR_ASSIGNEE_ENV, True):
-        fields["assignee_id"] = None
+    fields: dict[str, Any] = {}
+    if not already_in_group:
+        fields["group_id"] = int(group_id)
+        if _env_bool(ZENDESK_ESCALATION_CLEAR_ASSIGNEE_ENV, True):
+            fields["assignee_id"] = None
+
+    # "Watch Sheet" = YES is set on escalated tickets too: the request is not
+    # answered here, but the flag belongs on the ticket either way.
+    if watch_sheet:
+        custom_fields: list[dict[str, Any]] = []
+        _append_watch_sheet_field(custom_fields, True, auth, base_url)
+        if custom_fields:
+            fields["custom_fields"] = custom_fields
+
+    if not fields:
+        return True
 
     response = zendesk_request(
         "PUT",
@@ -2358,6 +2477,16 @@ def assign_unhandled_tickets_to_escalation_group(
 
         seen_ticket_ids: set[int] = set()
 
+        # Several requests can belong to one ticket, and only the first of
+        # them produces a ticket update, so the watch-sheet flag is OR-ed
+        # across all of a ticket's rows before anything is sent.
+        watch_sheet_ticket_ids = {
+            _to_int(row.get("zendesk_ticket_id"))
+            for row in rows
+            if row_requests_watch_sheet(row)
+        }
+        watch_sheet_ticket_ids.discard(None)
+
         for row in rows:
             ticket_id = _to_int(row.get("zendesk_ticket_id"))
             if ticket_id is None:
@@ -2376,6 +2505,7 @@ def assign_unhandled_tickets_to_escalation_group(
                     group_id,
                     auth=auth,
                     base_url=base_url,
+                    watch_sheet=ticket_id in watch_sheet_ticket_ids,
                     session=session,
                 ):
                     assigned += 1
@@ -2619,6 +2749,7 @@ def submit_final_responses(
                 # "Country <BRAND>" field: the 422 names the field id, which
                 # gives the brand, and this gives the ISO country code.
                 country_code=row.get('full_order_country_code') or None,
+                watch_sheet=row_requests_watch_sheet(row),
                 auth=auth,
                 base_url=base_url,
             ):
@@ -2649,6 +2780,7 @@ def submit_final_responses(
                 # "Country <BRAND>" field: the 422 names the field id, which
                 # gives the brand, and this gives the ISO country code.
                 country_code=row.get('full_order_country_code') or None,
+                watch_sheet=row_requests_watch_sheet(row),
                 auth=auth,
                 base_url=base_url,
             ):
@@ -3711,6 +3843,17 @@ def fetch_ticket_rows(
                         "extracted_tracking_number": tracking_number,
                         "extracted_order_reference": ";".join(
                             order_references
+                        ),
+                        # The ticket description exists only here, at fetch
+                        # time, and is not carried down the pipeline, so the
+                        # watch-sheet decision is made now and stored as a
+                        # flag. The latest requester message is included as
+                        # well: a watch sheet mentioned in a follow-up is
+                        # still a watch sheet.
+                        "watch_sheet_requested": mentions_watch_sheet(
+                            subject,
+                            description,
+                            request_body,
                         ),
                     }
                 )
