@@ -413,6 +413,107 @@ Repository persistence is controlled separately by `persist_generated_documents`
 
 The submission decision is independent from BigQuery history de-duplication. This means a dry run with `submit_zendesk_responses=false` can be followed by another run with `submit_zendesk_responses=true`; the agent will still evaluate the current non-human `final_response` values for Zendesk submission. The duplicate-comment guard skips a ticket when the exact same public response body is already present.
 
+### Invoice and RPI are always sent together
+
+Whichever of the two a request resolves to, both are fetched, downloaded and
+attached. `customs_rules.pair_invoice_requested_data()` adds the missing
+counterpart and runs **after** every rule that used to choose between them, so
+those rules now only decide which document is *detected* first, never which
+one is *sent*:
+
+- the tracking-role swap in `align_invoice_requested_data_with_tracking_context()`;
+- the first-returns / return-context target choice in `collapse_embedded_document_fields()`;
+- the canonical-key preference in `response_data_extractor.requested_data_keys_from_row()`,
+  whose whole purpose was to stop both documents being downloaded.
+
+The pairing is applied in two places, because the two stages compute their own
+requested-data list: `requested_data_keys_from_row()` (the extractor, so both
+PDFs are retrieved) and `requested_data_for_response()` (the response builder,
+so both appear in the reply).
+
+**A shipment that carries only one document type still answers both keys.**
+`select_invoice_document_link()` now falls back from the wanted
+`documentType` to the combined `INV_RPI_M` document and then to the other
+type, since the PDF behind any of those links carries both the commercial
+invoice and the return proforma -- the same reasoning the `prd_invoiceUpdate`
+fallback already used when substituting one link for the other. Without this,
+pairing would have escalated to human review every ticket whose order
+published only an `INV`. When both keys resolve to the same file it is
+attached once (`document_attachment_paths_for_response()` de-duplicates by
+path) while the reply still lists both labels, which is accurate: that one
+PDF is both documents.
+
+The `Order Customs Clearance` reply no longer hard-codes `RPI` in its
+document list; it names the invoice keys actually being sent, and its
+per-shipment wording is now Italian in Italian replies.
+
+### Items invoiced at zero are re-declared at a nominal value
+
+Samples, gifts-with-purchase and replacements are invoiced at zero. Customs
+will not clear a shipment declared at no value, so whenever GET_FULL_ORDER
+reports `items[].price == 0` for the shipment, the downloaded invoice and RPI
+PDFs are rewritten:
+
+- every `0,00` in the **unit price** column becomes `1,00`;
+- the **line price** on that row becomes quantity x 1;
+- `Totale articoli`, `IMPORTO TOTALE DOVUTO`, `Merchandise Total` and
+  `Invoice Total Amount` grow by the sum of the line increases.
+
+`Totale spedizione` / shipping total is deliberately **not** touched: it is
+not an item value, and a zero there is a real free-shipping promotion rather
+than a missing value.
+
+The zero-priced SKUs are recorded at extraction time in the new
+`full_order_zero_price_items` column (`extract_zero_price_items()`, shipped
+items only -- `canceledItems` never reach the document), and
+`_apply_zero_value_correction()` runs right after the invoice/RPI download
+loop in `generate_documents_for_dataframe()`, so a cached download from an
+earlier run is corrected too.
+
+**How the PDF is edited** (`invoice_value_correction.py`, PyMuPDF, already a
+pipeline dependency for the order-reference PDF scan). The column headers
+(`Prezzo Unitario` / `Unit Price`, `Prezzo` / `Price`, `QTA'` / `QTY`) locate
+the columns; each numeric span is assigned to the column it overlaps most;
+spans are grouped into rows by their vertical centre rather than by a
+rounding bucket, because the line price in these templates sits a point lower
+than the unit price on the same row and a bucket splits them. The old number
+is removed with a redaction that leaves line art and images alone, and the
+new one is drawn in the same font, size and colour, right-aligned to the
+original right edge so `9,00` -> `10,00` cannot drift into the next column.
+The document's own notation is preserved, so a `1.234,56` invoice stays
+European and a `1,234.56` one stays Anglo.
+
+**It cannot run twice.** Each corrected file gets a sidecar
+`<file>.value_correction.json` recording what changed, and a file carrying its
+marker is skipped. The save goes to a temp file that is moved into place, so a
+crash mid-write cannot leave a half-written PDF where the pipeline expects a
+readable one.
+
+**It never blocks a reply.** A correction failure is logged and recorded in
+`generated_document_error` for the reviewer; the uncorrected document is still
+attached, exactly like a failed shipping label. A missing PyMuPDF is one log
+line, not a failed run.
+
+### A tracking request is answered with the other leg
+
+A carrier quoting a tracking number is saying which parcel the ticket is
+about; what they are asking for is the other leg. That is already what the UPS
+returns flow does -- the desk quotes the return label and gets the export
+tracking number -- and `answered_tracking_leg()` now applies the rule in both
+directions: a ticket quoting the **export** tracking number is answered with
+the **return** one.
+
+The flip happens only when the ticket's number is positively identified as the
+export leg (`extracted_tracking_number_kind()`, matching against the
+shipments-table values and their GET_FULL_ORDER fallbacks). An unrecognized or
+ambiguous number keeps the historic behaviour and is answered with the export
+tracking number, so nothing changes for the requests this rule cannot read.
+
+The label follows the value: the hard-coded `TRK in export` / `AWB in export`
+lines in the UPS and FedEx templates, and the generic reply's `Export TRK`
+line, are now chosen per leg (`tracking_label_for_row()`), so a return number
+is never filed under an export heading.
+
 ### The "Watch Sheet" ticket field
 
 When the ticket **subject or description** mentions a watch sheet, the Zendesk
