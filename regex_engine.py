@@ -209,7 +209,8 @@ class RegexEngine:
             order_reference_source,
             shipment_selection_mode,
             order_processing_blocked,
-            order_resolution_complete
+            order_resolution_complete,
+            watch_sheet_requested
         FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
         """
 
@@ -271,6 +272,7 @@ class RegexEngine:
                 "shipment_selection_mode": ticket.get("shipment_selection_mode"),
                 "order_processing_blocked": ticket.get("order_processing_blocked"),
                 "order_resolution_complete": ticket.get("order_resolution_complete"),
+                "watch_sheet_requested": ticket.get("watch_sheet_requested"),
                 **result,
             }
 
