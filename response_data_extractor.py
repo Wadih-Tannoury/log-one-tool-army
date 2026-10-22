@@ -43,6 +43,7 @@ from customs_rules import (
     PLACEHOLDER,
     UPS_BROKERAGE_EMAIL,
     align_invoice_requested_data_with_tracking_context,
+    pair_invoice_requested_data,
     extract_ups_code,
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
@@ -69,6 +70,10 @@ from order_reference_resolver import (
     is_shipment_shaped_order_reference,
 )
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe, write_dataframe
+from invoice_value_correction import (
+    InvoiceValueCorrectionError,
+    correct_zero_item_values,
+)
 
 DEFAULT_BASE_URL = "https://zelda.thelevelgroup.com/return/api/v1"
 CREDENTIALS_ENV = "GET_FULL_ORDER_API_CREDENTIALS"
@@ -104,6 +109,11 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     # Which rule produced full_order_export_tracking_number. Internal/audit
     # only; never shown to the customer.
     "export_tracking_source": "full_order_export_tracking_source",
+    # SKUs of the shipment's items whose GET_FULL_ORDER price is 0. These are
+    # the rows that the invoice/RPI PDF prints as 0,00 and that customs will
+    # not clear, so their presence triggers the zero-value PDF correction
+    # (see invoice_value_correction.py).
+    "zero_price_items": "full_order_zero_price_items",
     "api_error": "full_order_api_error",
     "missing_shipment_orders_by_key": "full_order_missing_shipment_orders_by_key",
 }
@@ -519,9 +529,11 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
     response should provide.  Regex and standard-reply columns are only fallbacks
     for older/incomplete rows where the canonical field is empty.
 
-    This prevents downloading both the commercial invoice and the return
-    proforma invoice when one of the non-canonical helper columns still contains
-    the other document type.
+    Invoice and RPI are then always paired: whichever of the two the request
+    resolved to, both are fetched and downloaded, because both are always
+    sent (see customs_rules.pair_invoice_requested_data). This function used
+    to do the opposite -- prefer the canonical column precisely so that only
+    one of the two documents was downloaded -- and that restriction is gone.
     """
 
     def _collapsed_unique_keys(value: Any) -> list[str]:
@@ -566,7 +578,7 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
         _collapsed_unique_keys(strip_libera_esportazione_requested_data(raw_canonical_keys))
     )
     if canonical_keys:
-        return canonical_keys
+        return pair_invoice_requested_data(canonical_keys)
 
     fallback_keys: list[str] = []
     for column in REQUESTED_DATA_SOURCE_COLUMNS:
@@ -575,7 +587,7 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
         for key in _collapsed_unique_keys(row.get(column)):
             if key and key not in fallback_keys:
                 fallback_keys.append(key)
-    return _expanded_keys(fallback_keys)
+    return pair_invoice_requested_data(_expanded_keys(fallback_keys))
 
 
 def _email_domain(email: object) -> str:
@@ -1205,6 +1217,61 @@ def _backfill_shipped_at_from_events(df, index: object) -> None:
         return
 
 
+def row_has_zero_price_items(row: Mapping[str, Any]) -> bool:
+    """True when the GET_FULL_ORDER shipment carries an item priced at 0."""
+
+    return not is_blank(row.get(FULL_ORDER_RESPONSE_COLUMNS["zero_price_items"]))
+
+
+def _apply_zero_value_correction(df, index) -> None:
+    """Re-declare zero item values in this row's invoice/RPI PDFs.
+
+    Runs only for rows whose GET_FULL_ORDER payload reported at least one
+    item with price 0. Each downloaded PDF is rewritten in place once; the
+    sidecar marker written by invoice_value_correction makes a second run a
+    no-op, so a cached download can never be inflated twice.
+
+    A failure here never blocks the reply: the uncorrected document is still
+    attached, and the reason is recorded in generated_document_error for the
+    reviewer, exactly like a failed shipping label.
+    """
+
+    row = df.loc[index]
+    if not row_has_zero_price_items(row):
+        return
+
+    seen_paths: set[str] = set()
+    for invoice_key in sorted(INVOICE_DOCUMENT_DATA_KEYS):
+        column = DOCUMENT_RESPONSE_COLUMNS[invoice_key]
+        value = row.get(column)
+        if is_blank(value):
+            continue
+
+        for path in str(value).split(";"):
+            path = path.strip()
+            if not path or path in seen_paths or not document_path_exists(path):
+                continue
+            seen_paths.add(path)
+
+            try:
+                result = correct_zero_item_values(path)
+            except InvoiceValueCorrectionError as exc:
+                print(
+                    f"WARNING: Could not re-declare zero values in {path} "
+                    f"for row {index}: {exc}"
+                )
+                _append_document_error(df, index, f"{invoice_key}_zero_value: {exc}")
+                continue
+
+            if result is None:
+                continue
+
+            print(
+                f"Re-declared {result.line_edits} zero value(s) in {path} "
+                f"(+{result.delta:.2f} on {result.total_edits} total field(s))."
+            )
+
+
 def generate_documents_for_dataframe(df, *, force: bool = False):
     if df.empty:
         return df
@@ -1267,6 +1334,14 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                 message = f"{invoice_key}: {exc}"
                 print(f"WARNING: Could not download {invoice_key} PDF for row {index}: {exc}")
                 _append_document_error(df, index, message)
+
+        if requested_invoice_keys:
+            # Samples, gifts and replacements are invoiced at zero, and a
+            # document declaring no value does not clear customs. Every
+            # invoice/RPI PDF of a shipment that carries a zero-priced item
+            # is re-declared at a nominal value per unit, with the totals
+            # raised to match.
+            _apply_zero_value_correction(df, index)
 
         if needs_loa:
             column = DOCUMENT_RESPONSE_COLUMNS["authorization_letter"]
@@ -1937,6 +2012,55 @@ def _clean_item_field(value: object) -> str:
     return str(value).strip()
 
 
+def _item_price(item: Mapping[str, Any]) -> float | None:
+    """Return an item's unit price, or None when the payload has none."""
+
+    value = _get_any(
+        item,
+        ("price", "unitPrice", "unit_price"),
+    )
+    if value is None:
+        item_price_data = _get_any(item, ("itemPriceData", "item_price_data"))
+        if isinstance(item_price_data, Mapping):
+            value = _get_any(item_price_data, ("grossPrice", "basePrice", "netPrice"))
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_zero_price_items(
+    payload: Mapping[str, Any],
+    shipment: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Return the SKUs of shipped items whose price is 0.
+
+    Samples, gifts-with-purchase and replacements are invoiced at zero, and
+    a customs office will not clear a shipment declared at no value. The
+    invoice/RPI PDF is therefore re-declared at a nominal value per unit; see
+    invoice_value_correction.correct_zero_item_values(). Only shipped items
+    are considered -- canceledItems never appear on the document.
+    """
+
+    zero_price_skus: list[str] = []
+
+    for item in _items_from_payload(payload, shipment):
+        price = _item_price(item)
+        if price is None or price != 0:
+            continue
+        sku = _clean_item_field(_get_any(item, ("sku", "SKU"))) or _clean_item_field(
+            _get_any(item, ("productName", "product_name", "name"))
+        )
+        sku = sku or "unknown"
+        if sku not in zero_price_skus:
+            zero_price_skus.append(sku)
+
+    return zero_price_skus
+
+
 def extract_returned_items(
     payload: Mapping[str, Any],
     shipment: Mapping[str, Any] | None = None,
@@ -1981,17 +2105,42 @@ def format_returned_items(returned_items: Iterable[Mapping[str, str]]) -> str | 
     return "\n".join(lines) if lines else None
 
 
+# Invoice and RPI are always sent together, so a shipment that carries only
+# one of the two document types still has to answer both keys. The combined
+# INV_RPI_M document is preferred as the stand-in, then the other type: the
+# PDF behind any of these links carries the shipment's commercial invoice and
+# its return proforma, which is also why the prd_invoiceUpdate fallback
+# substitutes one link for the other.
+_INVOICE_DOCUMENT_TYPE_FALLBACKS = ("INV_RPI_M", "INV", "RPI")
+
+
 def select_invoice_document_link(
     invoice_documents: Iterable[Mapping[str, Any]],
     document_type: str,
+    *,
+    allow_fallback: bool = True,
 ) -> str | None:
+    documents = list(invoice_documents)
     wanted_document_type = str(document_type or "").strip().upper()
-    matches = [
-        document
-        for document in invoice_documents
-        if str(document.get("documentType", "") or "").strip().upper() == wanted_document_type
-        and not is_blank(document.get("documentLink"))
-    ]
+
+    wanted_types = [wanted_document_type]
+    if allow_fallback:
+        wanted_types += [
+            fallback
+            for fallback in _INVOICE_DOCUMENT_TYPE_FALLBACKS
+            if fallback != wanted_document_type
+        ]
+
+    matches: list = []
+    for candidate_type in wanted_types:
+        matches = [
+            document
+            for document in documents
+            if str(document.get("documentType", "") or "").strip().upper() == candidate_type
+            and not is_blank(document.get("documentLink"))
+        ]
+        if matches:
+            break
 
     if not matches:
         return None
@@ -2199,6 +2348,7 @@ _NEWLINE_JOINED_COLUMNS = {
 # shipment is unknown), every shipment's export/return tracking number is
 # reported rather than only the first one.
 _SEMICOLON_JOINED_COLUMNS |= {
+    FULL_ORDER_RESPONSE_COLUMNS["zero_price_items"],
     FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"],
     FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"],
 }
@@ -2286,6 +2436,9 @@ def _extract_single_shipment_data(
         ),
         FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"]: format_returned_items(
             extract_returned_items(payload, shipment)
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["zero_price_items"]: (
+            ";".join(extract_zero_price_items(payload, shipment)) or None
         ),
         FULL_ORDER_RESPONSE_COLUMNS["customer_email"]: (
             None if is_blank(customer.get("email")) else str(customer.get("email")).strip()
