@@ -2680,6 +2680,34 @@ def align_invoice_requested_data_with_tracking_context(
     return values
 
 
+# Invoice and RPI are always answered together. Whichever of the two a
+# request resolves to, the other is added: the two documents describe the same
+# shipment from the export and the return side, carriers routinely need both,
+# and picking one was the single biggest source of "we sent the wrong
+# document" follow-ups. The rules that used to choose between them -- the
+# tracking-role swap in align_invoice_requested_data_with_tracking_context(),
+# the first-returns/return-context target choice in
+# collapse_embedded_document_fields(), and the canonical-key filtering in
+# response_data_extractor.requested_data_keys_from_row() -- still decide which
+# one is detected first; they no longer decide which one is sent, because this
+# runs after them and restores the pair.
+
+INVOICE_DOCUMENT_PAIR = ("commercial_invoice", "return_proforma_invoice")
+
+
+def pair_invoice_requested_data(requested_data: object) -> List[str]:
+    """Return requested_data with invoice and RPI always present together."""
+
+    values = [str(value) for value in normalize_requested_data(requested_data)]
+    if not any(value in INVOICE_DOCUMENT_PAIR for value in values):
+        return values
+
+    for key in INVOICE_DOCUMENT_PAIR:
+        if key not in values:
+            values.append(key)
+    return values
+
+
 def is_atr_certificate_mandate_request(text: object) -> bool:
     """True for ATR-certificate mandate/forms, which are not POA replies."""
 
