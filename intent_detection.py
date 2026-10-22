@@ -711,6 +711,7 @@ def base_output_row(source_row) -> Dict[str, object]:
         "shipment_selection_mode": source_row.get("shipment_selection_mode"),
         "order_processing_blocked": as_bool(source_row.get("order_processing_blocked")),
         "order_resolution_complete": source_row.get("order_resolution_complete"),
+        "watch_sheet_requested": source_row.get("watch_sheet_requested"),
         "llm_human_intervention_draft_response": source_row.get(
             "llm_human_intervention_draft_response",
             "",
