@@ -50,6 +50,9 @@ from customs_rules import (
     filter_libera_esportazione_response_data,
     first_available_value,
     is_atr_certificate_mandate_request,
+    CLEARANCE_SUBJECT_ORDER,
+    customs_clearance_subject,
+    apply_order_clearance_response_data,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_noreply_autoreply_first_request,
@@ -502,6 +505,30 @@ def _request_type_sources_for_tracking_alignment(row: Mapping[str, Any]) -> list
     return values
 
 
+def row_is_order_customs_clearance(row: Mapping[str, Any]) -> bool:
+    """True when the parcel held at customs is the order, not a return.
+
+    Decided by the leg of the tracking number the carrier quoted, not by
+    ticket_category: the category is configured once per brokerage mailbox
+    and describes its usual traffic, not this message.
+    """
+
+    return customs_clearance_subject(
+        _row_request_text(row),
+        extracted_tracking_number=row.get("extracted_tracking_number"),
+        shipment_tracking_number=first_available_value(
+            row.get("shipment_tracking_number"),
+            row.get(FULL_ORDER_RESPONSE_COLUMNS["export_tracking_number"]),
+            default="",
+        ),
+        return_tracking_number=first_available_value(
+            row.get("return_tracking_number"),
+            row.get(FULL_ORDER_RESPONSE_COLUMNS["return_tracking_number"]),
+            default="",
+        ),
+    ) == CLEARANCE_SUBJECT_ORDER
+
+
 def _apply_response_requested_data_overrides(
     row: Mapping[str, Any],
     requested_data: object,
@@ -519,6 +546,8 @@ def _apply_response_requested_data_overrides(
     )
     if is_atr_certificate_mandate_request(_row_request_text(row)):
         values = [value for value in values if value != "power_of_attorney"]
+    if row_is_order_customs_clearance(row):
+        values = apply_order_clearance_response_data(values)
     return values
 
 
@@ -536,6 +565,8 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
     one of the two documents was downloaded -- and that restriction is gone.
     """
 
+    order_customs_clearance = row_is_order_customs_clearance(row)
+
     def _collapsed_unique_keys(value: Any) -> list[str]:
         keys: list[str] = []
         collapsed_keys = collapse_document_embedded_requested_data(
@@ -544,6 +575,7 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
             request_number=row.get("request_number", 1),
             requester_email=row.get("requester_email", ""),
             request_text=_row_request_text(row),
+            order_customs_clearance=order_customs_clearance,
         )
         for key in collapsed_keys:
             key = normalize_data_key(key)
@@ -568,6 +600,7 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
             request_number=row.get("request_number", 1),
             requester_email=row.get("requester_email", ""),
             trigger_requested_data=regex_trigger_keys or keys,
+            order_customs_clearance=order_customs_clearance,
         )
         return _apply_response_requested_data_overrides(row, expanded_keys)
 
@@ -578,7 +611,10 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
         _collapsed_unique_keys(strip_libera_esportazione_requested_data(raw_canonical_keys))
     )
     if canonical_keys:
-        return pair_invoice_requested_data(canonical_keys)
+        return pair_invoice_requested_data(
+            canonical_keys,
+            order_customs_clearance=order_customs_clearance,
+        )
 
     fallback_keys: list[str] = []
     for column in REQUESTED_DATA_SOURCE_COLUMNS:
@@ -587,7 +623,10 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
         for key in _collapsed_unique_keys(row.get(column)):
             if key and key not in fallback_keys:
                 fallback_keys.append(key)
-    return pair_invoice_requested_data(_expanded_keys(fallback_keys))
+    return pair_invoice_requested_data(
+        _expanded_keys(fallback_keys),
+        order_customs_clearance=order_customs_clearance,
+    )
 
 
 def _email_domain(email: object) -> str:
