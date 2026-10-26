@@ -49,6 +49,8 @@ from customs_rules import (
     UNKNOWN_REQUEST,
     PURELY_INFORMATIVE_SOLVED,
     clean_latest_request_text,
+    customs_clearance_subject,
+    quoted_tracking_contradicts_return_wording,
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
     detect_language_with_dictionary,
@@ -1422,6 +1424,24 @@ def _build_batch_payload(batch_rows):
                 "regex_notes": str(row.get("notes", "") or ""),
                 "extracted_tracking_number": str(
                     row.get("extracted_tracking_number", "") or ""
+                ),
+                # Which parcel the carrier is holding, resolved from the leg
+                # of the quoted tracking number against
+                # bi.shipping_platform_shipments. The model cannot work this
+                # out from the text -- the wording is identical for a return
+                # and for an order -- so it is computed here and handed over
+                # as a fact. "" means the number resolved to neither leg.
+                "clearance_subject": customs_clearance_subject(
+                    f"{row.get('subject', '') or ''}\n{source_text_for_llm(row)}",
+                    extracted_tracking_number=row.get("extracted_tracking_number"),
+                    shipment_tracking_number=row.get("shipment_tracking_number"),
+                    return_tracking_number=row.get("return_tracking_number"),
+                ),
+                "clearance_subject_disputed": quoted_tracking_contradicts_return_wording(
+                    f"{row.get('subject', '') or ''}\n{source_text_for_llm(row)}",
+                    extracted_tracking_number=row.get("extracted_tracking_number"),
+                    shipment_tracking_number=row.get("shipment_tracking_number"),
+                    return_tracking_number=row.get("return_tracking_number"),
                 ),
                 "tracking_not_found_in_shipping_platform_shipments": as_bool(
                     row.get("tracking_not_found_in_shipping_platform_shipments")
