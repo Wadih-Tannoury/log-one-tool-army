@@ -27,6 +27,16 @@ If a Returns Customs Clearance first-request response depends on comparing expor
 
 Carrier-domain tickets from requester emails not present in the BigQuery config can still be processed. In that case, `ticket_category` was inferred from the current request body and subject by deterministic rules. Use the supplied `ticket_category` normally, but keep all existing human-intervention guardrails.
 
+`clearance_subject` outranks `ticket_category` wherever the two disagree. It records which parcel is actually held at customs, resolved from the leg of the tracking number the carrier quoted against `tlg-business-intelligence-prd.bi.shipping_platform_shipments`:
+
+- `return` — the carrier quoted the return label. A return is stuck at import. Answer with the reintroduzione-in-franchigia package below.
+- `order` — the carrier quoted the shipment label. The customer's own order is stuck at import and cannot be delivered. Answer with what releases it: the goods description carried by the commercial invoice, the UPS account code, and the export tracking of that same parcel. Never draft an RPI line, never draft a returned-items line, and never report a return tracking number: the export tracking to report is the held shipment's own number, even though the carrier already quoted it back to us.
+- `""` — the quoted number resolved to neither leg. Fall back to `ticket_category` and the wording.
+
+The words `Tracking export`, `TRK in export` and `AWB in export` appear in both kinds of request. They name the forward leg and are not evidence of a return.
+
+When `clearance_subject_disputed` is true — the quoted number is the shipment leg but the body uses real return wording — the two readings call for opposite document packages. Do not draft either. Create a human-intervention note.
+
 Carrier notification/status emails that were classified as `exclude_from_processing` should not receive a Zendesk reply. Examples include carrier no-reply delivery notifications, Import Data Summary information-only messages, UPS MRN automatic notices, UPS claim/inquiry acknowledgements, and billing/no-reply notices.
 
 If `requester_email` starts with `noreply`, do not create a public Zendesk reply regardless of the detected requested data. Create a `HUMAN INTERVENTION REQUIRED` draft that summarizes what the request appears to be about, keep `final_response` empty, and mark the row as human intervention required. Do not run GET_FULL_ORDER or document generation only for a `noreply*` sender because no automatic response will be sent.
@@ -184,6 +194,8 @@ Compare the `carrier_code` for the row where `is_return = true` with the `carrie
 
 ## UPS Returns Customs Clearance First Request
 
+This section applies only when `clearance_subject` is `return`, or when it is `""` and `ticket_category` is `Returns Customs Clearance`. When `clearance_subject` is `order`, skip it and use "UPS Order Customs Clearance First Request" below.
+
 For UPS Returns Customs Clearance request number `1`, treat `export_tracking_number`, `return_proforma_invoice`, `ups_account_number`, and `returned_items_confirmation` as one required first-request bundle. If regex/effective requested-data detection finds at least one of those values, expand the response data to include all four before enrichment, document generation, and response building.
 
 When the detected requested data includes both `ups_account_number` and `return_proforma_invoice`, draft one response when the carrier comparison is available.
@@ -226,9 +238,31 @@ Piero T.
 
 If the order/carrier comparison cannot be determined, create a human-intervention note instead of drafting two alternatives.
 
+## UPS Order Customs Clearance First Request
+
+For UPS request number `1` where `clearance_subject` is `order`, the parcel held at customs is the customer's order. The first-request bundle is `export_tracking_number`, `ups_account_number` and `commercial_invoice`. There is no RPI and no returned-items list, and no export/return `carrier_code` comparison is needed: there is only one leg.
+
+The export tracking to report is the held shipment's own tracking number, the one quoted in the request. Draft:
+
+```text
+Buongiorno,
+
+In allegato la documentazione per lo sdoganamento della spedizione in oggetto:
+
+- TRK in export: <shipment tracking number of the held parcel>
+- Cod UPS: <retrieved value or placeholder>
+- Fattura commerciale: <retrieved value or placeholder>
+
+Cordiali saluti,
+
+Piero T.
+```
+
+If the commercial invoice cannot be retrieved or generated, create a human-intervention note rather than drafting a reply with a placeholder document link.
+
 ## FedEx/DHL Returns Customs Clearance RPI Contact/Address Rule
 
-For FedEx or DHL Returns Customs Clearance request number `1`, if `shipping_address`, `customer_email`, or `customer_phone` are requested, treat those fields as part of the RPI package. Draft one response when the carrier comparison is available.
+For FedEx or DHL Returns Customs Clearance request number `1`, when `clearance_subject` is not `order`, if `shipping_address`, `customer_email`, or `customer_phone` are requested, treat those fields as part of the RPI package. Draft one response when the carrier comparison is available.
 
 If `carrier_code` is the same for the return row and the export row, draft the carrier-specific response.
 
@@ -279,7 +313,7 @@ If the order/carrier comparison cannot be determined, create a human-interventio
 
 ## DHL Returns Customs Clearance First Request
 
-For DHL Returns Customs Clearance request number `1`, when the requested data includes `return_proforma_invoice`, apply the same carrier-match lookup rule used for the DHL branch above.
+For DHL Returns Customs Clearance request number `1`, when `clearance_subject` is not `order` and the requested data includes `return_proforma_invoice`, apply the same carrier-match lookup rule used for the DHL branch above.
 
 If `carrier_code` is the same for the return row and the export row, draft:
 
