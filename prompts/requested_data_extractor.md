@@ -66,6 +66,34 @@ A follow-up whose body is an acknowledgement — "Thank you.", "Received, thanks
 Getting this wrong sends the customer a document they have just confirmed receiving. A follow-up that thanks TLG **and then asks for something** ("Thanks, but the invoice is missing the total value") is a real request: classify it from what the body asks for.
 
 
+## Which Parcel Is Held at Customs
+
+A brokerage desk sends the same checklist whether the parcel stuck at customs is a return or the customer's own order. The wording does not tell them apart. The tracking number the carrier quotes does, and it is resolved for you before you see the request and handed over in `clearance_subject`:
+
+| `clearance_subject` | What the carrier quoted | What is held | What they are asking for |
+|---|---|---|---|
+| `return` | the return label | a return coming back to TLG | what releases a reintroduzione in franchigia: the export leg of the original order, the UPS account, the RPI, the returned-items list |
+| `order` | the shipment label | the customer's order, which cannot be delivered | what releases that parcel: the goods description, the account code, and that parcel's export tracking |
+| `""` | neither leg resolved | unknown | fall back to the wording and to `ticket_category` |
+
+`clearance_subject` outranks `ticket_category`. The category is configured once per brokerage mailbox and describes the traffic it usually sends, not this message: a mailbox configured as `Returns Customs Clearance` sends order holds too, and the reverse happens as well.
+
+**When `clearance_subject` is `order`, never return `return_proforma_invoice` or `returned_items_confirmation`.** There is no return leg in play. Customs description, importer details, tax information, country of origin and product description all belong to the `commercial_invoice` of that shipment. The export tracking they are asking for is that same parcel's number — the one they quoted back at you — so return `export_tracking_number` normally; the response generator reports the shipment's own tracking number rather than looking for a return label.
+
+**`Tracking export`, `export TRK`, `AWB in export` and similar are not return wording.** They name the forward leg of any shipment and appear in order holds and return holds alike. Do not let them, on their own, push a request toward `return_proforma_invoice` or toward a Returns Customs Clearance reading. Real return wording is RPI, PRI, return proforma, fattura di reso, reintroduzione in franchigia, returned goods/items, return to shipper, RTS, proof or evidence of export.
+
+**When `clearance_subject_disputed` is true**, the quoted number is the shipment leg but the body also uses real return wording. The two readings call for opposite packages and a wrong guess sends the wrong documents, so do not pick one. Return:
+
+```json
+{
+  "requested_data": ["human_intervention_required"],
+  "confidence": 0.95,
+  "notes": "Quoted tracking number is the shipment leg (order held at customs) but the body uses return wording; a human must settle which package applies.",
+  "human_intervention_draft_response": ""
+}
+```
+
+
 ## Important Logic
 
 A request can require more than one data element.
@@ -145,9 +173,13 @@ If these fields are requested in an order/import/commercial-invoice context, ret
 
 If these fields are requested in a return, RPI, PRI, reintroduction, reintroduzione in franchigia, or Returns Customs Clearance context, return `return_proforma_invoice`.
 
+`clearance_subject` settles this when it is set: `order` means `commercial_invoice` and `return` means `return_proforma_invoice`, whatever the surrounding wording and `ticket_category` suggest.
+
 Do not return `tax_information`, `country_of_origin`, `product_description`, `customs_description`, or `importer_details`.
 
 ## Returns Customs Clearance Rules
+
+Every rule in this section applies only when the parcel held at customs really is a return: `clearance_subject` is `return`, or it is `""` and the wording says so. When `clearance_subject` is `order`, skip this section entirely — see "Which Parcel Is Held at Customs" above.
 
 For first Returns Customs Clearance requests, customer phone, customer email, and shipping address are often requested only because they must appear in the RPI package.
 
@@ -178,11 +210,11 @@ For any request number, return `eori_number` when the EORI number is requested. 
 
 For request number `1`, if the request asks for generic shipment/clearance instructions, return `ups_account_number` and `export_tracking_number`. For later request numbers, return `shipment_instructions` so the response generator can route it to human intervention.
 
-If the ticket request body contains the word `sdoganamento`, include `export_tracking_number` in `requested_data` in addition to any other requested data, unless the row must be `human_intervention_required`.
+If the ticket request body contains the word `sdoganamento`, include `export_tracking_number` in `requested_data` in addition to any other requested data, unless the row must be `human_intervention_required`. This holds for both values of `clearance_subject`: on an order hold the export tracking to report is the held parcel's own number, which is still `export_tracking_number`.
 
 When `address_translation`, `exporter_ein`, or `address_correction` is explicitly requested, return that exact key. These keys are not automatically retrieved; the response generator routes them to human intervention.
 
-For the UPS UK import-clearance instruction template from UPS Brokerage at East Midlands Airport, return exactly these operational data elements when the context is Returns Customs Clearance: `export_tracking_number`, `ups_account_number`, and `return_proforma_invoice`. Treat EORI/VAT, commodity code, customs procedure, deferment, and generic shipment instructions as part of that specific return-clearance package.
+For the UPS UK import-clearance instruction template from UPS Brokerage at East Midlands Airport, return exactly these operational data elements when `clearance_subject` is `return`: `export_tracking_number`, `ups_account_number`, and `return_proforma_invoice`. When `clearance_subject` is `order`, the same template is an order hold: return `export_tracking_number`, `ups_account_number`, and `commercial_invoice` instead. Treat EORI/VAT, commodity code, customs procedure, deferment, and generic shipment instructions as part of that specific return-clearance package.
 
 ## UPS Extra Charges Rule
 
@@ -338,8 +370,8 @@ Examples:
 - RPI / PRI = return_proforma_invoice
 - reintroduzione in franchigia = return_proforma_invoice
 - fattura corretta = corrected_invoice unless it is part of a first-request RPI/Returns Customs Clearance package
-- numero di tracking export = export_tracking_number
-- AWB in export / lettera di vettura = export_tracking_number
+- numero di tracking export = export_tracking_number (the forward leg of any shipment; not a sign that the held parcel is a return)
+- AWB in export / lettera di vettura = export_tracking_number (same: not return wording)
 - codice abbonamento UPS = ups_account_number
 - dichiarazione di libera esportazione = dichiarazione_di_libera_esportazione
 - dichiarazione di intento / dichiarazione d'intento = dichiarazione_di_libera_esportazione
