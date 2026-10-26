@@ -48,7 +48,7 @@ The config table still remains authoritative for classification:
 
 1. If the normalized requester email exists in `tlg-business-intelligence-prd.til.log_one_tool_army_config`, the workflow keeps the configured `ticket_category` exactly as before.
 2. If the requester email is a UPS/DHL/FedEx-domain address but is not in the config table, `customs_rules.classify_ticket_category_from_content()` infers one of the existing categories from the current requester message and subject:
-   - `Returns Customs Clearance` for RPI/PRI, return proforma, returned-goods, reintroduction, proof/evidence-of-export, export-tracking, and RTS wording.
+   - `Returns Customs Clearance` for RPI/PRI, return proforma, returned-goods, reintroduction, proof/evidence-of-export, and RTS wording. Export-tracking wording (`Tracking export`, `TRK in export`, `AWB in export`) no longer counts on its own: it names the forward leg of any shipment and appears in order holds and return holds alike. See "Which parcel is held at customs" below.
    - `Pending Order Release` for delivery/address/phone/contact/recipient-availability/FedEx Support Hub handoff wording.
    - `Order Customs Clearance` for commercial invoice, import/customs clearance, sdoganamento, goods description, country of origin, POA/AES/SED/SLI/EORI, and generic customs-document requests.
 
@@ -135,6 +135,29 @@ Requester emails whose address starts with `noreply` are never answered automati
 - `ticket_fetcher.submit_final_responses()` routes these rows to `submit_ticket_solved_without_response()` alongside `noreply@fedex.com` rows, before the general `noreply*`/human-intervention skips, so the ticket is solved with a status-only update and no public comment.
 
 If instead the message does contain data/action request language, the row falls back to the existing `HUMAN INTERVENTION REQUIRED` behavior below.
+
+
+### Which parcel is held at customs
+
+A brokerage desk sends the same checklist whether the parcel stuck at customs is a return or the customer's own order, so the wording cannot tell them apart. The tracking number the carrier quotes can: it names the parcel being held. `customs_rules.customs_clearance_subject()` resolves it against `bi.shipping_platform_shipments` and returns one of three values.
+
+| value | carrier quoted | what is held | what we send |
+|---|---|---|---|
+| `return` | the return label | a return coming back to TLG | export leg of the original order, UPS account, RPI, returned-items list |
+| `order` | the shipment label | the customer's order, undeliverable | goods description via the commercial invoice, account code, and that parcel's own export tracking |
+| `""` | neither leg resolved | unknown | existing category/wording rules stay in charge |
+
+This overrides `ticket_category` in both directions, in `regex_engine.process_tickets()` and again in `detect()`. The category is configured once per brokerage mailbox and describes the traffic it usually sends, not this message: a `Returns Customs Clearance` mailbox sends order holds too.
+
+On an `order` row the returns machinery is switched off end to end: `expand_first_returns_customs_clearance_bundle()` skips the franchigia bundle, `collapse_document_embedded_requested_data()` collapses `customs_description`/`importer_details` into `commercial_invoice` instead of the RPI, `pair_invoice_requested_data()` does not add the RPI back, and `apply_order_clearance_response_data()` drops `return_proforma_invoice` and `returned_items_confirmation`.
+
+`response_generator.answered_tracking_leg()` also stops flipping to the return leg on these rows. The flip exists because a carrier quoting one leg usually wants the other, but on a customs hold the carrier is asking for the export tracking of the parcel it is holding — the number it already quoted. Flipping there answered with a return label belonging to an unrelated return.
+
+What this was fixing: `RETURN_CATEGORY_RE` matches `(?:trk|tracking|awb|...)[\s\S]{0,60}(?:export|andata)`, so the single line `- Tracking export.` in the UPS Italy import checklist classified an ordinary order hold as a return. The ticket then received a generated RPI, a returned-items list, and the return tracking number of a return leg that had nothing to do with the held shipment.
+
+**Contradiction goes to a human.** When the quoted number is the shipment leg but the body also uses real return wording (`fattura di reso`, `reintroduzione in franchigia`, RPI/PRI, returned goods, RTS, proof of export), the two signals call for opposite document packages. `quoted_tracking_contradicts_return_wording()` detects this and `detect()` sets `force_human_intervention` with the reason recorded in `review_reasons`; no reply is drafted either way.
+
+**The LLM path follows the same rule.** `intent_detection._build_batch_payload()` sends `clearance_subject` and `clearance_subject_disputed` with every row, because the model cannot derive the leg from the text. `prompts/requested_data_extractor.md` ("Which Parcel Is Held at Customs"), `prompts/requested_data_taxonomy.md`, and `prompts/response_builder.md` state that `clearance_subject` outranks `ticket_category`, that export-tracking wording is not return wording, and that a disputed row returns `human_intervention_required`. `prompts/response_builder.md` carries the order-hold reply template ("UPS Order Customs Clearance First Request").
 
 ### EORI numbers are answered with the invoice
 
@@ -570,7 +593,7 @@ Additional response guardrails:
 
 - If the tracking number is not found in the ticket, the request is not analyzed by regex or LLM. Instead, a lightweight purely-informative check runs on the message text: if it contains no actionable data/action request language (e.g. a thank-you/status-only note), the ticket is submitted as `solved` with no public comment, the same way as `noreply@fedex.com` — `draft_response`/`final_response` are both set to a note explaining the ticket was solved without a response because the tracking number was not found and no data or action was requested. Otherwise, the row receives an internal human-intervention `draft_response` saying that the tracking number was not found, and no public `final_response` is generated.
 - Invoice/value/MRN/import-export discrepancies and requests for corrected return invoices or corrected values are routed to human intervention instead of sending a normal generated RPI/commercial-invoice reply — **except** on `request_number` `1`, where correction/discrepancy language is treated as noise and the reply is sent with the data found, same as the request_builder rule for `invoice_correction`/`corrected_invoice`/`value_confirmation`.
-- For UPS-style `Returns Customs Clearance` request number `1`, when regex/effective requested-data detection finds at least one of `export_tracking_number`, `return_proforma_invoice`, `ups_account_number`, or `returned_items_confirmation`, the response data is expanded to include all four. This ensures a partial first-request regex hit still prepares the complete export TRK + RPI + UPS code + returned-items package.
+- For UPS-style `Returns Customs Clearance` request number `1`, when the parcel held at customs is a return (see "Which parcel is held at customs") and regex/effective requested-data detection finds at least one of `export_tracking_number`, `return_proforma_invoice`, `ups_account_number`, or `returned_items_confirmation`, the response data is expanded to include all four. This ensures a partial first-request regex hit still prepares the complete export TRK + RPI + UPS code + returned-items package.
 - If the ticket request body contains `sdoganamento`, `export_tracking_number` is included in the response data so the draft and final public response mention the export tracking number.
 - If `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, the row is processed like any other row (it is no longer routed to human intervention). The only difference is the closing section of the public reply, which becomes `Sincerely,` + blank line + `Scarosso | Customer Care` (in Italian, `Cordiali saluti,` + blank line + `Scarosso | Customer Care`). It replaces the template's usual closing phrase and any signer line after it. See `apply_sc_closing()` in `response_generator.py`.
 ### Invoice requested together with the dichiarazione di libera esportazione
