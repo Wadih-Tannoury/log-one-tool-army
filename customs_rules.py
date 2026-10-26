@@ -1714,6 +1714,201 @@ def is_ups_uk_import_clearance_instructions_request(text: object) -> bool:
     return bool(UPS_UK_IMPORT_CLEARANCE_INSTRUCTIONS_RE.search(normalize_whitespace(text)))
 
 
+# ---------------------------------------------------------------------------
+# Which parcel is held at customs: the return, or the order
+# ---------------------------------------------------------------------------
+# A carrier brokerage desk sends the same checklist for two situations, and
+# the tracking number it quotes is what tells them apart:
+#
+#   * the quoted number is the RETURN label  -> a return is held at import.
+#     They want what releases a reintroduzione in franchigia: the export leg
+#     of the original order, the UPS account, the RPI and the returned-items
+#     list.
+#
+#   * the quoted number is the SHIPMENT label -> the customer's own order is
+#     held at import and cannot be delivered. They want what releases that
+#     parcel: the goods description, the account code, and the export
+#     tracking of that same parcel -- which is the number they already quoted.
+#     There is no return here, so no RPI and no returned-items list.
+#
+# Nothing else decides this. The wording is identical in both cases, and the
+# words "Tracking export" in the checklist are what used to send an order
+# hold down the returns path (RETURN_CATEGORY_RE matches them on their own):
+# the ticket then got a generated RPI, a returned-items list, and the return
+# tracking number of a return leg that had nothing to do with the request.
+#
+# The leg is resolved by extracted_tracking_number_kind(), which compares the
+# quoted number against bi.shipping_platform_shipments. When it cannot say --
+# the number resolved to neither leg, or to both -- the request is left to
+# the existing category/wording rules rather than guessed at.
+
+CLEARANCE_SUBJECT_RETURN = "return"
+CLEARANCE_SUBJECT_ORDER = "order"
+
+# Return wording. Only consulted when the quoted tracking number does not
+# resolve to a leg; it never overrides the leg itself. "Tracking export" is
+# deliberately absent: it names the forward leg and says nothing about
+# whether the held parcel is a return.
+RETURN_WORDING_RE = re.compile(
+    r"(?:"
+    r"\b(?:rpi|pri|rts)\b|"
+    r"return\s+proforma|return\s+invoice|returns?\s+clearance|"
+    r"return(?:ed|ing)?\s+(?:goods|items|merchandise|parcel|shipment|package)|"
+    r"return\s+to\s+(?:shipper|sender)|reverse\s+logistics|gb\s+returns?|"
+    r"proof\s+of\s+export|evidence\s+of\s+export|"
+    r"fattura\s+(?:di\s+)?reso|proforma\s+(?:di\s+)?reso|"
+    r"\bresi\b|\breso\b|spedizione\s+di\s+reso|"
+    r"reintroduzione\s+in\s+franchigia|rientro\s+(?:della\s+)?merce|"
+    r"merce\s+(?:resa|rientrat\w+|di\s+ritorno)|"
+    r"(?:merce|articoli|goods|items)[\s\S]{0,100}rientr|"
+    r"rientr[\s\S]{0,100}(?:merce|articoli|goods|items)"
+    r")",
+    re.IGNORECASE,
+)
+
+# "Tracking export" / "export AWB" and friends: the forward leg, discounted
+# before the wording fallback decides anything.
+EXPORT_TRACKING_PHRASE_RE = re.compile(
+    r"(?:"
+    r"(?:trk|tracking|awb|hawb|mawb|lettera\s+di\s+vettura)\s*"
+    r"(?:number|no\.?|n\.?|in|di|of)?\s*(?:di\s+|in\s+)?export|"
+    r"export\s*(?:trk|tracking|awb|hawb|mawb|lettera\s+di\s+vettura)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def has_explicit_return_context(text: object) -> bool:
+    """True when the message contains real return wording.
+
+    Ignores a bare "Tracking export" mention: asking for the export tracking
+    number of a held parcel says nothing about whether that parcel is a
+    return.
+    """
+
+    return bool(RETURN_WORDING_RE.search(normalize_whitespace(text)))
+
+
+def return_wording_without_export_tracking(text: object) -> bool:
+    """Wording-only fallback, used when the tracking leg is unresolved."""
+
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+    if RETURN_WORDING_RE.search(cleaned):
+        return True
+    return bool(RETURN_CATEGORY_RE.search(EXPORT_TRACKING_PHRASE_RE.sub(" ", cleaned)))
+
+
+def customs_clearance_subject(
+    text: object = "",
+    *,
+    extracted_tracking_number: object = "",
+    shipment_tracking_number: object = "",
+    return_tracking_number: object = "",
+) -> str:
+    """Which parcel the carrier is holding: the return, or the order.
+
+    Returns CLEARANCE_SUBJECT_RETURN, CLEARANCE_SUBJECT_ORDER, or "" when it
+    cannot be determined. The tracking number the carrier quoted decides it;
+    the wording is only a fallback for a number that resolved to neither leg.
+    """
+
+    kind = extracted_tracking_number_kind(
+        extracted_tracking_number,
+        shipment_tracking_number,
+        return_tracking_number,
+    )
+    if kind == "return":
+        return CLEARANCE_SUBJECT_RETURN
+    if kind == "shipment":
+        return CLEARANCE_SUBJECT_ORDER
+
+    if return_wording_without_export_tracking(text):
+        return CLEARANCE_SUBJECT_RETURN
+    return ""
+
+
+def is_order_customs_clearance_request(
+    text: object = "",
+    *,
+    extracted_tracking_number: object = "",
+    shipment_tracking_number: object = "",
+    return_tracking_number: object = "",
+) -> bool:
+    """True when the held parcel is the customer's order, not a return."""
+
+    return customs_clearance_subject(
+        text,
+        extracted_tracking_number=extracted_tracking_number,
+        shipment_tracking_number=shipment_tracking_number,
+        return_tracking_number=return_tracking_number,
+    ) == CLEARANCE_SUBJECT_ORDER
+
+
+def is_return_customs_clearance_request(
+    text: object = "",
+    *,
+    extracted_tracking_number: object = "",
+    shipment_tracking_number: object = "",
+    return_tracking_number: object = "",
+) -> bool:
+    """True when the held parcel is a return coming back to us."""
+
+    return customs_clearance_subject(
+        text,
+        extracted_tracking_number=extracted_tracking_number,
+        shipment_tracking_number=shipment_tracking_number,
+        return_tracking_number=return_tracking_number,
+    ) == CLEARANCE_SUBJECT_RETURN
+
+
+def quoted_tracking_contradicts_return_wording(
+    text: object = "",
+    *,
+    extracted_tracking_number: object = "",
+    shipment_tracking_number: object = "",
+    return_tracking_number: object = "",
+) -> bool:
+    """True when the quoted leg says order but the body talks about a return.
+
+    The leg still wins -- it is the harder fact -- but the disagreement is
+    worth recording on the row, because it is the shape a genuinely
+    mislabelled ticket would take.
+    """
+
+    if not is_order_customs_clearance_request(
+        text,
+        extracted_tracking_number=extracted_tracking_number,
+        shipment_tracking_number=shipment_tracking_number,
+        return_tracking_number=return_tracking_number,
+    ):
+        return False
+    return has_explicit_return_context(text)
+
+
+# Response data that can only belong to a return.
+RETURN_ONLY_RESPONSE_DATA = {
+    "return_proforma_invoice",
+    "returned_items_confirmation",
+}
+
+
+def apply_order_clearance_response_data(requested_data: object) -> List[str]:
+    """Strip return-only response data from an order clearance request.
+
+    A requested return proforma invoice is replaced by the commercial invoice
+    of the same shipment, which is the document that actually clears it.
+    """
+
+    values = normalize_requested_data(requested_data)
+    document_requested = "return_proforma_invoice" in values
+    result = [value for value in values if value not in RETURN_ONLY_RESPONSE_DATA]
+    if document_requested and "commercial_invoice" not in result:
+        result.append("commercial_invoice")
+    return result
+
+
 def is_explicit_export_tracking_request(text: object) -> bool:
     """True when tracking/AWB wording is an actual export-tracking request."""
     return bool(EXPLICIT_EXPORT_TRACKING_REQUEST_RE.search(normalize_whitespace(text)))
@@ -1826,7 +2021,14 @@ def classify_ticket_category_from_content(
     if re.search(r"ups export department|compliance for export|export this shipment", text, re.IGNORECASE):
         return ORDER_CUSTOMS_CLEARANCE
 
-    if RETURN_CATEGORY_RE.search(text):
+    # This runs at fetch time, before the tracking number has been matched
+    # against bi.shipping_platform_shipments, so the leg is not known yet and
+    # only the wording is available. A bare "Tracking export" in a brokerage
+    # checklist is not return wording -- it names the forward leg -- so it no
+    # longer counts on its own. The leg-based decision in
+    # customs_clearance_subject() overrides whatever is chosen here as soon
+    # as the shipment lookup has run.
+    if return_wording_without_export_tracking(text):
         return RETURNS_CUSTOMS_CLEARANCE
 
     pending_match = bool(PENDING_ORDER_RELEASE_CATEGORY_RE.search(text))
@@ -1876,6 +2078,7 @@ def collapse_document_embedded_requested_data(
     request_number: object = 1,
     requester_email: object = "",
     request_text: object = "",
+    order_customs_clearance: bool = False,
 ) -> List[str]:
     """
     Remove deprecated standalone data elements that should be fulfilled by a
@@ -1907,7 +2110,12 @@ def collapse_document_embedded_requested_data(
     first_request_rpi_response_fields_found = False
     first_request_shipment_instructions_found = False
     first_request = normalize_request_number(request_number) == 1
-    first_returns = is_first_returns_customs_request(ticket_category, request_number)
+    # A forward (outbound) shipment held at import is never a returns flow,
+    # whatever the ticket_category says: the RPI package does not apply.
+    first_returns = (
+        is_first_returns_customs_request(ticket_category, request_number)
+        and not order_customs_clearance
+    )
 
     for value in values:
         if value == "declaration_of_intent":
@@ -1953,10 +2161,18 @@ def collapse_document_embedded_requested_data(
             if value not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
         ]
 
-    if (
-        rpi_document_fields_found or first_request_rpi_response_fields_found
-    ) and "return_proforma_invoice" not in result:
-        result.append("return_proforma_invoice")
+    if rpi_document_fields_found or first_request_rpi_response_fields_found:
+        # customs_description / importer_details / value wording is carried by
+        # the RPI on a return and by the commercial invoice on a forward
+        # shipment. Picking the RPI here is what used to attach a return
+        # proforma to an ordinary import hold.
+        collapsed_document = (
+            "commercial_invoice"
+            if order_customs_clearance
+            else "return_proforma_invoice"
+        )
+        if collapsed_document not in result:
+            result.append(collapsed_document)
 
     if first_request_shipment_instructions_found:
         for value in ("ups_account_number", "export_tracking_number"):
@@ -1964,7 +2180,9 @@ def collapse_document_embedded_requested_data(
                 result.append(value)
 
     if embedded_fields_found:
-        if first_returns or has_return_proforma_context(text):
+        if order_customs_clearance:
+            target_document = "commercial_invoice"
+        elif first_returns or has_return_proforma_context(text):
             target_document = "return_proforma_invoice"
         else:
             target_document = "commercial_invoice"
@@ -1984,7 +2202,9 @@ def collapse_document_embedded_requested_data(
             or field_phrase_found
         )
     ):
-        if first_request_rpi_response_fields_found:
+        if order_customs_clearance:
+            result = [value for value in result if value != "return_proforma_invoice"]
+        elif first_request_rpi_response_fields_found:
             result = [value for value in result if value != "commercial_invoice"]
         elif first_returns or has_return_proforma_context(text):
             result = [value for value in result if value != "commercial_invoice"]
@@ -2013,6 +2233,7 @@ def expand_first_returns_customs_clearance_bundle(
     request_number: object = 1,
     requester_email: object = "",
     trigger_requested_data: object = None,
+    order_customs_clearance: bool = False,
 ) -> List[str]:
     """Expand first UPS Returns Customs Clearance regex hits to the full bundle.
 
@@ -2031,6 +2252,12 @@ def expand_first_returns_customs_clearance_bundle(
     triggers = _normalize_returns_first_request_bundle_values(
         trigger_requested_data if trigger_requested_data is not None else requested_data
     )
+
+    # The bundle is the reintroduzione-in-franchigia package. A forward
+    # shipment held at import needs none of it, and expanding into it is what
+    # turned an ordinary unblock request into a return.
+    if order_customs_clearance:
+        return values
 
     if not is_first_returns_customs_request(ticket_category, request_number):
         return values
@@ -2695,12 +2922,21 @@ def align_invoice_requested_data_with_tracking_context(
 INVOICE_DOCUMENT_PAIR = ("commercial_invoice", "return_proforma_invoice")
 
 
-def pair_invoice_requested_data(requested_data: object) -> List[str]:
+def pair_invoice_requested_data(
+    requested_data: object,
+    order_customs_clearance: bool = False,
+) -> List[str]:
     """Return requested_data with invoice and RPI always present together."""
 
     values = [str(value) for value in normalize_requested_data(requested_data)]
     if not any(value in INVOICE_DOCUMENT_PAIR for value in values):
         return values
+
+    # The pair exists because a return has two legs and carriers need both
+    # documents. A forward shipment has one leg and no return proforma, so
+    # pairing here would put the RPI back after it was correctly removed.
+    if order_customs_clearance:
+        return apply_order_clearance_response_data(values)
 
     for key in INVOICE_DOCUMENT_PAIR:
         if key not in values:
