@@ -40,6 +40,10 @@ from order_reference_resolver import (
 from customs_rules import (
     BLOCKED_ORDER_PREFIX_SKIPPED,
     HUMAN_INTERVENTION_REQUIRED,
+    ORDER_CUSTOMS_CLEARANCE,
+    RETURNS_CUSTOMS_CLEARANCE,
+    CLEARANCE_SUBJECT_ORDER,
+    CLEARANCE_SUBJECT_RETURN,
     PURELY_INFORMATIVE_SOLVED,
     NOREPLY_AUTOREPLY_FIRST_REQUEST_SOLVED,
     align_invoice_requested_data_with_tracking_context,
@@ -57,6 +61,9 @@ from customs_rules import (
     is_delivery_address_phone_unreachable_request,
     is_explicit_export_tracking_request,
     is_explicit_ups_account_request,
+    customs_clearance_subject,
+    quoted_tracking_contradicts_return_wording,
+    apply_order_clearance_response_data,
     is_informative_status_update_only,
     is_explicit_invoice_request,
     is_missing_invoice_request,
@@ -230,6 +237,22 @@ class RegexEngine:
                 request_body=request_text,
                 requester_email=ticket.get("requester_email", ""),
             )
+            # The configured category of a brokerage mailbox describes the
+            # traffic it usually sends, not this particular message. The
+            # tracking number the carrier quoted is the harder fact, and it
+            # says which parcel is actually held at customs: the return, or
+            # the customer's order. Whichever it is, it overrides both the
+            # configured category and the wording-based inference above.
+            clearance_subject = customs_clearance_subject(
+                f"{ticket.get('subject', '')}\n{request_text}",
+                extracted_tracking_number=ticket.get("extracted_tracking_number"),
+                shipment_tracking_number=ticket.get("shipment_tracking_number"),
+                return_tracking_number=ticket.get("return_tracking_number"),
+            )
+            if clearance_subject == CLEARANCE_SUBJECT_ORDER:
+                ticket_category = ORDER_CUSTOMS_CLEARANCE
+            elif clearance_subject == CLEARANCE_SUBJECT_RETURN:
+                ticket_category = RETURNS_CUSTOMS_CLEARANCE
             result = self.detect(
                 request_text,
                 requester_email=ticket["requester_email"],
@@ -392,6 +415,43 @@ class RegexEngine:
         tracking_not_found = str(
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
+
+        # Which parcel is held at customs decides everything below. The
+        # carrier quotes the parcel it is holding:
+        #
+        #   return label  -> a return is stuck at import. Answer with the
+        #                    reintroduzione-in-franchigia package: export
+        #                    leg, UPS account, RPI, returned items.
+        #   shipment label -> the customer's order is stuck at import and
+        #                    cannot be delivered. Answer with what releases
+        #                    it: goods description, account code and that
+        #                    parcel's own export tracking. No RPI, no
+        #                    returned-items list.
+        #
+        # This overrides ticket_category, which is configured per mailbox and
+        # cannot know which of the two a given message is.
+        clearance_subject = customs_clearance_subject(
+            cleaned_text or raw_text,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
+        )
+        order_customs_clearance = clearance_subject == CLEARANCE_SUBJECT_ORDER
+        if order_customs_clearance:
+            ticket_category = ORDER_CUSTOMS_CLEARANCE
+        elif clearance_subject == CLEARANCE_SUBJECT_RETURN:
+            ticket_category = RETURNS_CUSTOMS_CLEARANCE
+
+        # The quoted leg wins, but a body that talks about a return while
+        # quoting the shipment label is worth flagging rather than silently
+        # resolving: that disagreement is the shape a genuinely mislabelled
+        # ticket would take.
+        clearance_subject_disputed = quoted_tracking_contradicts_return_wording(
+            cleaned_text or raw_text,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
+        )
 
         # An order resolved from an order reference (ticket text or PDF
         # attachment) is just as usable as one resolved from the tracking
@@ -1018,6 +1078,7 @@ class RegexEngine:
             request_number=request_number,
             requester_email=requester_email,
             request_text=cleaned_text,
+            order_customs_clearance=order_customs_clearance,
         )
         regex_requested_data = collapse_document_embedded_requested_data(
             self._requested_data_from_types(real_request_types),
@@ -1025,6 +1086,7 @@ class RegexEngine:
             request_number=request_number,
             requester_email=requester_email,
             request_text=cleaned_text,
+            order_customs_clearance=order_customs_clearance,
         )
         requested_data = filter_libera_esportazione_response_data(
             requested_data,
@@ -1073,6 +1135,7 @@ class RegexEngine:
                 request_number=request_number,
                 requester_email=requester_email,
                 trigger_requested_data=requested_data,
+                order_customs_clearance=order_customs_clearance,
             )
             requested_data = expand_first_returns_customs_clearance_bundle(
                 requested_data,
@@ -1080,6 +1143,15 @@ class RegexEngine:
                 request_number=request_number,
                 requester_email=requester_email,
                 trigger_requested_data=requested_data,
+                order_customs_clearance=order_customs_clearance,
+            )
+
+        if order_customs_clearance:
+            requested_data = apply_order_clearance_response_data(
+                requested_data
+            )
+            regex_requested_data = apply_order_clearance_response_data(
+                regex_requested_data
             )
         requested_data = align_invoice_requested_data_with_tracking_context(
             requested_data,
@@ -1113,6 +1185,24 @@ class RegexEngine:
                 "mismatch) rather than asking for the standard documentation, "
                 "so the UPS first-request bundle was not applied and the "
                 "customs procedure has to be confirmed by a human."
+            )
+
+        if order_customs_clearance:
+            audit_notes.append(
+                "The quoted tracking number is the shipment leg, so the "
+                "parcel held at customs is the customer's order, not a "
+                "return. Answered with what releases it -- no RPI, no "
+                "returned-items list -- and the export tracking reported is "
+                "that same shipment tracking number."
+            )
+
+        if clearance_subject_disputed:
+            force_human = True
+            review_reasons.append(
+                "The quoted tracking number is the shipment leg, which makes "
+                "this an order held at customs, but the message also uses "
+                "return wording. The two readings need a human to settle "
+                "before either package is sent."
             )
 
         if suppressed_types:
