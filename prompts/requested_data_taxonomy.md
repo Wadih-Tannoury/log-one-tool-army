@@ -7,13 +7,13 @@ The system should classify requests into requested data elements, not a single i
 | Key | Meaning |
 |---|---|
 | `commercial_invoice` | Commercial invoice or invoice copy. Also covers tax information, country of origin, and product-description fields when those are requested in an invoice context. |
-| `return_proforma_invoice` | Return proforma invoice / RPI / PRI / reintroduction-in-franchigia documentation. Also covers customs description, importer details, tax information, country of origin, product-description fields, phone, email, and address when those are part of a Returns Customs Clearance RPI package. |
+| `return_proforma_invoice` | Return proforma invoice / RPI / PRI / reintroduction-in-franchigia documentation. Also covers customs description, importer details, tax information, country of origin, product-description fields, phone, email, and address when those are part of a Returns Customs Clearance RPI package. Only valid when the parcel held at customs is a return (`clearance_subject` is `return`); when it is `order`, those same fields belong to `commercial_invoice`. |
 | `corrected_invoice` | Corrected or updated invoice |
-| `export_tracking_number` | Export tracking number / TRK export / AWB export |
+| `export_tracking_number` | Export tracking number / TRK export / AWB export. The forward leg of any shipment, return or order alike: this wording is never on its own evidence that the held parcel is a return. On an order hold the value reported is the held shipment's own tracking number. |
 | `shipping_label` | Return shipping label PDF. Never detected directly from the request text — the response generator automatically appends this key whenever `export_tracking_number` is included in a response, since providing the tracking number implies the customer needs the printable return label too. Generated from the labels API's ZPL data and attached as a PDF (see response_builder.md). If the label PDF cannot be generated/retrieved, `export_tracking_number` must still be sent in the response — a missing label is never a reason to withhold the tracking number or to force human intervention; the response generator simply omits the `shipping_label` line/attachment in that case. |
 | `ups_account_number` | UPS account / abbonamento UPS |
 | `value_confirmation` | Declared value / value confirmation |
-| `returned_items_confirmation` | Which items are returning / partial or full return |
+| `returned_items_confirmation` | Which items are returning / partial or full return. Never valid when `clearance_subject` is `order`. |
 | `dichiarazione_di_libera_esportazione` | Dichiarazione di libera esportazione / dichiarazione di intento / declaration of intent. This declaration is not answered automatically by itself and should not be converted into a commercial invoice. |
 | `eori_number` | EORI number. Printed on the invoice: the reply attaches the invoice and says the number is stated in it, rather than sending the number as a separate line. |
 | `power_of_attorney` | POA / power of attorney / authorization delegate. Do not use for ATR-certificate mandate/form requests. |
