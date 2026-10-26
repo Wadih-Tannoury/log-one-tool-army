@@ -93,6 +93,11 @@ from customs_rules import (
     first_available_value,
     has_libera_esportazione_regex_type,
     is_atr_certificate_mandate_request,
+    CLEARANCE_SUBJECT_ORDER,
+    CLEARANCE_SUBJECT_RETURN,
+    customs_clearance_subject,
+    quoted_tracking_contradicts_return_wording,
+    apply_order_clearance_response_data,
     is_customer_refused_return_request,
     is_invoice_with_libera_esportazione_request,
     is_missing_extracted_tracking_number,
@@ -632,7 +637,19 @@ def answered_tracking_leg(row):
     The flip only happens when the ticket's number is positively identified
     as the export leg. An unrecognized or ambiguous number keeps the
     historic behaviour and is answered with the export tracking number.
+
+    A customs hold is the exception, and it is the common case. When the
+    quoted number is the shipment leg, the parcel on hold is the customer's
+    own order: the carrier is asking for that parcel's export tracking so it
+    can release it, which is the number it already quoted. Flipping to the
+    return leg there answers with a return label that has nothing to do with
+    the shipment being held. The flip is kept only when the body explicitly
+    asks for return-side information, which is the one reading under which
+    the quoted export number really is "the other leg".
     """
+
+    if row_is_order_customs_clearance(row) and not row_quoted_tracking_contradicts_return_wording(row):
+        return "export"
 
     kind = extracted_tracking_number_kind(
         row.get("extracted_tracking_number"),
@@ -1395,6 +1412,65 @@ def _request_type_sources_for_tracking_alignment(row):
     return values
 
 
+def _row_clearance_tracking(row):
+    """The two tracking legs of the row, shipments table before GET_FULL_ORDER."""
+
+    return (
+        first_available_value(
+            row.get("shipment_tracking_number"),
+            row.get(FULL_ORDER_EXPORT_TRACKING_COLUMN),
+            default="",
+        ),
+        first_available_value(
+            row.get("return_tracking_number"),
+            row.get(FULL_ORDER_RETURN_TRACKING_COLUMN),
+            default="",
+        ),
+    )
+
+
+def row_clearance_subject(row):
+    """Which parcel this row's carrier is holding: the return, or the order."""
+
+    shipment_tracking, return_tracking = _row_clearance_tracking(row)
+    return customs_clearance_subject(
+        row_request_text(row),
+        extracted_tracking_number=row.get("extracted_tracking_number"),
+        shipment_tracking_number=shipment_tracking,
+        return_tracking_number=return_tracking,
+    )
+
+
+def row_is_order_customs_clearance(row):
+    """True when the parcel held at customs is the order, not a return.
+
+    The carrier quoted the shipment's own tracking number, so the parcel on
+    hold is the one going to the customer. There is no return leg in play:
+    no RPI, no returned-items list, and the export tracking to report is
+    that same shipment tracking number.
+    """
+
+    return row_clearance_subject(row) == CLEARANCE_SUBJECT_ORDER
+
+
+def row_is_return_customs_clearance(row):
+    """True when the parcel held at customs is a return coming back to us."""
+
+    return row_clearance_subject(row) == CLEARANCE_SUBJECT_RETURN
+
+
+def row_quoted_tracking_contradicts_return_wording(row):
+    """True when the quoted leg says order but the body talks about a return."""
+
+    shipment_tracking, return_tracking = _row_clearance_tracking(row)
+    return quoted_tracking_contradicts_return_wording(
+        row_request_text(row),
+        extracted_tracking_number=row.get("extracted_tracking_number"),
+        shipment_tracking_number=shipment_tracking,
+        return_tracking_number=return_tracking,
+    )
+
+
 def _apply_response_requested_data_overrides(row, requested_data):
     values = filter_libera_esportazione_response_data(
         requested_data,
@@ -1409,6 +1485,8 @@ def _apply_response_requested_data_overrides(row, requested_data):
     )
     if is_atr_certificate_mandate_request(row_request_text(row)):
         values = [value for value in values if value != "power_of_attorney"]
+    if row_is_order_customs_clearance(row):
+        values = apply_order_clearance_response_data(values)
     return values
 
 
@@ -1428,9 +1506,18 @@ def has_embedded_rpi_contact_fields(row):
 def collapse_embedded_document_fields(row, requested_data):
     """Collapse old standalone fields into invoice/RPI document requests."""
     text = row_request_text(row)
-    first_returns = is_first_returns_customs_request(
-        row.get("ticket_category"),
-        row.get("request_number", 1),
+    # An import hold on an outbound order has no return leg, so the fields
+    # below collapse into its commercial invoice, never into an RPI.
+    order_customs_clearance = row_is_order_customs_clearance(row)
+    first_returns = (
+        is_first_returns_customs_request(
+            row.get("ticket_category"),
+            row.get("request_number", 1),
+        )
+        and not order_customs_clearance
+    )
+    collapsed_document = (
+        "commercial_invoice" if order_customs_clearance else "return_proforma_invoice"
     )
     first_request = normalize_request_number(row.get("request_number", 1)) == 1
 
@@ -1440,12 +1527,12 @@ def collapse_embedded_document_fields(row, requested_data):
 
     for data_key in requested_data:
         if data_key in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
-            if "return_proforma_invoice" not in result:
-                result.append("return_proforma_invoice")
+            if collapsed_document not in result:
+                result.append(collapsed_document)
             continue
         if first_request and data_key in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
-            if "return_proforma_invoice" not in result:
-                result.append("return_proforma_invoice")
+            if collapsed_document not in result:
+                result.append(collapsed_document)
             continue
         if first_request and data_key in FIRST_REQUEST_IGNORED_REQUESTED_DATA:
             continue
@@ -1469,7 +1556,8 @@ def collapse_embedded_document_fields(row, requested_data):
     if embedded_document_fields_found:
         target = (
             "return_proforma_invoice"
-            if first_returns or has_return_proforma_context(text)
+            if not order_customs_clearance
+            and (first_returns or has_return_proforma_context(text))
             else "commercial_invoice"
         )
         if target not in result:
@@ -1514,12 +1602,14 @@ def requested_data_for_response(row):
         return []
     requested_data = strip_libera_esportazione_requested_data(requested_data)
     requested_data = collapse_embedded_document_fields(row, requested_data)
+    order_customs_clearance = row_is_order_customs_clearance(row)
     requested_data = expand_first_returns_customs_clearance_bundle(
         requested_data,
         ticket_category=row.get("ticket_category"),
         request_number=row.get("request_number", 1),
         requester_email=row.get("requester_email"),
         trigger_requested_data=regex_requested_data_sources(row) or requested_data,
+        order_customs_clearance=order_customs_clearance,
     )
     requested_data = _apply_response_requested_data_overrides(row, requested_data)
     requested_data = [
@@ -1529,8 +1619,12 @@ def requested_data_for_response(row):
     ]
 
     # Invoice and RPI are always sent together, whichever of the two the
-    # request resolved to.
-    requested_data = pair_invoice_requested_data(requested_data)
+    # request resolved to -- except on a forward shipment clearance, which
+    # has no return leg and therefore no return proforma invoice.
+    requested_data = pair_invoice_requested_data(
+        requested_data,
+        order_customs_clearance=order_customs_clearance,
+    )
 
     if (
         not libera_regex_detected
