@@ -193,23 +193,30 @@ DOCUMENT_PUBLIC_BASE_URL = os.getenv("DOCUMENT_PUBLIC_BASE_URL", "").strip().rst
 
 # --- Shipping label (ZPL -> PDF) configuration -----------------------------
 #
-# The labels endpoint is a Logic App request trigger (see
-# Labels_triggering_for_DGEUTST0001.py for a batch-trigger example against the
-# same workflow). Given a shipment_order_number it returns a JSON payload with
-# one "shipment" block per label (outbound + return); each block carries an
-# isReturn flag and a base64-or-raw ZPL string in labelData.
+# Labels come from the TLG integrations API, not from the old Logic App
+# request trigger. Given a shipment order number the documents endpoint
+# returns one JSON object per shipment with a labelDocuments[] list; each
+# entry states its labelType ("SHPLBL" = outbound, "RETLBL" = return) and
+# carries either a base64 ZPL string in labelData (printType "ZPL") or a URL
+# to a hosted PDF in link (printType "PDF").
+#
+# The endpoint is protected by OAuth2 client credentials minted at the token
+# endpoint below, with the client id/secret supplied as a JSON object in the
+# GET_LABELS_API_CREDS secret:
+#     {"clientId": "...", "clientSecret": "..."}
 SHIPPING_LABELS_API_URL = os.getenv("SHIPPING_LABELS_API_URL") or (
-    "https://prod-09.northeurope.logic.azure.com/workflows/"
-    "8fca928224de4819aa279973e08f9008/"
-    "triggers/request/paths/invoke"
+    "https://integrations.thelevelgroup.com/logistics/v1/shipments/documents"
 )
-SHIPPING_LABELS_API_PARAMS = {
-    "api-version": os.getenv("SHIPPING_LABELS_API_VERSION", "2016-10-01"),
-    "sp": os.getenv("SHIPPING_LABELS_API_SP", "/triggers/request/run"),
-    "sv": os.getenv("SHIPPING_LABELS_API_SV", "1.0"),
-    "sig": os.getenv("SHIPPING_LABELS_API_SIG")
-    or "5Ay_LV4SS9h3gw9zCfftJ0LabeCnfuig7BgkH9fcAU4",
-}
+SHIPPING_LABELS_API_TOKEN_URL = os.getenv("SHIPPING_LABELS_API_TOKEN_URL") or (
+    "https://integrations.thelevelgroup.com/logistics/v1/oauth2/token"
+)
+SHIPPING_LABELS_CREDENTIALS_ENV = "GET_LABELS_API_CREDS"
+# auto | get | post. "auto" probes the request shapes below once per process
+# and then reuses whichever one the API accepted.
+SHIPPING_LABELS_API_METHOD = os.getenv("SHIPPING_LABELS_API_METHOD", "auto").strip().lower()
+# Optional pin for the request field carrying the shipment order number
+# (shipmentOrderNumber / orderNumber). Empty means "probe both".
+SHIPPING_LABELS_API_ORDER_FIELD = os.getenv("SHIPPING_LABELS_API_ORDER_FIELD", "").strip()
 SHIPPING_LABELS_API_TIMEOUT_SECONDS = int(
     os.getenv("SHIPPING_LABELS_API_TIMEOUT_SECONDS", "30")
 )
@@ -1822,8 +1829,9 @@ def _classified_tracking_numbers(
     The shippingLabels[] list and its labelType decide this whenever the
     payload has one. Only a payload without that list falls back to the
     field-name heuristic, which is also why an ``isReturn`` flag is never
-    consulted: its polarity differs between GET_FULL_ORDER and the labels
-    Logic App (see extract_return_label_data).
+    consulted: ``labelType`` is the authoritative marker on both sides, in
+    GET_FULL_ORDER's shippingLabels[] and in the labels API's
+    labelDocuments[] (see extract_return_label_data).
     """
 
     buckets: dict[str, list[str]] = {"export": [], "return": [], "unlabeled": []}
@@ -4146,18 +4154,176 @@ def generate_power_of_attorney(row: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ShippingLabelsCredentials:
+    """Client credentials for the integrations labels API."""
+
+    client_id: str
+    client_secret: str
+
+    @classmethod
+    def from_environment(cls) -> "ShippingLabelsCredentials":
+        raw_credentials = os.getenv(SHIPPING_LABELS_CREDENTIALS_ENV, "").strip()
+        if not raw_credentials:
+            raise DocumentGenerationError(
+                f"Missing {SHIPPING_LABELS_CREDENTIALS_ENV}; the labels API cannot be called"
+            )
+
+        try:
+            payload = json.loads(raw_credentials)
+        except json.JSONDecodeError as exc:
+            raise DocumentGenerationError(
+                f"{SHIPPING_LABELS_CREDENTIALS_ENV} must be a JSON object with "
+                "clientId and clientSecret"
+            ) from exc
+
+        if not isinstance(payload, Mapping):
+            raise DocumentGenerationError(
+                f"{SHIPPING_LABELS_CREDENTIALS_ENV} must be a JSON object with "
+                "clientId and clientSecret"
+            )
+
+        # The secret is documented as {"clientId": ..., "clientSecret": ...};
+        # snake_case is accepted too so the same value can be reused with the
+        # GET_FULL_ORDER-style naming without re-encoding it.
+        client_id = str(payload.get("clientId") or payload.get("client_id") or "").strip()
+        client_secret = str(
+            payload.get("clientSecret") or payload.get("client_secret") or ""
+        ).strip()
+        if not client_id or not client_secret:
+            raise DocumentGenerationError(
+                f"{SHIPPING_LABELS_CREDENTIALS_ENV} must contain non-empty "
+                "clientId and clientSecret"
+            )
+
+        return cls(client_id=client_id, client_secret=client_secret)
+
+
+# The access token is minted once per process and reused: every row on a run
+# hits the same endpoint, and the token endpoint rate-limits per client.
+_shipping_labels_token_lock = threading.Lock()
+_shipping_labels_token: str | None = None
+# Which request shape the documents endpoint accepted, cached after the first
+# successful call so later shipments go straight to it.
+_shipping_labels_request_strategy: tuple[str, str] | None = None
+
+
+def _shipping_labels_access_token(*, refresh: bool = False) -> str:
+    """Return a bearer token for the labels API, minting it on first use."""
+
+    global _shipping_labels_token
+
+    if _shipping_labels_token and not refresh:
+        return _shipping_labels_token
+
+    with _shipping_labels_token_lock:
+        if _shipping_labels_token and not refresh:
+            return _shipping_labels_token
+
+        credentials = ShippingLabelsCredentials.from_environment()
+
+        # The token endpoint is probed with the two client-credentials shapes
+        # it may expect: a JSON body using the same camelCase field names as
+        # the stored secret, then the standard form-encoded OAuth2 grant.
+        attempts = (
+            {
+                "json": {
+                    "clientId": credentials.client_id,
+                    "clientSecret": credentials.client_secret,
+                    "grantType": "client_credentials",
+                }
+            },
+            {
+                "data": {
+                    "grant_type": "client_credentials",
+                    "client_id": credentials.client_id,
+                    "client_secret": credentials.client_secret,
+                }
+            },
+        )
+
+        last_error: str = ""
+        for attempt in attempts:
+            try:
+                response = requests.post(
+                    SHIPPING_LABELS_API_TOKEN_URL,
+                    headers={"Accept": "application/json"},
+                    timeout=SHIPPING_LABELS_API_TIMEOUT_SECONDS,
+                    **attempt,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                continue
+
+            if response.status_code >= 400:
+                last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                last_error = "token response was not JSON"
+                continue
+
+            token = _access_token_from_payload(payload)
+            if token:
+                _shipping_labels_token = token
+                return token
+
+            last_error = "token response did not contain an access token"
+
+        raise DocumentGenerationError(
+            f"Could not obtain a labels API access token from "
+            f"{SHIPPING_LABELS_API_TOKEN_URL} ({last_error})"
+        )
+
+
+def _access_token_from_payload(payload: object) -> str:
+    """Pull the bearer token out of a token-endpoint response."""
+
+    if not isinstance(payload, Mapping):
+        return ""
+
+    for key in ("access_token", "accessToken", "token", "id_token"):
+        token = str(payload.get(key) or "").strip()
+        if token:
+            return token
+
+    nested = payload.get("data")
+    if isinstance(nested, Mapping):
+        return _access_token_from_payload(nested)
+    return ""
+
+
+def _shipping_labels_request_strategies() -> list[tuple[str, str]]:
+    """Return (method, order-number field) candidates for the documents call."""
+
+    if SHIPPING_LABELS_API_ORDER_FIELD:
+        fields = [SHIPPING_LABELS_API_ORDER_FIELD]
+    else:
+        fields = ["shipmentOrderNumber", "orderNumber"]
+
+    if SHIPPING_LABELS_API_METHOD in {"get", "post"}:
+        methods = [SHIPPING_LABELS_API_METHOD.upper()]
+    else:
+        methods = ["GET", "POST"]
+
+    return [(method, field) for method in methods for field in fields]
+
+
 def fetch_shipment_labels(
     shipment_order_number: str,
     *,
-    weight: float | None = None,
-    packages_number: int = 1,
     timeout: int | None = None,
 ) -> dict:
-    """POST to the labels Logic App and return the parsed JSON response.
+    """Call the integrations labels API and return the parsed JSON response.
 
-    Mirrors the request shape used in Labels_triggering_for_DGEUTST0001.py
-    (same workflow, orderNumber/weight/packagesNumber body).
+    Authenticates with an OAuth2 bearer token minted from
+    GET_LABELS_API_CREDS, then asks the documents endpoint for the shipment's
+    labelDocuments[] (outbound + return).
     """
+
+    global _shipping_labels_request_strategy
 
     order_number = str(shipment_order_number or "").strip()
     if not order_number:
@@ -4166,90 +4332,138 @@ def fetch_shipment_labels(
     # The labels API expects the shipmentOrderNumber shape used inside
     # GET_FULL_ORDER payloads (e.g. DG-EUA01667336), not the GET_FULL_ORDER
     # *order number* URL shape (e.g. DG-EU-01667336). Passing the order-number
-    # shape here caused the labels API to return a payload with no matching
-    # shipment block, so no labelData could ever be found.
+    # shape here returns a payload with no matching shipment, so no labelData
+    # could ever be found.
     shipment_order_number_for_labels_api = shipment_order_number_for_shipment_block_lookup(
         order_number
     )
 
-    body = {
-        "orderNumber": shipment_order_number_for_labels_api,
-        "weight": weight,
-        "packagesNumber": packages_number,
-    }
+    request_timeout = timeout or SHIPPING_LABELS_API_TIMEOUT_SECONDS
+    token = _shipping_labels_access_token()
 
-    response = requests.post(
-        SHIPPING_LABELS_API_URL,
-        params=SHIPPING_LABELS_API_PARAMS,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        json=body,
-        timeout=timeout or SHIPPING_LABELS_API_TIMEOUT_SECONDS,
+    if _shipping_labels_request_strategy is not None:
+        strategies = [_shipping_labels_request_strategy]
+    else:
+        strategies = _shipping_labels_request_strategies()
+
+    last_error = ""
+    for method, field in strategies:
+        payload_arguments: dict[str, Any] = (
+            {"params": {field: shipment_order_number_for_labels_api}}
+            if method == "GET"
+            else {"json": {field: shipment_order_number_for_labels_api}}
+        )
+
+        response = requests.request(
+            method,
+            SHIPPING_LABELS_API_URL,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=request_timeout,
+            **payload_arguments,
+        )
+
+        # An expired cached token looks like a 401/403 on an otherwise valid
+        # request: mint a fresh one once and replay the same shape.
+        if response.status_code in {401, 403}:
+            token = _shipping_labels_access_token(refresh=True)
+            response = requests.request(
+                method,
+                SHIPPING_LABELS_API_URL,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=request_timeout,
+                **payload_arguments,
+            )
+
+        # Only shape-rejection statuses fall through to the next candidate;
+        # anything else is a real failure and is raised as-is.
+        if response.status_code in {400, 404, 405, 415, 422} and len(strategies) > 1:
+            last_error = f"{method} {field} -> HTTP {response.status_code}"
+            continue
+
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise DocumentGenerationError("Labels API response was not a JSON object")
+
+        _shipping_labels_request_strategy = (method, field)
+        return payload
+
+    raise DocumentGenerationError(
+        f"Labels API rejected every request shape for {order_number} ({last_error})"
     )
-    response.raise_for_status()
-    return response.json()
 
 
-def _label_shipment_blocks(payload: dict) -> list[dict]:
-    """Return the list of shipment label blocks from a labels API payload.
+LABEL_DOCUMENT_KEYS = ("labelDocuments", "label_documents", "labels")
+RETURN_LABEL_TYPES = {"RETLBL", "RETURN", "RETURNLABEL", "RETURN_LABEL"}
 
-    The real response shape is:
-        {"success": true, "data": [{"shipment": {...}, ...}, ...], "error": null}
 
-    i.e. a top-level "data" list where each item wraps its label block under
-    "shipment" (one item per parcel/leg: outbound + return). The previous
-    implementation looked for a top-level "shipment"/"shipments" key, which
-    doesn't exist in this shape, so no block was ever found.
+def _label_documents(payload: dict) -> list[dict]:
+    """Return the labelDocuments[] entries of a labels API payload.
+
+    The response is a single shipment object carrying labelDocuments[], one
+    entry per leg (SHPLBL outbound, RETLBL return). A payload wrapped in a
+    "data" object/list is unwrapped first, so a future envelope around the
+    same object keeps working.
     """
 
     if not isinstance(payload, dict):
         return []
 
-    items = payload.get("data")
-    if isinstance(items, list):
-        blocks = [
-            item.get("shipment")
-            for item in items
-            if isinstance(item, dict) and isinstance(item.get("shipment"), dict)
-        ]
-        if blocks:
-            return blocks
+    documents = _get_any(payload, LABEL_DOCUMENT_KEYS)
+    if isinstance(documents, list):
+        entries = [entry for entry in documents if isinstance(entry, dict)]
+        if entries:
+            return entries
 
-    # Fall back to the older/alternate shapes this function originally
-    # supported, in case some environments still return them.
-    shipments = payload.get("shipment")
-    if shipments is None:
-        shipments = payload.get("shipments")
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        return _label_documents(nested)
+    if isinstance(nested, list):
+        collected: list[dict] = []
+        for item in nested:
+            if isinstance(item, dict):
+                collected.extend(_label_documents(item))
+        return collected
 
-    if isinstance(shipments, dict):
-        return [shipments]
-    if isinstance(shipments, list):
-        return [block for block in shipments if isinstance(block, dict)]
     return []
 
 
 def extract_return_label_data(payload: dict) -> str:
-    """Return the raw labelData for the return label block (shipment.isReturn == False).
+    """Return the return label's data from a labels API payload.
 
-    The labels API usually returns two blocks: one for the outbound shipment
-    and one for the return. The return label is the block where
-    isReturn == False (the outbound leg carries isReturn == True since it is
-    part of a returns flow); labelData holds either a (often base64-encoded)
-    ZPL string, or a URL pointing to a hosted PDF label (e.g. an Azure blob
-    storage link such as
+    The return leg is the labelDocuments[] entry whose labelType is RETLBL;
+    labelType is authoritative here exactly as it is in GET_FULL_ORDER's
+    shippingLabels[]. The entry carries either a (usually base64-encoded) ZPL
+    string in labelData, or a URL to a hosted PDF label in link (e.g. an Azure
+    blob storage link such as
     "https://tlgspstorage.blob.core.windows.net/pdflabels/.../LABEL.pdf").
     Callers should inspect the returned value (see _label_data_is_pdf_link)
     to decide whether to decode it as ZPL or download it as a PDF.
     """
 
-    for block in _label_shipment_blocks(payload):
-        if block.get("isReturn") is False:
-            label_data = block.get("labelData")
-            if label_data:
-                return str(label_data)
+    for entry in _label_documents(payload):
+        label_type = str(entry.get("labelType") or "").strip().upper()
+        if label_type not in RETURN_LABEL_TYPES:
+            continue
+
+        label_data = entry.get("labelData")
+        if label_data:
+            return str(label_data)
+
+        # printType "PDF" entries carry a null labelData and a hosted link.
+        link = entry.get("link")
+        if link:
+            return str(link)
 
     raise DocumentGenerationError(
-        "No return label block (shipment.isReturn == false) with labelData "
-        "found in the labels API response"
+        "No return label (labelType RETLBL) with labelData or link found in "
+        "the labels API response"
     )
 
 
