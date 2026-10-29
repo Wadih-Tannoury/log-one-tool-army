@@ -370,8 +370,8 @@ When a ticket references more than one `shipment_order_number` (semicolon-separa
 
 Whenever `export_tracking_number` is part of a response (directly requested or auto-added), `response_generator.py` also auto-adds a `shipping_label` data key and `response_data_extractor.py` generates the return label PDF:
 
-1. POST the shipment's `orderNumber` to the labels API (a Logic App request trigger — see `Labels_triggering_for_DGEUTST0001.py` for a batch-trigger example against the same workflow, configurable via `SHIPPING_LABELS_API_URL` / `SHIPPING_LABELS_API_SIG`).
-2. The response contains one `shipment` block per label (outbound + return). The block where `isReturn == false` is the return label; its `labelData` field holds the ZPL, usually base64-encoded.
+1. Mint an OAuth2 bearer token from `https://integrations.thelevelgroup.com/logistics/v1/oauth2/token` using the `GET_LABELS_API_CREDS` secret (`{"clientId": ..., "clientSecret": ...}`), then ask `https://integrations.thelevelgroup.com/logistics/v1/shipments/documents` for the shipment's documents. The token is minted once per process and refreshed on a 401/403. Both URLs are overridable via `SHIPPING_LABELS_API_URL` / `SHIPPING_LABELS_API_TOKEN_URL`.
+2. The response carries a `labelDocuments[]` list, one entry per leg. The entry whose `labelType` is `RETLBL` is the return label: `printType` `ZPL` entries hold the (base64) ZPL in `labelData`, while `printType` `PDF` entries leave `labelData` null and put a hosted PDF URL in `link`. A link is downloaded directly; ZPL goes through step 3.
 3. Decode the ZPL and render it to PNG via the Labelary API, then wrap it into a PDF with `reportlab` (see `ZPL_to_PDF_converter.py` for the reference implementation, reused as `render_zpl_label_pdf`).
 4. Save to `generated_documents/shipping_labels/<shipment_order_number>.pdf` and attach it in the final response next to the export tracking number, one PDF per shipment on the ticket.
 
@@ -745,8 +745,8 @@ shipment block states its labels explicitly:
 `SHPLBL` is the export (outbound) leg and `RETLBL` is the return leg. That
 `labelType` is authoritative — field-name heuristics are only a fallback for
 payload shapes without a `shippingLabels[]` list, and the `isReturn` flag is
-never consulted here because its polarity is inverted in the labels Logic App
-(see `extract_return_label_data`).
+never consulted here. The labels API marks its own `labelDocuments[]` the same
+way (see `extract_return_label_data`).
 
 **Which block is read** (`_resolve_export_tracking()` in
 `response_data_extractor.py`), first match wins:
